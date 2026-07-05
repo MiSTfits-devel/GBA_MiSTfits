@@ -42,8 +42,15 @@ vcom -quiet -work sim/gba ^
 ../rtl/gba_sound.vhd ^
 ../rtl/gba_joypad.vhd ^
 ../rtl/gba_serial.vhd ^
+../rtl/gba_linkport.vhd ^
 ../rtl/gba_dma_module.vhd ^
 ../rtl/gba_dma.vhd ^
+../rtl/gba_savestates_stub.vhd ^
+../rtl/gba_mem_writerotate.vhd ^
+../rtl/gba_mem_readrotate.vhd ^
+../rtl/gba_mem_cheatread.vhd ^
+../rtl/gba_mem_ewram_sdram.vhd ^
+../rtl/gba_mem_cart2_sdram.vhd ^
 ../rtl/gba_memorymux.vhd ^
 ../rtl/gba_timer_module.vhd ^
 ../rtl/gba_timer.vhd ^
@@ -63,6 +70,7 @@ vcom -quiet -work sim/gba ^
 
 vcom -2008 -quiet -work sim/gba ^
 ../rtl/gba_cpu.vhd ^
+../rtl/gba_ctrl_pause.vhd ^
 ../rtl/gba_top.vhd
 
 vcom -quiet -work sim/tb ^

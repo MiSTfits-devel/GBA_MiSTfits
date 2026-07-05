@@ -36,3 +36,12 @@ c5_pin_model_dump.txt
 *~
 *.xml
 *.cdf
+build/artifacts/
+sim/nvc_work/
+.DS_Store
+sim/nvc_libs/
+sim/tests/bios_words.hex
+sim/tests/rom_words.hex
+sim/tests/rom2_words.hex
+sim/tests/ewram_alias_test.gba
+build/

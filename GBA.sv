@@ -179,7 +179,7 @@ module emu
 
 assign ADC_BUS  = 'Z;
 assign {UART_RTS, UART_TXD, UART_DTR} = 0;
-assign USER_OUT = '1;
+assign USER_OUT = linkport_user_out; // all released ('1) unless the link port claims its pins
 
 assign AUDIO_S   = 1;
 assign AUDIO_MIX = status[8:7];
@@ -220,25 +220,29 @@ wire reset = RESET | buttons[1] | status[0] | cart_download | bk_loading;
 // 0         1         2         3          4         5         6
 // 01234567890123456789012345678901 23456789012345678901234567890123
 // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
-// X XXXXXXXXXRXXXXXXXXXXXXXXXXXXXX XXXXXXXXXXXX      xxxxxxxxxx
+// X XXXXXXXXXRXXXXXXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXXxxxxxxxxxxxx
 
 `include "build_id.v"
 parameter CONF_STR = {
 	"GBA;SS3E000000:80000;",
 	"FS1,GBA,Load,30080000;",
 	"-;",
+`ifndef GBA2P_LITE
 	"C,Cheats;",
 	"H1O[6],Cheats Enabled,Yes,No;",
 	"-;",
+`endif
 	"D0R[12],Reload Backup RAM;",
 	"D0R[13],Save Backup RAM;",
 	"D0O[23],Autosave,Off,On;",
 	"D0-;",
+`ifndef GBA2P_LITE
 	"O[36],Savestates to SDCard,On,Off;",
 	"O[43],Autoincrement Slot,Off,On;",
 	"O[38:37],Savestate Slot,1,2,3,4;",
 	"h4H3R[17],Save state (Alt-F1);",
 	"h4H3R[18],Restore state (F1);",
+`endif
 	"-;",
 	"P1,Video & Audio;",
 	"P1-;",
@@ -258,10 +262,22 @@ parameter CONF_STR = {
 	"P1O[10:9],Flickerblend,Off,Blend,30Hz;",
 	"P1-;",
 	"P1O[8:7],Stereo Mix,None,25%,50%,100%;",
+`ifdef GBA2P_LITE
+	"P1O[49:48],2P Audio,Player 1,Player 2,Mix,Split P1-L P2-R;",
+	"P1O[21:20],2P Display,Both,Player 1,Player 2;",
+	"H8P1O[22],2P Separator Line,Off,On;",
+`endif
 
 	"P2,Hardware;",
 	"P2-;",
 	"H6P2O[31:29],Solar Sensor,0%,15%,30%,42%,55%,70%,85%,100%;",
+	"P2-;",
+`ifdef GBA2P_LITE
+	"P2O[46:44],Multiplayer,2P Link (Internal),Link Cable (GPIO),Off;",
+`else
+	"P2O[46:44],Multiplayer,Off,Link Cable (GPIO);",
+`endif
+	"H7P2O[47],Link Role,Parent,Child;",
    "P2-;",
    "P2-,Save setting + reload Core;",
 	"P2O[28],Homebrew BIOS,Off,On;",
@@ -270,13 +286,34 @@ parameter CONF_STR = {
 	"P3-;",
    "D5P3O[5],Pause when OSD is open,Off,On;",
    "P3O[50],Error Overlay,Off,On;",
+	"H9P3O[14],Link Debug Overlay,Off,On;",
    "P3-;",
 	"P3-,Only Romhacks or Crash!;",
 	"P3O[40],GPIO HACK(RTC+Rumble),Off,On;",
 
+	"P4,Credits;",
+	"P4-;",
+	"P4-,Robert Peip;",
+	"P4-,(FPGAzumSpass);",
+	"P4-,Core Creator;",
+	"P4-;",
+	"P4-,The awesome hackers;",
+	"P4-,of MiSTer-FPGA;",
+	"P4-,sorgelig;",
+	"P4-,Till Harbaum;",
+	"P4-,paulb-nl;",
+	"P4-;",
+	"P4-,Sarah Aronson;",
+	"P4-,Multiplayer Extensions;",
+	"P4-,RIO/SIO/RTC Bugfixes;",
+
 	"- ;",
 	"R0,Reset;",
+`ifdef GBA2P_LITE
+	"J1,A,B,L,R,Select,Start,Unused,Pause;",
+`else
 	"J1,A,B,L,R,Select,Start,Savestates,Pause;",
+`endif
 	"jn,A,B,L,R,Select,Start,X,X;",
 	"I,",
 	"Load=DPAD Up|Save=Down|Slot=L+R,",
@@ -298,7 +335,15 @@ parameter CONF_STR = {
 
 wire  [1:0] buttons;
 wire [63:0] status;
-wire [15:0] status_menumask = {~solar_quirk, status[27], cart_loaded, |cart_type, force_turbo, ~gg_active, ~bk_ena};
+wire [15:0] status_menumask = {
+`ifdef GBA2P_LITE
+	(status[46:44] == 3'd2),        // H9: hide Link Debug Overlay when Multiplayer is Off (2P profile: Off = 2)
+`else
+	(status[46:44] == 3'd0),        // H9: hide Link Debug Overlay when Multiplayer is Off (1P profile: Off = 0)
+`endif
+	|status[21:20],                    // H8: hide 2P Separator Line unless 2P Display is Both
+	(status[46:44] != 3'd1),           // H7: hide Link Role unless Multiplayer is Link Cable (GPIO)
+	~solar_quirk, status[27], cart_loaded, |cart_type, force_turbo, ~gg_active, ~bk_ena};
 wire        forced_scandoubler;
 reg  [31:0] sd_lba;
 reg         sd_rd = 0;
@@ -321,6 +366,7 @@ wire [15:0] joy_rumble;
 
 wire [15:0] joy;
 wire [15:0] joy_unmod;
+wire [15:0] joy2;      // player 2 (second core in the 2P profile)
 wire [10:0] ps2_key;
 
 wire [21:0] gamma_bus;
@@ -342,6 +388,7 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 
 	.joystick_0(joy_unmod),
 	.joystick_0_rumble(joy_rumble),
+	.joystick_1(joy2),
 	.ps2_key(ps2_key),
 
 	.status(status),
@@ -461,6 +508,38 @@ wire has_rtc;
 wire cart_rumble;
 reg RTC_load = 0;
 
+// mGBA RTC footer ingest. mGBA appends 16 bytes after the save data:
+//   byte 0..6 : S-3511 time registers, BCD  (year mon day wday hour min sec)
+//   byte 7    : S-3511 control register     (0x40 = 24h mode)
+//   byte 8..15: little-endian u64 unix timestamp of the last RTC latch
+// (layout verified against a real mGBA-written .sav; see the native "RT"
+// footer parse below for the MiSTer-format equivalent). The words of the
+// first extra sector are staged here and committed only if they decode as
+// a plausible mGBA footer -- strict BCD/range checks so beyond-EOF garbage
+// (all-0x00 / all-0xFF / stale flash) can never false-positive.
+reg [127:0] mgba_buf = 0;
+wire  [7:0] mg_year = mgba_buf[7:0];
+wire  [7:0] mg_mon  = mgba_buf[15:8];
+wire  [7:0] mg_day  = mgba_buf[23:16];
+wire  [7:0] mg_wday = mgba_buf[31:24];
+wire  [7:0] mg_hour = {2'b00, mgba_buf[37:32]}; // strip S-3511 12h-PM flag
+wire  [7:0] mg_min  = mgba_buf[47:40];
+wire  [7:0] mg_sec  = mgba_buf[55:48];
+wire [31:0] mg_ts   = mgba_buf[95:64];
+wire mg_bcd_ok = (mg_year[3:0] < 10) && (mg_year[7:4] < 10)
+              && (mg_mon[3:0]  < 10) && (mg_mon[7:4]  < 10)
+              && (mg_day[3:0]  < 10) && (mg_day[7:4]  < 10)
+              && (mg_hour[3:0] < 10) && (mg_hour[7:4] < 10)
+              && (mg_min[3:0]  < 10) && (mg_min[7:4]  < 10)
+              && (mg_sec[3:0]  < 10) && (mg_sec[7:4]  < 10);
+wire mgba_valid = mg_bcd_ok
+               && (mg_mon  >= 8'h01) && (mg_mon  <= 8'h12)
+               && (mg_day  >= 8'h01) && (mg_day  <= 8'h31)
+               && (mg_hour <= 8'h23) && (mg_min  <= 8'h59) && (mg_sec <= 8'h59)
+               && (mg_wday <= 8'd6)
+               && (mg_ts != 32'h00000000) && (mg_ts != 32'hFFFFFFFF)
+               && (mgba_buf[127:96] == 32'd0); // u64 timestamp high dword
+
 reg [7:0] rumble_reg = 0;
 
 always @(posedge clk_sys) begin
@@ -483,14 +562,76 @@ end
 
 wire sdram_refresh;
 
+///////////////////////////  LINK PORT  ////////////////////////////////
+
+// Multiplayer select. Full profile: 0 = off, 1 = link cable on the user port
+// (SNAC GBA adapter). 2P profile: 0 = internal core<->core link (default),
+// 1 = SNAC link cable, 2 = off. In internal mode core 1 is always the parent
+// and the user port pins stay released.
+wire [2:0] multiplayer_mode = status[46:44];
+wire       link_snac        = (multiplayer_mode == 3'd1);
+`ifdef GBA2P_LITE
+wire       link_internal    = (multiplayer_mode == 3'd0);
+`else
+wire       link_internal    = 1'b0;
+`endif
+wire       link_enable      = link_snac | link_internal;
+wire       link_role_parent = link_internal ? 1'b1 : ~status[47];
+
+wire [6:0] linkport_user_out;
+wire link_clk_out, link_clk_oe, link_clk_in;
+wire link_so_out,  link_so_oe,  link_si_in;
+wire link_sd_out,  link_sd_oe,  link_sd_in;
+
+gba_linkport linkport
+(
+	.clk(clk_sys),
+	.port_enable(link_snac),
+	.user_in(USER_IN),
+	.user_out(linkport_user_out),
+
+	.link_clk_out(link_clk_out),
+	.link_clk_oe (link_clk_oe ),
+	.link_clk_in (link_clk_in ),
+	.link_so_out (link_so_out ),
+	.link_so_oe  (link_so_oe  ),
+	.link_si_in  (link_si_in  ),
+	.link_sd_out (link_sd_out ),
+	.link_sd_oe  (link_sd_oe  ),
+	.link_sd_in  (link_sd_in  )
+);
+
+// GBA2P_LITE: the 2P build profile drops savestates/rewind and cheats -
+// irrelevant for realtime 2P and they pay for the second core.
+// GBA2P_MEMTEST: hardware bisect profile - single core with the 2P build's
+// EWRAM-over-SDRAM path (and the same strip), no second core/compose. If a
+// game misbehaves here it's the EWRAM/SDRAM path on silicon; if it's clean
+// the fault needs the second core.
+`ifdef GBA2P_LITE
+localparam STRIP_2P    = 1'b1;
+localparam SECOND_CORE = 1'b1;
+`elsif GBA2P_MEMTEST
+localparam STRIP_2P    = 1'b1;
+localparam SECOND_CORE = 1'b0;
+`else
+localparam STRIP_2P    = 1'b0;
+localparam SECOND_CORE = 1'b0;
+`endif
+
 gba_wrap
 #(
    // assume: cart may have either flash or eeprom, not both! (need to verify)
 	.Softmap_GBA_FLASH_ADDR  (0),                   // 131072 (8bit)  -- 128 Kbyte Data for GBA Flash
 	.Softmap_GBA_EEPROM_ADDR (0),                   //   8192 (8bit)  --   8 Kbyte Data for GBA EEProm
 	.Softmap_GBA_Gamerom_ADDR(524288),              //  32MB of ROM
+	.Softmap_GBA_EWRAM_ADDR  (34078720),            // 256KB EWRAM core 1 right after ROM (2P profile, needs 64MB SDRAM)
+	.Softmap_GBA_EWRAM2_ADDR (34340864),            // 256KB EWRAM core 2, right after core 1's slot (2P profile)
 	.Softmap_SaveState_ADDR  (58720256),            // 65536 (64bit) -- ~512kbyte Data for SaveState (separate memory)
 	.Softmap_Rewind_ADDR     (33554432),            // 65536 qwords*64 -- 64*512 Kbyte Data for Savestates
+	.strip_savestates(STRIP_2P),
+	.strip_cheats(STRIP_2P),
+	.ewram_in_sdram(STRIP_2P),
+	.second_core(SECOND_CORE),
 	.turbosound('0)                                 // sound buffer to play sound in turbo mode without sound pitched up
 )
 gba
@@ -519,9 +660,11 @@ gba
    .videoHshift(status[55:52]),
    .videoVshift(status[58:56]),
 	.specialmodule(gpio_quirk | status[40]),
+	.rtc_noselect_quirk(rtc_noselect_quirk),
 	.solar_in(status[31:29]),
 	.tilt(tilt_quirk),
 	.overlay_error_on(status[50]),
+	.overlay_link_on(status[14]),
    .rewind_on(1'b0),
    .rewind_active(1'b0),
    .savestate_number(ss_slot),
@@ -541,10 +684,11 @@ gba
    .cheat_in(gg_code),
    .cheats_active(gg_active),
    
-	.sdram_Din(bus_din),              
-	.sdram_Adr(bus_addr),             
-	.sdram_rnw(bus_rd),               
-	.sdram_ena(bus_req),              
+	.sdram_Din(bus_din),
+	.sdram_Adr(bus_addr),
+	.sdram_rnw(bus_rd),
+	.sdram_ena(bus_req),
+	.sdram_be(bus_be),
 	.sdram_cancel(sdram_cancel),              
 	.sdram_refresh(sdram_refresh),              
    .sdram_Dout(bus_dout),      
@@ -595,6 +739,33 @@ gba
 	.Rumble(cart_rumble),
    .KeyPause(joy[11]),
 
+   .link_enable     (link_enable     ),
+   .link_role_parent(link_role_parent),
+   .link_clk_out    (link_clk_out    ),
+   .link_clk_oe     (link_clk_oe     ),
+   .link_clk_in     (link_clk_in     ),
+   .link_so_out     (link_so_out     ),
+   .link_so_oe      (link_so_oe      ),
+   .link_si_in      (link_si_in      ),
+   .link_sd_out     (link_sd_out     ),
+   .link_sd_oe      (link_sd_oe      ),
+   .link_sd_in      (link_sd_in      ),
+
+   .link_2p     (link_internal),
+   .Key2A       (joy2[4]),
+   .Key2B       (joy2[5]),
+   .Key2Select  (joy2[8]),
+   .Key2Start   (joy2[9]),
+   .Key2Right   (joy2[0]),
+   .Key2Left    (joy2[1]),
+   .Key2Up      (joy2[3]),
+   .Key2Down    (joy2[2]),
+   .Key2R       (joy2[7]),
+   .Key2L       (joy2[6]),
+   .sound2_select(status[49:48]),
+   .display2p_select(status[21:20]),
+   .separator_line(status[22]),
+
    .videoout_hsync    (hs),
    .videoout_vsync    (vs),
    .videoout_hblank   (hbl),
@@ -633,6 +804,8 @@ reg memory_remap_quirk = 0;    // game uses memory mirroring, e.g. access 4Mbyte
 reg gpio_quirk = 0;            // game exchanges some addresses to be GPIO lines for e.g. Solar or RTC
 reg tilt_quirk = 0;            // game exchanges some addresses to be Tilt module
 reg solar_quirk = 0;           // game has solar module
+reg rtc_noselect_quirk = 0;    // Sennen Kazoku never selects the RTC device (GPIO bit 2) before talking
+                                // to it -- every other RTC cart does, so this bypass is scoped to just it
 
 always @(posedge clk_6x) begin
 
@@ -648,6 +821,7 @@ always @(posedge clk_6x) begin
       gpio_quirk         <= 0;
       tilt_quirk         <= 0;
       solar_quirk        <= 0;
+      rtc_noselect_quirk <= 0;
    end
 
 	if(rom_wr) begin
@@ -678,7 +852,7 @@ always @(posedge clk_6x) begin
 			if(cart_id[31:8] == "AXV" ) begin gpio_quirk <= 1;                                             end // POKEMON Ruby
 			if(cart_id[31:8] == "AXP" ) begin gpio_quirk <= 1;                                             end // POKEMON Sapphire
 			if(cart_id[31:8] == "RZW" ) begin gpio_quirk <= 1;                                             end // WarioWare Twisted
-			if(cart_id[31:8] == "BKA" ) begin gpio_quirk <= 1;                                             end // Sennen Kazoku
+			if(cart_id[31:8] == "BKA" ) begin gpio_quirk <= 1; rtc_noselect_quirk <= 1;                    end // Sennen Kazoku
 			if(cart_id[31:8] == "BR4" ) begin gpio_quirk <= 1;                                             end // Rockman EXE 4.5
 			if(cart_id[31:8] == "V49" ) begin gpio_quirk <= 1;                                             end // Drill Dozer
 			if(cart_id[31:8] == "2GB" ) begin gpio_quirk <= 1;                                             end // Goodboy Galaxy
@@ -753,6 +927,7 @@ wire [31:0] bus_dout = sdr_bus_dout;
 wire        bus_ack16  = sdr_bus_ack_16;
 wire        bus_ack32  = sdr_bus_ack;
 wire        bus_rd, bus_req;
+wire  [3:0] bus_be;
 wire        sdram_cancel;
 
 wire [31:0] sdr_sdram_dout1, sdr_sdram_dout2, sdr_bus_dout;
@@ -776,6 +951,7 @@ sdram sdram
 
 	.ch2_addr(rom_copy ? romcopy_writepos[26:1] : bus_addr[26:1]),
 	.ch2_din(rom_copy ? romcopy_data : bus_din),
+	.ch2_be(rom_copy ? 4'b1111 : bus_be),
 	.ch2_dout(sdr_bus_dout),
 	.ch2_req(rom_copy ? romcopy_req : ~cart_download & bus_req),
 	.ch2_cancel(sdram_cancel),
@@ -928,8 +1104,17 @@ video_freak video_freak
 	.VGA_DE_IN(VGA_DE),
 	.VGA_DE(),
 
+`ifdef GBA2P_LITE
+	// 480x160 side by side, borders unavailable. Single-player display modes
+	// show one core's 240x160 image pixel-doubled to fill the same 480x160
+	// frame, so "Original" needs the normal single-GBA 3:2 ratio instead of
+	// the side-by-side 3:1 - half the width ratio, image content is unchanged.
+	.ARX((!ar) ? 12'd3 : (ar - 1'd1)),
+	.ARY((!ar) ? ((|status[21:20]) ? 12'd2 : 12'd1) : 12'd0),
+`else
 	.ARX((!ar) ? ((status[51]) ? 12'd4 : 12'd3) : (ar - 1'd1)),
 	.ARY((!ar) ? ((status[51]) ? 12'd3 : 12'd2) : 12'd0),
+`endif
 	.CROP_SIZE(0),
 	.CROP_OFF(0),
 	.SCALE(status[35:34])
@@ -1045,6 +1230,27 @@ always @(posedge clk_sys) begin
 
 			if (&sd_buff_addr)
 				bk_record_rtc <= 0;
+		end
+
+		// mGBA footer (see mgba_buf above): stage words 0..7 of the FIRST
+		// extra sector only (later extra sectors are beyond-EOF junk), then
+		// commit after word 8 if it validates and the native "RT" footer
+		// didn't already claim this save.
+		if (extra_data_addr && sd_lba[8:0] == {1'b0, save_sz} + 9'd1 && sd_buff_wr) begin
+			if (sd_buff_addr < 8)
+				mgba_buf[{sd_buff_addr[2:0], 4'b0000} +: 16] <= sd_buff_dout;
+
+			if (sd_buff_addr == 8'd8 && ~bk_record_rtc && ~RTC_load && mgba_valid) begin
+				time_dout[41:34] <= mg_year;
+				time_dout[33:29] <= mg_mon[4:0];
+				time_dout[28:23] <= mg_day[5:0];
+				time_dout[22:20] <= mg_wday[2:0];
+				time_dout[19:14] <= mg_hour[5:0];
+				time_dout[13:7]  <= mg_min[6:0];
+				time_dout[6:0]   <= mg_sec[6:0];
+				time_dout[73:42] <= mg_ts;
+				RTC_load <= 1;
+			end
 		end
 	end
 	else begin

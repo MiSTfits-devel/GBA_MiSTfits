@@ -8,10 +8,16 @@ use work.pReg_savestates.all;
 entity gba_gpioRTCSolarGyro is
    port 
    (
-      clk1x                : in     std_logic; 
+      clk1x                : in     std_logic;
       reset                : in     std_logic;
       GBA_on               : in     std_logic;
-      
+      -- Sennen Kazoku's own GPIO driver never writes the RTC device-select
+      -- bit (selected(2)) before issuing RTC commands. Real hardware (and
+      -- every other RTC-using cart) does select it first, so the check
+      -- below is only skipped for that one cart id, gated by this signal
+      -- -- see GBA.sv's cart_id detection.
+      rtc_noselect_quirk   : in     std_logic := '0';
+
       savestate_bus        : in    proc_bus_gb_type;
       ss_wired_out         : out   std_logic_vector(proc_buswidth-1 downto 0) := (others => '0');
       ss_wired_done        : out   std_logic;
@@ -83,8 +89,48 @@ architecture arch of gba_gpioRTCSolarGyro is
    
    signal RTC_timestamp    : std_logic_vector(31 downto 0);
    signal diffSeconds      : unsigned(31 downto 0) := (others => '0');
-   
+
    signal secondcount      : integer range 0 to 16777216 := 0; -- 1 second at 16.777216 Mhz
+
+   -- Real-time-clock seeding from the MiSTer/HPS system clock (RTC_timestampIn
+   -- is a live Unix timestamp, already available on this entity's existing
+   -- ports -- see GBA.sv's RTC_time wire). Without this, tm_* above only ever
+   -- gets a real value from a loaded save (RTC_saveLoaded) or a direct game
+   -- write (saveRTC_next); a cart with no existing RTC save data (the normal
+   -- case for a freshly-played ROM hack, since it isn't in any save yet)
+   -- just counts up from the hardcoded Dec 31 2009 23:59:45 default above,
+   -- which is why the in-game clock always reads "Jan 1 2010" on first boot.
+   -- Converts Unix seconds -> BCD date/time via bounded iterative subtraction
+   -- (a handful of compare+subtract states, each with a tiny worst-case
+   -- iteration count) rather than a direct division on the full 32-bit
+   -- timestamp, which would synthesize into a wide combinational divider and
+   -- blow timing; this only needs to finish well within the ~1 second
+   -- interval between real timestamp updates, so a few thousand cycles of
+   -- iteration is negligible.
+   constant UNIX_SECONDS_2000 : unsigned(31 downto 0) := to_unsigned(946684800, 32); -- Jan 1 2000 00:00:00 UTC
+   type tBcdSeedState is (BCDSEED_IDLE, BCDSEED_DAYS, BCDSEED_HOURS, BCDSEED_MINS, BCDSEED_YEARS, BCDSEED_MONTHS, BCDSEED_PACK);
+   signal bcdSeedState     : tBcdSeedState := BCDSEED_IDLE;
+   signal RTC_timestampNew_bcd : std_logic := '0';
+   signal bcd_remaining    : unsigned(31 downto 0) := (others => '0');
+   signal bcd_remaining2   : unsigned(31 downto 0) := (others => '0');
+   signal bcd_days         : unsigned(15 downto 0) := (others => '0');
+   signal bcd_wday         : unsigned(2 downto 0)  := (others => '0');
+   signal bcd_hour         : unsigned(4 downto 0)  := (others => '0'); -- 0..23
+   signal bcd_min          : unsigned(5 downto 0)  := (others => '0'); -- 0..59
+   signal bcd_sec          : unsigned(5 downto 0)  := (others => '0'); -- 0..59
+   signal bcd_year         : unsigned(6 downto 0)  := (others => '0'); -- 0..99
+   signal bcd_mon          : unsigned(3 downto 0)  := (others => '0'); -- 1..12
+   signal bcd_mday         : unsigned(4 downto 0)  := (others => '0'); -- 1..31
+   signal bcd_doy          : unsigned(8 downto 0)  := (others => '0'); -- 0..365
+   signal bcd_ready        : std_logic := '0'; -- one cycle pulse: tm_*_bcd below are valid
+   signal tm_year_bcd      : unsigned(7 downto 0) := (others => '0');
+   signal tm_mon_bcd       : unsigned(4 downto 0) := (others => '0');
+   signal tm_mday_bcd      : unsigned(5 downto 0) := (others => '0');
+   signal tm_hour_bcd      : unsigned(5 downto 0) := (others => '0');
+   signal tm_min_bcd       : unsigned(6 downto 0) := (others => '0');
+   signal tm_sec_bcd       : unsigned(6 downto 0) := (others => '0');
+   signal GBA_on_1         : std_logic := '0';
+   signal bcd_seed_done    : std_logic := '0'; -- blocks re-seeding once a save loads, a game writes the time, or we've already seeded once this session
                            
    signal tm_year          : unsigned(7 downto 0) := x"09";
    signal tm_mon           : unsigned(4 downto 0) := '1' & x"2";
@@ -289,8 +335,8 @@ begin
                      end if;
                      
                      -- RTC
-                     --if (selected(2) = '1') then -- don't check for clock as Sennen Kazoku doesn't handle it "correct"
-                     
+                     if (selected(2) = '1' or rtc_noselect_quirk = '1') then
+
                         if (state = IDLE and retval = x"1" and GPIO_Dout = x"5") then
                         
                            state   <= COMMANDSTATE;
@@ -401,8 +447,8 @@ begin
                            retval <= GPIO_Dout;
                               
                         end if;
-                     --end if;
-                  
+                     end if;
+
                   when others => null;
                end case;
                
@@ -414,6 +460,122 @@ begin
    end process;
    
    RTC_timestampOut <= RTC_timestamp;
+
+   -- Unix timestamp -> BCD date/time, see the bcdSeedState declaration above
+   -- for why this is iterative subtraction rather than direct division.
+   process (clk1x)
+      variable is_leap      : std_logic;
+      variable month_length : unsigned(4 downto 0);
+   begin
+      if rising_edge(clk1x) then
+
+         bcd_ready <= '0';
+
+         case (bcdSeedState) is
+
+            when BCDSEED_IDLE =>
+               RTC_timestampNew_bcd <= RTC_timestampNew;
+               if (RTC_timestampNew /= RTC_timestampNew_bcd) then
+                  if (unsigned(RTC_timestampIn) >= UNIX_SECONDS_2000) then
+                     bcd_remaining <= unsigned(RTC_timestampIn) - UNIX_SECONDS_2000;
+                  else
+                     bcd_remaining <= (others => '0');
+                  end if;
+                  bcd_days  <= (others => '0');
+                  bcd_wday  <= "110"; -- Jan 1 2000 was a Saturday
+                  bcdSeedState <= BCDSEED_DAYS;
+               end if;
+
+            when BCDSEED_DAYS => -- worst case ~36500 iterations (year ~2099), ~1.1ms @ 33MHz clk1x
+               if (bcd_remaining >= 86400) then
+                  bcd_remaining <= bcd_remaining - 86400;
+                  bcd_days      <= bcd_days + 1;
+                  if (bcd_wday = "110") then
+                     bcd_wday <= (others => '0');
+                  else
+                     bcd_wday <= bcd_wday + 1;
+                  end if;
+               else
+                  bcd_hour     <= (others => '0');
+                  bcdSeedState <= BCDSEED_HOURS;
+               end if;
+
+            when BCDSEED_HOURS => -- max 23 iterations
+               if (bcd_remaining >= 3600) then
+                  bcd_remaining <= bcd_remaining - 3600;
+                  bcd_hour      <= bcd_hour + 1;
+               else
+                  bcd_min      <= (others => '0');
+                  bcdSeedState <= BCDSEED_MINS;
+               end if;
+
+            when BCDSEED_MINS => -- max 59 iterations
+               if (bcd_remaining >= 60) then
+                  bcd_remaining <= bcd_remaining - 60;
+                  bcd_min       <= bcd_min + 1;
+               else
+                  bcd_sec       <= bcd_remaining(5 downto 0);
+                  bcd_remaining2 <= resize(bcd_days, 32);
+                  bcd_year      <= (others => '0');
+                  bcdSeedState  <= BCDSEED_YEARS;
+               end if;
+
+            when BCDSEED_YEARS => -- max 99 iterations
+               if (bcd_year(1 downto 0) = "00") then is_leap := '1'; else is_leap := '0'; end if;
+               if (bcd_remaining2 >= 366 and is_leap = '1') or (bcd_remaining2 >= 365 and is_leap = '0') then
+                  if (is_leap = '1') then
+                     bcd_remaining2 <= bcd_remaining2 - 366;
+                  else
+                     bcd_remaining2 <= bcd_remaining2 - 365;
+                  end if;
+                  bcd_year <= bcd_year + 1;
+               else
+                  bcd_doy      <= bcd_remaining2(8 downto 0);
+                  bcd_mon      <= to_unsigned(1, 4);
+                  bcdSeedState <= BCDSEED_MONTHS;
+               end if;
+
+            when BCDSEED_MONTHS => -- max 12 iterations
+               if (bcd_year(1 downto 0) = "00") then is_leap := '1'; else is_leap := '0'; end if;
+               case (to_integer(bcd_mon)) is
+                  when 1 => month_length := to_unsigned(31, 5);
+                  when 2 => if (is_leap = '1') then month_length := to_unsigned(29, 5); else month_length := to_unsigned(28, 5); end if;
+                  when 3 => month_length := to_unsigned(31, 5);
+                  when 4 => month_length := to_unsigned(30, 5);
+                  when 5 => month_length := to_unsigned(31, 5);
+                  when 6 => month_length := to_unsigned(30, 5);
+                  when 7 => month_length := to_unsigned(31, 5);
+                  when 8 => month_length := to_unsigned(31, 5);
+                  when 9 => month_length := to_unsigned(30, 5);
+                  when 10 => month_length := to_unsigned(31, 5);
+                  when 11 => month_length := to_unsigned(30, 5);
+                  when others => month_length := to_unsigned(31, 5);
+               end case;
+               if (bcd_doy >= resize(month_length, 9)) then
+                  bcd_doy <= bcd_doy - resize(month_length, 9);
+                  bcd_mon <= bcd_mon + 1;
+               else
+                  bcd_mday     <= bcd_doy(4 downto 0) + 1;
+                  bcdSeedState <= BCDSEED_PACK;
+               end if;
+
+            when BCDSEED_PACK =>
+               -- binary -> packed BCD (tens nibble : ones nibble), matching
+               -- the representation tm_* already uses everywhere else in
+               -- this file (e.g. RTC_savedtimeIn/data(0..6) above)
+               tm_year_bcd <= to_unsigned(to_integer(bcd_year) / 10, 4) & to_unsigned(to_integer(bcd_year) mod 10, 4);
+               tm_mon_bcd  <= to_unsigned(to_integer(bcd_mon)  / 10, 1) & to_unsigned(to_integer(bcd_mon)  mod 10, 4);
+               tm_mday_bcd <= to_unsigned(to_integer(bcd_mday) / 10, 2) & to_unsigned(to_integer(bcd_mday) mod 10, 4);
+               tm_hour_bcd <= to_unsigned(to_integer(bcd_hour) / 10, 2) & to_unsigned(to_integer(bcd_hour) mod 10, 4);
+               tm_min_bcd  <= to_unsigned(to_integer(bcd_min)  / 10, 3) & to_unsigned(to_integer(bcd_min)  mod 10, 4);
+               tm_sec_bcd  <= to_unsigned(to_integer(bcd_sec)  / 10, 3) & to_unsigned(to_integer(bcd_sec)  mod 10, 4);
+               bcd_ready    <= '1';
+               bcdSeedState <= BCDSEED_IDLE;
+
+         end case;
+      end if;
+   end process;
+
    RTC_savedtimeOut(41 downto 34) <= buf_tm_year;
    RTC_savedtimeOut(33 downto 29) <= buf_tm_mon; 
    RTC_savedtimeOut(28 downto 23) <= buf_tm_mday;
@@ -437,16 +599,23 @@ begin
          end if;
       
          rtc_change <= '0';
-         
+
          secondcount <= secondcount + 1;
-         
+
+         -- a fresh game load (GBA_on falling then rising again) gets its own
+         -- chance to seed from the system clock, same as a fresh boot
+         GBA_on_1 <= GBA_on;
+         if (GBA_on_1 = '1' and GBA_on = '0') then
+            bcd_seed_done <= '0';
+         end if;
+
          RTC_saveLoaded_1 <= RTC_saveLoaded;
          if (RTC_saveLoaded_1 = '0' and  RTC_saveLoaded = '1') then
-         
+
             if (unsigned(RTC_timestamp) > unsigned(RTC_timestampSaved)) then
                diffSeconds <= unsigned(RTC_timestamp) - unsigned(RTC_timestampSaved);
             end if;
-         
+
             tm_year <= unsigned(RTC_savedtimeIn(41 downto 34));
             tm_mon  <= unsigned(RTC_savedtimeIn(33 downto 29));
             tm_mday <= unsigned(RTC_savedtimeIn(28 downto 23));
@@ -454,10 +623,12 @@ begin
             tm_hour <= unsigned(RTC_savedtimeIn(19 downto 14));
             tm_min  <= unsigned(RTC_savedtimeIn(13 downto 7));
             tm_sec  <= unsigned(RTC_savedtimeIn(6 downto 0));
-         
-           
+            -- a real save was loaded -- don't let a later system-clock seed
+            -- pulse clobber it
+            bcd_seed_done <= '1';
+
          elsif (saveRTC_next = '1') then
-            
+
             tm_year <= unsigned(data(0));
             tm_mon  <= unsigned(data(1)(4 downto 0));
             tm_mday <= unsigned(data(2)(5 downto 0));
@@ -465,7 +636,22 @@ begin
             tm_hour <= unsigned(data(4)(5 downto 0));
             tm_min  <= unsigned(data(5)(6 downto 0));
             tm_sec  <= unsigned(data(6)(6 downto 0));
-            
+            -- the game itself just set the time -- don't overwrite it later
+            bcd_seed_done <= '1';
+
+         elsif (bcd_ready = '1' and RTC_saveLoaded = '0' and bcd_seed_done = '0') then
+            -- no save data exists for this cart (typical first boot for a
+            -- ROM hack) -- seed from the real system clock instead of
+            -- leaving tm_* at its hardcoded Dec 31 2009 default
+            tm_year       <= tm_year_bcd;
+            tm_mon        <= tm_mon_bcd;
+            tm_mday       <= tm_mday_bcd;
+            tm_wday       <= bcd_wday;
+            tm_hour       <= tm_hour_bcd;
+            tm_min        <= tm_min_bcd;
+            tm_sec        <= tm_sec_bcd;
+            bcd_seed_done <= '1';
+
          else
             
             if (tm_year(7 downto 4) > 9)  then tm_year(7 downto 4) <= (others => '0'); rtc_change <= '1'; end if;    
