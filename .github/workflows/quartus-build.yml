@@ -2,7 +2,8 @@ name: Quartus Build
 
 on:
   push:
-    branches: [2p-linkcable]
+    branches: [2p-linkcable, release]
+    tags: ['v*.*.*']
   pull_request:
     branches: [2p-linkcable]
   workflow_dispatch:
@@ -61,3 +62,25 @@ jobs:
             output_files/${{ matrix.revision }}.map.rpt
           if-no-files-found: warn
           retention-days: 14
+
+  release:
+    name: Publish release
+    needs: build
+    if: success() && (github.ref_type == 'tag' || github.ref_name == 'release')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: quartus-*
+          path: artifacts
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || 'release' }}
+          prerelease: ${{ github.ref_type != 'tag' }}
+          files: artifacts/*.rbf
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
