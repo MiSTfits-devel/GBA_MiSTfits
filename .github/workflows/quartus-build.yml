@@ -1,0 +1,63 @@
+name: Quartus Build
+
+on:
+  push:
+    branches: [2p-linkcable]
+  pull_request:
+    branches: [2p-linkcable]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.revision }}
+    runs-on: ubuntu-latest
+    container:
+      image: raetro/quartus:17.0
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [GBA, GBA2P]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile ${{ matrix.revision }}
+        run: |
+          sed -i "s/NUM_PARALLEL_PROCESSORS 1/NUM_PARALLEL_PROCESSORS $(nproc)/" GBA.qsf
+          quartus_sh --flow compile GBA -c ${{ matrix.revision }}
+
+      - name: Detailed timing report
+        if: success()
+        run: |
+          printf '%s\n' \
+            "project_open GBA -revision ${{ matrix.revision }}" \
+            "create_timing_netlist" \
+            "read_sdc" \
+            "update_timing_netlist" \
+            "report_timing -setup -npaths 50 -detail full_path -file output_files/${{ matrix.revision }}.paths.rpt" \
+            "project_close" > paths.tcl
+          quartus_sta -t paths.tcl
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quartus-${{ matrix.revision }}
+          path: |
+            output_files/${{ matrix.revision }}.rbf
+            output_files/${{ matrix.revision }}.fit.summary
+            output_files/${{ matrix.revision }}.map.summary
+            output_files/${{ matrix.revision }}.sta.summary
+            output_files/${{ matrix.revision }}.sta.rpt
+            output_files/${{ matrix.revision }}.paths.rpt
+            output_files/${{ matrix.revision }}.flow.rpt
+            output_files/${{ matrix.revision }}.fit.rpt
+            output_files/${{ matrix.revision }}.map.rpt
+          if-no-files-found: warn
+          retention-days: 14
