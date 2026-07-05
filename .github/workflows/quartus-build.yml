@@ -19,8 +19,6 @@ jobs:
   build:
     name: Build ${{ matrix.revision }}
     runs-on: ubuntu-latest
-    container:
-      image: raetro/quartus:17.0
     strategy:
       fail-fast: false
       matrix:
@@ -29,21 +27,35 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Compile ${{ matrix.revision }}
+        env:
+          REVISION: ${{ matrix.revision }}
         run: |
+          cat > build.sh <<'EOF'
+          set -e
           sed -i "s/NUM_PARALLEL_PROCESSORS 1/NUM_PARALLEL_PROCESSORS $(nproc)/" GBA.qsf
-          quartus_sh --flow compile GBA -c ${{ matrix.revision }}
+          quartus_sh --flow compile GBA -c "$REVISION"
+          EOF
+          chmod +x build.sh
+          docker run --rm --entrypoint bash -v "$PWD:/work" -w /work -e REVISION raetro/quartus:17.0 build.sh
 
       - name: Detailed timing report
         if: success()
+        env:
+          REVISION: ${{ matrix.revision }}
         run: |
+          cat > sta.sh <<'EOF'
+          set -e
           printf '%s\n' \
-            "project_open GBA -revision ${{ matrix.revision }}" \
+            "project_open GBA -revision $REVISION" \
             "create_timing_netlist" \
             "read_sdc" \
             "update_timing_netlist" \
-            "report_timing -setup -npaths 50 -detail full_path -file output_files/${{ matrix.revision }}.paths.rpt" \
+            "report_timing -setup -npaths 50 -detail full_path -file output_files/$REVISION.paths.rpt" \
             "project_close" > paths.tcl
           quartus_sta -t paths.tcl
+          EOF
+          chmod +x sta.sh
+          docker run --rm --entrypoint bash -v "$PWD:/work" -w /work -e REVISION raetro/quartus:17.0 sta.sh
 
       - name: Upload artifacts
         if: always()
