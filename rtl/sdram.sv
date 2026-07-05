@@ -47,6 +47,7 @@ module sdram
 	input      [26:1] ch2_addr,    // 25 bit address for 8bit mode. addr[0] = 0 for 16bit mode for correct operations.
 	output reg [31:0] ch2_dout,    // data output to cpu
 	input      [31:0] ch2_din,     // data input from cpu
+	input       [3:0] ch2_be,      // byte enables for writes (DQM masks), keep 4'b1111 for reads
 	input             ch2_req,     // request
 	input             ch2_cancel,  // cancel pending read request so it doesn't deliver ready anymore
 	input             ch2_rnw,     // 1 - read, 0 - write
@@ -114,15 +115,38 @@ always @(posedge clk) begin
 	reg        saved_wr;
 	reg [12:0] cas_addr;
 	reg [31:0] saved_data;
+	reg  [3:0] saved_be;
 	reg [15:0] dq_reg;
 	reg  [3:0] state = STATE_STARTUP;
 
 	reg       ch1_rq, ch2_rq, ch3_rq;
 	reg [1:0] ch;
 
+	// ch2 request contract fix (2P guest mux): a request owns its attributes.
+	// The original code sampled ch2_addr/din/be/rnw LIVE at grant time and let
+	// a latched rq survive ch2_cancel - safe with the single 1P client whose
+	// registers hold still until grant, but with gba_wrap's guest mux in front
+	// the attributes move while a request waits (extern chains/rewinds its
+	// address, the mux switches source) and an abandoned request would run
+	// later as a ghost whose done poisons whichever channel waits.
+	reg [26:1] ch2_addr_r; // range matches the port: a [26:0] reg would
+	                       // zero-extend the assignment and shift every
+	                       // address bit down by one on queued grants
+	reg [31:0] ch2_din_r;
+	reg  [3:0] ch2_be_r;
+	reg        ch2_rnw_r;
+	reg        ch2_kill = 0;
+
 	ch1_rq <= ch1_rq | ch1_req;
-	ch2_rq <= ch2_rq | ch2_req;
+	ch2_rq <= (ch2_rq & ~ch2_cancel) | ch2_req; // cancel kills a pending rq; same-edge relaunch re-arms
 	ch3_rq <= ch3_rq | ch3_req;
+
+	if (ch2_req) begin
+		ch2_addr_r <= ch2_addr;
+		ch2_din_r  <= ch2_din;
+		ch2_be_r   <= ch2_be;
+		ch2_rnw_r  <= ch2_rnw;
+	end
 
 	ch1_ready   <= 0;
 	ch2_ready   <= 0;
@@ -212,6 +236,7 @@ always @(posedge clk) begin
 				{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {2'b00, 1'b1, ch1_addr[25:1]};
 				chip       <= ch1_addr[26];
 				saved_data <= ch1_din;
+				saved_be   <= 4'b1111;
 				saved_wr   <= ~ch1_rnw;
 				ch         <= 0;
 				ch1_rq     <= 0;
@@ -219,12 +244,29 @@ always @(posedge clk) begin
 				state      <= STATE_WAIT;
 			end
 			else if(ch2_rq | ch2_req) begin
-				{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {2'b00, ch2_rnw, ch2_addr[25:1]};
-				chip       <= ch2_addr[26];
-				saved_data <= ch2_din;
-				saved_wr   <= ~ch2_rnw;
+				// live attributes only for a same-edge request; a queued rq
+				// runs with what was latched at its request pulse. NB the
+				// cancel is deliberately NOT in this condition: extern's
+				// cancel term carries a wide comparator and would land in
+				// the SDRAM_A load cone; a stale rq granted at the cancel
+				// edge is silenced by ch2_kill below instead (dead slot)
+				if (ch2_req) begin
+					{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {2'b00, ch2_rnw, ch2_addr[25:1]};
+					chip       <= ch2_addr[26];
+					saved_data <= ch2_din;
+					saved_be   <= ch2_be;
+					saved_wr   <= ~ch2_rnw;
+				end
+				else begin
+					{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {2'b00, ch2_rnw_r, ch2_addr_r[25:1]};
+					chip       <= ch2_addr_r[26];
+					saved_data <= ch2_din_r;
+					saved_be   <= ch2_be_r;
+					saved_wr   <= ~ch2_rnw_r;
+				end
 				ch         <= 1;
 				ch2_rq     <= 0;
+				ch2_kill   <= 0;
 				command    <= CMD_ACTIVE;
 				state      <= STATE_WAIT;
 			end
@@ -232,6 +274,7 @@ always @(posedge clk) begin
 				{cas_addr[12:9],SDRAM_BA,SDRAM_A,cas_addr[8:0]} <= {2'b00, ch3_rnw, ch3_addr[23:1], 2'b00};
 				chip       <= ch3_addr[24];
 				saved_data <= {8'hFF, ch3_din[15:8], 8'hFF, ch3_din[7:0]};
+				saved_be   <= 4'b1111;
 				saved_wr   <= ~ch3_rnw;
 				ch         <= 2;
 				ch3_rq     <= 0;
@@ -246,6 +289,7 @@ always @(posedge clk) begin
 			if(saved_wr) begin
 				command  <= CMD_WRITE;
 				SDRAM_DQ <= saved_data[15:0];
+				SDRAM_A[12:11] <= ~saved_be[1:0]; // DQM byte masks for the low word
 				if(!ch) begin
 					ch1_ready  <= 1;
 					state <= STATE_IDLE_2;
@@ -258,16 +302,27 @@ always @(posedge clk) begin
 				command <= CMD_READ;
 				state   <= STATE_IDLE_5;
 				     if(ch == 0) data_ready_delay1[CAS_LATENCY+BURST_LENGTH] <= 1;
-				else if(ch == 1) data_ready_delay2[CAS_LATENCY+BURST_LENGTH] <= 1;
+				else if(ch == 1) begin
+					// a cancel since grant means nobody wants this data:
+					// let the burst run out silently, fire no ready
+					if (~ch2_kill) data_ready_delay2[CAS_LATENCY+BURST_LENGTH] <= 1;
+				end
 				else             data_ready_delay3[CAS_LATENCY+BURST_LENGTH] <= 1;
 			end
 		end
 
 		STATE_RW2: begin
 			if(ch == 1) begin
-				state       <= STATE_IDLE_2;
+				// 8-cycle slot like reads: the next grant's same-bank ACTIVE
+				// (or AUTO_REFRESH) must sit out tWR+tRP of this write's auto
+				// precharge and tRC of its ACTIVE (63ns on AS4C32M16SB-7 =
+				// 6.4 cycles). The old 6-cycle slot fired ACT at 59.6ns,
+				// corrupting rows under sustained EWRAM write traffic --
+				// harmless in 1P, whose gameplay never writes ch2.
+				state       <= STATE_IDLE_4;
 				SDRAM_A[10] <= 1;
 				SDRAM_A[0]  <= 1;
+				SDRAM_A[12:11] <= ~saved_be[3:2]; // DQM byte masks for the high word
 				command     <= CMD_WRITE;
 				SDRAM_DQ    <= saved_data[31:16];
 				ch2_ready   <= 1;
@@ -289,7 +344,18 @@ always @(posedge clk) begin
 		refresh_count <= startup_refresh_max - sdram_startup_cycles;
 	end
    
-   if (ch2_cancel) data_ready_delay2 <= 'd0;
+   if (ch2_cancel) begin
+		// kill the pipeline AND a ready registered this very edge: the
+		// pre-edge delay bit would otherwise let the abandoned op's done
+		// escape into whatever read the canceller starts on this edge
+		data_ready_delay2 <= 'd0;
+		ch2_ready         <= 0;
+		ch2_ready16       <= 0;
+		// sticky kill for ops between grant and CAS, and for a stale rq
+		// granted this very edge (this assignment is last, so it wins over
+		// the grant's clear). A same-edge relaunch keeps its op alive.
+		if (!ch2_req) ch2_kill <= 1;
+	end
  
 end
 

@@ -1904,7 +1904,7 @@ begin
          
          if (execute_stall = '0') then
             execute_RW_ena  <= execute_now and (not execute_skip); 
-            execute_RW_addr <= to_unsigned(to_integer(execute_busaddress) + decode_block_addrmod, execute_blockRW_endaddr'length);
+            execute_RW_addr <= unsigned(signed(execute_busaddress) + decode_block_addrmod);
          else
             execute_RW_addr <= execute_blockRW_addr;
             if (busState = BUSSTATE_WAITDATA and gb_bus_done = '1') then
@@ -2047,7 +2047,7 @@ begin
                        execute_writedata(31 downto 1) & '0'                                     when (execute_writeback = '1' and execute_writereg = x"F") else
                        (execute_op2(31 downto 1) & '0' + (decode_immidiate(10 downto 0) & '0')) when (decode_branch_long = '1') else
                        execute_op2(31 downto 1) & '0'                                           when (decode_branch_usereg = '1') else
-                       to_unsigned(to_integer(decode_PC) + to_integer(decode_branch_immi), 32);
+                       unsigned(signed(decode_PC) + resize(decode_branch_immi, 32));
    
    execute_branchPC_masked(31 downto 2) <= execute_branchPC(31 downto 2);
    execute_branchPC_masked(1) <= execute_branchPC(1) when (execute_nextIsthumb = '1') else '0';
@@ -2549,7 +2549,7 @@ begin
                         end if;
                         execute_stall            <= '1';
                         execute_blockRW_writereg <= unsigned(decode_RM_op2);
-                        execute_blockRW_endaddr  <= to_unsigned(to_integer(execute_busaddress) + decode_block_endmod, execute_blockRW_endaddr'length);
+                        execute_blockRW_endaddr  <= unsigned(signed(execute_busaddress) + decode_block_endmod);
                         execute_blockRW_addr     <= execute_RW_addr + 4;
                         if (decode_block_switchmode = '1') then
                            error_cpu <= '1';

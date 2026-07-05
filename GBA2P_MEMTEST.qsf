@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# SPDX-FileCopyrightText: 2026 Sarah Aronson <v@pingas.org>
+# GBA2P_MEMTEST revision: hardware bisector for 2P crashs
+
+source GBA.qsf
+
+set_global_assignment -name VERILOG_MACRO "GBA2P_MEMTEST=1"

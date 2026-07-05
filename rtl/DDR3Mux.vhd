@@ -26,10 +26,11 @@ end package;
 --------------- DDR3Mux module    -------------------------------
 -----------------------------------------------------------------
 
--- 234...256 Mbyte = Savestates                 (E000000)
--- 218...220 Mbyte = Border(320x240x4)          (D000000)
--- 128...129 Mbyte = 4 Framebuffers(240x160x2)  (8000000)
--- 0.5..64.5 Mbyte = Game ROM                   (0080000)
+-- 234...256 Mbyte = Savestates                          (E000000)
+-- 218...220 Mbyte = Border(320x240x4)                   (D000000)
+-- 128.5..129 Mbyte = 4 Framebuffers core 2 (2P profile) (8080000)
+-- 128..128.5 Mbyte = 4 Framebuffers(240x160x2)          (8000000)
+-- 0.5..64.5 Mbyte = Game ROM                            (0080000)
 
 library IEEE;
 use IEEE.std_logic_1164.all;  
@@ -39,7 +40,11 @@ library mem;
 use work.pDDR3.all;
 
 entity DDR3Mux is
-   port 
+   generic
+   (
+      gpufifo2_en      : std_logic := '0' -- 2P profile: second GPU write channel at byte 0x8080000
+   );
+   port
    (
       clk1x            : in  std_logic;
       
@@ -67,11 +72,17 @@ entity DDR3Mux is
       rdram_ready      : out tDDDR3Single;
       rdram_dataRead   : out std_logic_vector(63 downto 0);
       
-      gpufifo_reset    : in  std_logic; 
+      gpufifo_reset    : in  std_logic;
       gpufifo_Din      : in  std_logic_vector(33 downto 0); -- 16bit data + 18 bit address
-      gpufifo_Wr       : in  std_logic;  
-      gpufifo_nearfull : out std_logic;  
-      gpufifo_empty    : out std_logic
+      gpufifo_Wr       : in  std_logic;
+      gpufifo_nearfull : out std_logic;
+      gpufifo_empty    : out std_logic;
+
+      -- second channel takes whole 64bit words (4 pixels), not single pixels:
+      -- one entry per 2 clk1x is all the drain rate left over during blend
+      gpufifo2_Din     : in  std_logic_vector(79 downto 0) := (others => '0'); -- 16 bit word address + 64bit data
+      gpufifo2_Wr      : in  std_logic := '0';
+      gpufifo2_empty   : out std_logic
    );
 end entity;
 
@@ -95,8 +106,12 @@ architecture arch of DDR3Mux is
    
    -- gpu fifo
    signal gpufifo_Dout     : std_logic_vector(33 downto 0);
-   signal gpufifo_Rd       : std_logic := '0';      
+   signal gpufifo_Rd       : std_logic := '0';
    signal gpufifo_Next     : std_logic_vector(47 downto 0) := (others => '0');
+
+   -- gpu fifo 2 (2P profile)
+   signal gpufifo2_Dout    : std_logic_vector(79 downto 0) := (others => '0');
+   signal gpufifo2_Rd      : std_logic := '0';
 
 begin 
 
@@ -117,8 +132,9 @@ begin
       if rising_edge(clk1x) then
       
          error         <= '0';
-         
+
          gpufifo_Rd    <= '0';
+         gpufifo2_Rd   <= '0';
          
          rdram_granted <= (others => '0');
          rdram_done    <= (others => '0');
@@ -193,10 +209,20 @@ begin
                      end if;     
                   
                      gpufifo_Rd <= '1';
-                     ddr3_BE    <= x"FF";       
+                     ddr3_BE    <= x"FF";
                      ddr3_ADDR(24 downto 0) <= "100000000" & gpufifo_Dout(33 downto 18);
                      ddr3_BURSTCNT <= x"01";
-                     
+
+                  elsif (gpufifo2_en = '1' and gpufifo2_empty = '0' and gpufifo2_Rd = '0') then
+
+                     ddr3_DIN      <= gpufifo2_Dout(63 downto 0);
+                     ddr3_WE       <= '1';
+
+                     gpufifo2_Rd   <= '1';
+                     ddr3_BE       <= x"FF";
+                     ddr3_ADDR(24 downto 0) <= "100000001" & gpufifo2_Dout(79 downto 64);
+                     ddr3_BURSTCNT <= x"01";
+
                   end if;
                   
                end if;
@@ -258,10 +284,44 @@ begin
       Wr       => gpufifo_Wr,
       Full     => error_fifo,    
       NearFull => gpufifo_nearfull,
-      Dout     => gpufifo_Dout,    
-      Rd       => gpufifo_Rd,      
-      Empty    => gpufifo_empty   
-   );   
+      Dout     => gpufifo_Dout,
+      Rd       => gpufifo_Rd,
+      Empty    => gpufifo_empty
+   );
+
+   -- paired if generates, not else generate: Quartus 17 VHDL-2008 support is patchy
+   gGPUFifo2 : if (gpufifo2_en = '1') generate
+   begin
+
+      iGPUFifo2: entity mem.SyncFifoFallThrough
+      generic map
+      (
+         SIZE             => 256,
+         DATAWIDTH        => 80, -- 16 bit word address + 64bit data
+         NEARFULLDISTANCE => 16
+      )
+      port map
+      (
+         clk      => clk1x,
+         reset    => gpufifo_reset,
+         Din      => gpufifo2_Din,
+         Wr       => gpufifo2_Wr,
+         Full     => open,
+         NearFull => open,
+         Dout     => gpufifo2_Dout,
+         Rd       => gpufifo2_Rd,
+         Empty    => gpufifo2_empty
+      );
+
+   end generate gGPUFifo2;
+
+   gNoGPUFifo2 : if (gpufifo2_en = '0') generate
+   begin
+
+      gpufifo2_empty <= '1';
+      gpufifo2_Dout  <= (others => '0');
+
+   end generate gNoGPUFifo2;
 
 end architecture;
 
