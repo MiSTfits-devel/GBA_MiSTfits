@@ -12,7 +12,8 @@ entity gba_memorymux is
    generic
    (
       is_simu                  : std_logic;
-      Softmap_GBA_Gamerom_ADDR : integer; -- count: 8388608  -- 32 Mbyte Data for GameRom   
+      ewram_in_sdram           : std_logic := '0'; -- 1 = EWRAM lives in SDRAM (2P profile), no BRAM instance
+      Softmap_GBA_Gamerom_ADDR : integer; -- count: 8388608  -- 32 Mbyte Data for GameRom
       Softmap_GBA_FLASH_ADDR   : integer; -- count:  131072  -- 128/512 Kbyte Data for GBA Flash
       Softmap_GBA_EEPROM_ADDR  : integer  -- count:    8192  -- 8/32 Kbyte Data for GBA EEProm
    );
@@ -36,6 +37,14 @@ entity gba_memorymux is
       cart_readdata        : in     std_logic_vector(31 downto 0);
       
       cart_waitcnt         : in     std_logic_vector(14 downto 0);
+
+      ewram_ena            : out    std_logic := '0';
+      ewram_rnw            : out    std_logic := '0';
+      ewram_addr           : out    std_logic_vector(15 downto 0) := (others => '0');
+      ewram_be             : out    std_logic_vector(3 downto 0) := (others => '0');
+      ewram_writedata      : out    std_logic_vector(31 downto 0) := (others => '0');
+      ewram_done           : in     std_logic := '0';
+      ewram_readdata       : in     std_logic_vector(31 downto 0) := (others => '0');
                                     
 -- synthesis translate_off
       debug_PF_count       : out    unsigned(3 downto 0) := (others => '0');
@@ -123,7 +132,8 @@ architecture arch of gba_memorymux is
       IDLE,
       ALLWAIT,
       ALLWAIT_CE,
-      WAIT_CART
+      WAIT_CART,
+      WAIT_EWRAM
    );
    signal state : tState := IDLE;
    
@@ -142,15 +152,7 @@ architecture arch of gba_memorymux is
       READSTATE_UNREADABLE
    );
    signal readState : treadState := READSTATE_BIOS;
-   
-   type treadStateCheats is
-   (
-      READSTATECHEATS_IDLE,
-      READSTATECHEATS_EWRAM,
-      READSTATECHEATS_IRAM
-   );
-   signal readStateCheats : treadStateCheats := READSTATECHEATS_IDLE;
-   
+
    signal mem_bus_din_unrot       : std_logic_vector(31 downto 0);
           
    signal mem_bus_din_dummy       : std_logic_vector(31 downto 0);
@@ -345,6 +347,9 @@ begin
    
    smallram_addr <= to_integer(unsigned(mem_bus_Adr(14 downto 2))) when (mem_bus_ena = '1') else to_integer(unsigned(Cheats_BusAddr(14 downto 2)));
 
+   -- paired if generates, not else generate: Quartus 17 VHDL-2008 support is patchy
+   gEwramBram : if (ewram_in_sdram = '0') generate
+   begin
    ilargeram: entity MEM.SyncRamDualByteEnable
    generic map
    (
@@ -357,7 +362,7 @@ begin
    port map
    (
       clk        => clk,
-      
+
       ce_a       => '1',
       addr_a     => largeram_addr,
       datain_a0  => rotate_writedata(7 downto 0),
@@ -367,7 +372,7 @@ begin
       dataout_a  => open,
       we_a       => largeram_we,
       be_a       => rotate_BE,
-        
+
       ce_b       => largeram_ce,
       addr_b     => largeram_addr,
       datain_b0  => x"00",
@@ -377,53 +382,29 @@ begin
       dataout_b  => largeram_DataOut,
       we_b       => '0',
       be_b       => "0000"
-   );   
+   );
+   end generate gEwramBram;
+
+   gEwramSdram : if (ewram_in_sdram = '1') generate
+   begin
+      largeram_DataOut <= (others => '0'); -- cheat reads from EWRAM are unsupported in this mode
+   end generate gEwramSdram;
 
    largeram_addr <= to_integer(unsigned(mem_bus_Adr(17 downto 2))) when (mem_bus_ena = '1') else to_integer(unsigned(Cheats_BusAddr(17 downto 2)));
    
    -- input rotate
-   process (all)
-   begin
-      
-      rotate_writedata <= mem_bus_dout; -- default, full dword      
-      if (mem_bus_acc = ACCESS_8BIT) then
-         case(mem_bus_Adr(1 downto 0)) is
-            when "00" => rotate_writedata( 7 downto  0) <= mem_bus_dout(7 downto 0);
-            when "01" => rotate_writedata(15 downto  8) <= mem_bus_dout(7 downto 0);
-            when "10" => rotate_writedata(23 downto 16) <= mem_bus_dout(7 downto 0);
-            when "11" => rotate_writedata(31 downto 24) <= mem_bus_dout(7 downto 0);
-            when others => null;
-         end case;
-      elsif (mem_bus_acc = ACCESS_16BIT and mem_bus_Adr(1) = '1') then
-         rotate_writedata(31 downto 16) <= mem_bus_dout(15 downto 0);
-      end if;
-   
-      rotate_BE <= "1111";
-      case (mem_bus_acc) is
-         when ACCESS_8BIT  => 
-            case (mem_bus_Adr(1 downto 0)) is
-               when "00" => rotate_BE <= "0001";
-               when "01" => rotate_BE <= "0010";
-               when "10" => rotate_BE <= "0100";
-               when "11" => rotate_BE <= "1000";
-               when others => null;
-            end case;
-         when ACCESS_16BIT => 
-            if (mem_bus_Adr(1) = '1') then
-               rotate_BE <= "1100";
-            else
-               rotate_BE <= "0011";
-            end if;
-         when ACCESS_32BIT => rotate_BE <= "1111";
-         when others => null;
-      end case;
-      
-      if (mem_bus_ena = '0') then
-         rotate_writedata <= Cheats_BusWriteData;     
-         rotate_BE        <= "1111";
-      end if;
-      
-   end process;
+   iwriterotate : entity work.gba_mem_writerotate
+   port map
+   (
+      mem_bus_Adr         => mem_bus_Adr(1 downto 0),
+      mem_bus_acc         => mem_bus_acc,
+      mem_bus_dout        => mem_bus_dout,
+      mem_bus_ena         => mem_bus_ena,
+      Cheats_BusWriteData => Cheats_BusWriteData,
+
+      rotate_writedata    => rotate_writedata,
+      rotate_BE           => rotate_BE
+   );
    
    -- request
    gb_bus_out.rst   <= register_reset;
@@ -535,6 +516,12 @@ begin
       OAMRAM_PROC_datain <= rotate_writedata;
       OAMRAM_PROC_we     <= (others => '0');
 
+      ewram_ena       <= '0';
+      ewram_rnw       <= mem_bus_rnw;
+      ewram_addr      <= mem_bus_Adr(17 downto 2);
+      ewram_be        <= rotate_BE;
+      ewram_writedata <= rotate_writedata;
+
       cart_ena       <= '0';
       cart_32        <= '0';
       cart_rnw       <= mem_bus_rnw;
@@ -572,11 +559,14 @@ begin
                   bios_readEna <= mem_bus_rnw;
                end if;
              
-            when x"2" => 
-               largeram_ce <= '1'; 
-               largeram_we <= not mem_bus_rnw; 
-             
-            when x"3" => 
+            when x"2" =>
+               largeram_ce <= '1';
+               largeram_we <= not mem_bus_rnw;
+               if (ewram_in_sdram = '1') then
+                  ewram_ena <= '1';
+               end if;
+
+            when x"3" =>
                smallram_ce <= '1';
                smallram_we <= not mem_bus_rnw;
                
@@ -649,7 +639,12 @@ begin
       case (readState) is
       
          when READSTATE_BIOS       => mem_bus_din_unrot <= bios_data;
-         when READSTATE_EWRAM      => mem_bus_din_unrot <= largeram_DataOut;
+         when READSTATE_EWRAM      =>
+            if (ewram_in_sdram = '1') then
+               mem_bus_din_unrot <= ewram_readdata;
+            else
+               mem_bus_din_unrot <= largeram_DataOut;
+            end if;
          when READSTATE_IRAM       => mem_bus_din_unrot <= smallram_DataOut;
          when READSTATE_GBBUS      => 
             mem_bus_din_unrot <= wired_out;
@@ -675,40 +670,37 @@ begin
             end if;
       
       end case;
-      
-      mem_bus_din <= (others => '0');
-      
-      if (acc_save = ACCESS_8BIT) then
-         case (return_rotate) is
-            when "00" => mem_bus_din <= x"000000" & mem_bus_din_unrot(7 downto 0);
-            when "01" => mem_bus_din <= x"000000" & mem_bus_din_unrot(15 downto 8);
-            when "10" => mem_bus_din <= x"000000" & mem_bus_din_unrot(23 downto 16);
-            when "11" => mem_bus_din <= x"000000" & mem_bus_din_unrot(31 downto 24);
-            when others => null;
-         end case;
-      elsif (acc_save = ACCESS_16BIT) then
-         case (return_rotate) is
-            when "00" => mem_bus_din <= x"0000" & mem_bus_din_unrot(15 downto 0);
-            when "01" => mem_bus_din <= mem_bus_din_unrot(7 downto 0) & x"0000" & mem_bus_din_unrot(15 downto 8);
-            when "10" => mem_bus_din <= x"0000" & mem_bus_din_unrot(31 downto 16);
-            when "11" => mem_bus_din <= mem_bus_din_unrot(23 downto 16) & x"0000" & mem_bus_din_unrot(31 downto 24);
-            when others => null;
-         end case;
-      else
-         case (return_rotate) is
-            when "00" => mem_bus_din <= mem_bus_din_unrot;
-            when "01" => mem_bus_din <= mem_bus_din_unrot(7 downto 0) & mem_bus_din_unrot(31 downto 8);
-            when "10" => mem_bus_din <= mem_bus_din_unrot(15 downto 0) & mem_bus_din_unrot(31 downto 16);
-            when "11" => mem_bus_din <= mem_bus_din_unrot(23 downto 0) & mem_bus_din_unrot(31 downto 24);
-            when others => null;
-         end case;
-      end if;
-      
-      if (ce_latched_done = '1' and saving_savestate = '0') then
-         mem_bus_din <= ce_latched_data;
-      end if;
-      
+
    end process;
+
+   -- cheat engine reads
+   icheatread : entity work.gba_mem_cheatread
+   port map
+   (
+      clk                => clk,
+      mem_bus_ena        => mem_bus_ena,
+      Cheats_Bus_ena     => Cheats_Bus_ena,
+      Cheats_BusAddr     => Cheats_BusAddr,
+      largeram_DataOut   => largeram_DataOut,
+      smallram_DataOut   => smallram_DataOut,
+
+      Cheats_BusReadData => Cheats_BusReadData,
+      Cheats_Bus_done    => Cheats_Bus_done
+   );
+
+   -- output rotate
+   ireadrotate : entity work.gba_mem_readrotate
+   port map
+   (
+      acc_save          => acc_save,
+      return_rotate     => return_rotate,
+      mem_bus_din_unrot => mem_bus_din_unrot,
+      ce_latched_done   => ce_latched_done,
+      ce_latched_data   => ce_latched_data,
+      saving_savestate  => saving_savestate,
+
+      mem_bus_din       => mem_bus_din
+   );
    
    
    prefetch_stopDelay <= 1 when (prefetch_active = '1' and (prefetch_countDown = 1 or (prefetch_width = 4 and prefetch_countDown = ((prefetch_timingNext / 2) + 1)))) else 0; 
@@ -749,36 +741,6 @@ begin
          
          vram_cycle      <= '0';
          
-         -- Cheats
-         Cheats_Bus_done <= '0';
-         case readStateCheats is
-            when READSTATECHEATS_IDLE =>
-               if (mem_bus_ena = '0' and Cheats_Bus_ena = '1') then
-                  case (Cheats_BusAddr(27 downto 24)) is
-                  
-                     when x"2" =>
-                        readStateCheats    <= READSTATECHEATS_EWRAM;
-                              
-                     when x"3" =>
-                        readStateCheats    <= READSTATECHEATS_IRAM;
-                        
-                     when others => null;
-                  
-                  end case;
-               end if;
-               
-            when READSTATECHEATS_EWRAM =>
-               readStateCheats    <= READSTATECHEATS_IDLE;
-               Cheats_BusReadData <= largeram_DataOut; 
-               Cheats_Bus_done    <= '1';
-            
-            when READSTATECHEATS_IRAM =>
-               readStateCheats    <= READSTATECHEATS_IDLE;
-               Cheats_BusReadData <= smallram_DataOut; 
-               Cheats_Bus_done    <= '1';
-               
-         end case;
-
          -- ce stopped handling
          if ((ce = '1' and mem_bus_done_out = '1') or reset = '1' or loading_savestate = '1') then
             ce_latched_done   <= '0';
@@ -877,7 +839,14 @@ begin
                            
                            when x"2" =>
                               readState    <= READSTATE_EWRAM;
-                              if (sleep_savestate = '1') then
+                              if (ewram_in_sdram = '1') then
+                                 state        <= WAIT_EWRAM;
+                                 if (mem_bus_acc = ACCESS_32BIT) then
+                                    wait_timer <= 4;
+                                 else
+                                    wait_timer <= 1;
+                                 end if;
+                              elsif (sleep_savestate = '1') then
                                  mem_bus_done <= '1';
                               else
                                  state        <= ALLWAIT;
@@ -885,7 +854,7 @@ begin
                                     wait_timer <= 4;
                                  else
                                     wait_timer <= 1;
-                                 end if;  
+                                 end if;
                               end if;
                               
                            when x"3" =>
@@ -1021,8 +990,15 @@ begin
                      else
                      
                         case (mem_bus_Adr(27 downto 24)) is
-                           when x"2" => 
-                              if (sleep_savestate = '1') then
+                           when x"2" =>
+                              if (ewram_in_sdram = '1') then
+                                 state <= WAIT_EWRAM;
+                                 if (mem_bus_acc = ACCESS_32BIT) then
+                                    wait_timer <= 4;
+                                 else
+                                    wait_timer <= 1;
+                                 end if;
+                              elsif (sleep_savestate = '1') then
                                  mem_bus_done <= '1';
                               else
                                  state <= ALLWAIT;
@@ -1030,7 +1006,7 @@ begin
                                     wait_timer <= 4;
                                  else
                                     wait_timer <= 1;
-                                 end if; 
+                                 end if;
                               end if;
                                
                            when x"3" =>
@@ -1127,9 +1103,25 @@ begin
                      if (wait_timer > 0) then
                         state      <= ALLWAIT;
                      else
-                        mem_bus_done    <= '1'; 
+                        mem_bus_done    <= '1';
                         state           <= IDLE;
                      end if;
+                  end if;
+               end if;
+
+            -- same handshake as WAIT_CART: modeled waitstates still apply, the
+            -- SDRAM roundtrip only adds time when it outlasts them
+            when WAIT_EWRAM =>
+               if (wait_timer > 0) then
+                  wait_timer <= wait_timer - 1;
+               end if;
+
+               if (ewram_done = '1') then
+                  if (wait_timer > 0) then
+                     state <= ALLWAIT;
+                  else
+                     mem_bus_done <= '1';
+                     state        <= IDLE;
                   end if;
                end if;
 

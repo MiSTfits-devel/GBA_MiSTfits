@@ -10,7 +10,8 @@ entity memorymux_extern is
    generic
    (
       is_simu                  : std_logic;
-      Softmap_GBA_Gamerom_ADDR : integer; -- count: 8388608  -- 32 Mbyte Data for GameRom   
+      sim_trace                : std_logic := '0'; -- report cache/SDRAM events (unit benches only)
+      Softmap_GBA_Gamerom_ADDR : integer; -- count: 8388608  -- 32 Mbyte Data for GameRom
       Softmap_GBA_FLASH_ADDR   : integer; -- count:  131072  -- 128/512 Kbyte Data for GBA Flash
       Softmap_GBA_EEPROM_ADDR  : integer  -- count:    8192  -- 8/32 Kbyte Data for GBA EEProm
    );
@@ -40,7 +41,11 @@ entity memorymux_extern is
       cart_readdata        : out    std_logic_vector(31 downto 0);
       
       cart_waitcnt         : in     std_logic_vector(15 downto 0);
-                                    
+
+      ewram_active         : in     std_logic := '0'; -- EWRAM channel pending or in flight -> hold off cache fill and refresh
+      ewram_allow          : out    std_logic;        -- scheduler idle, EWRAM channel may launch at clk6xIndex 0
+      hold_ena             : in     std_logic := '0'; -- a foreign SDRAM channel owns the request bus -> defer own launch (2P profile)
+
       sdram_Din            : out    std_logic_vector(31 downto 0) := (others => '0');
       sdram_Adr            : buffer std_logic_vector(26 downto 0) := (others => '0');
       sdram_rnw            : out    std_logic := '0';                     
@@ -113,6 +118,12 @@ architecture arch of memorymux_extern is
    signal cart_writedata_1       : std_logic_vector(7 downto 0) := (others => '0');
    
    signal cart_readdata_6x       : std_logic_vector(31 downto 0) := (others => '0');
+
+   -- launch decided but the request bus was owned by a foreign channel (2P
+   -- profile: the other core's EWRAM/cart channels). The op stays pending and
+   -- launches at the next free clk6xIndex 0 slot; constant '0' in the full
+   -- profile where hold_ena is tied off.
+   signal launch_pending         : std_logic := '0';
    
    signal adr_save               : std_logic_vector(27 downto 0);
    signal Dout_save              : std_logic_vector(7 downto 0) := (others => '0');
@@ -279,6 +290,15 @@ begin
                            cart_readdata <= x"0000" & cache_data(cache_index16);
                         end if;
                         cache_remove     <= '1';
+                        -- synthesis translate_off
+                        if (sim_trace = '1') then
+                           report "TRC hit addr " & to_hstring(unsigned(cart_addr)) &
+                                  " idx " & integer'image(cache_index16) &
+                                  " data " & to_hstring(cache_data(cache_index16)) &
+                                  " next " & to_hstring(cache_next) &
+                                  " valid " & to_string(cache_valid);
+                        end if;
+                        -- synthesis translate_on
                      else
                         state1X          <= WAITDATA;
                         cart_ena_1       <= '1';             
@@ -286,9 +306,15 @@ begin
                   end if;
                   
                when WAITDATA =>
-                  if (state = IDLE) then
+                  if (state = IDLE and launch_pending = '0') then
                      state1X       <= IDLE1X;
                      cart_done     <= '1';
+                     -- synthesis translate_off
+                     if (sim_trace = '1') then
+                        report "TRC cpu done addr " & to_hstring(unsigned(cart_addr_1)) &
+                               " data " & to_hstring(cart_readdata_6x);
+                     end if;
+                     -- synthesis translate_on
                      if (cart_32_1 = '0' and cart_addr_1(1) = '1') then
                         cart_readdata <= cart_readdata_6x(15 downto 0) & cart_readdata_6x(31 downto 16);
                      else
@@ -315,10 +341,15 @@ begin
       cachecount <= cachecounter;
    end process;
    
-   sdram_refresh <= '1' when (state = IDLE and cacheState = CACHE_IDLE and clk6xIndex = 0 and refresh_block = '0' and cart_ena_1 = '0' and cart_done = '0' and cache_remove = '0' and (cacheEnable = '0' or cachecount > 1)) else 
+   sdram_refresh <= '1' when (state = IDLE and cacheState = CACHE_IDLE and clk6xIndex = 0 and refresh_block = '0' and cart_ena_1 = '0' and launch_pending = '0' and cart_done = '0' and cache_remove = '0' and ewram_active = '0' and (cacheEnable = '0' or cachecount > 1)) else
                     '0';
-                    
-   sdram_cancel  <= '1' when (state = IDLE and clk6xIndex = 0 and cart_ena_1 = '1') else 
+
+   ewram_allow   <= '1' when (state = IDLE and cacheState = CACHE_IDLE and cart_ena_1 = '0' and launch_pending = '0' and cache_remove = '0' and sdram_refresh = '0') else
+                    '0';
+
+   -- never cancel while a foreign channel owns the bus: with hold_ena set no
+   -- own burst can be in flight, but the foreign op's read data would be killed
+   sdram_cancel  <= '1' when (state = IDLE and clk6xIndex = 0 and cart_ena_1 = '1' and hold_ena = '0') else
                     '1' when (cacheState /= CACHE_IDLE and clk6xIndex = 0 and cache_remove = '1' and cache_next /= unsigned(cart_addr_1)) else
                     '0';
    
@@ -377,6 +408,7 @@ begin
             cacheEnable       <= '0';
             cache_valid       <= (others => '0');
             cacheState        <= CACHE_IDLE;
+            launch_pending    <= '0';
                               
             rom_debug_cnt     <= (others => '0');
             rom_debug_ena     <= (others => '0');
@@ -402,22 +434,34 @@ begin
          
             case (cacheState) is
                when CACHE_IDLE =>
-                  if (cacheEnable = '1' and state = IDLE and clk6xIndex = 0 and cart_ena_1 = '0' and sdram_refresh = '0') then
+                  if (cacheEnable = '1' and state = IDLE and clk6xIndex = 0 and cart_ena_1 = '0' and launch_pending = '0' and sdram_refresh = '0' and ewram_active = '0') then
                      cacheState <= WAIT_CACHE16;
                      sdram_ena  <= '1';
                      sdram_Adr  <= std_logic_vector(unsigned(sdram_Adr) + 2);
-   
+
                      if (cachecount > 6 or (refresh_timer(8) = '1' and cachecount > 3)) then
-                        sdram_ena  <= '0'; 
+                        sdram_ena  <= '0';
                         cacheState <= CACHE_IDLE;
                         sdram_Adr  <= sdram_Adr;
+                     else
+                        null;
+                        -- synthesis translate_off
+                        if (sim_trace = '1') then
+                           report "TRC fill launch sdramadr " & to_hstring(unsigned(sdram_Adr) + 2);
+                        end if;
+                        -- synthesis translate_on
                      end if;
                   end if;
-                              
+
                when WAIT_CACHE16 =>
                   if (sdram_cancel = '1') then
                      cacheState <= CACHE_IDLE;
                      sdram_Adr  <= std_logic_vector(unsigned(sdram_Adr) - 2);
+                     -- synthesis translate_off
+                     if (sim_trace = '1') then
+                        report "TRC fill16 cancel sdramadr " & to_hstring(unsigned(sdram_Adr));
+                     end if;
+                     -- synthesis translate_on
                   elsif (sdram_done16 = '1') then
                      if (sdram_Adr(1) = '0') then
                         cacheState <= WAIT_CACHE32;
@@ -426,17 +470,41 @@ begin
                         cacheState <= CACHE_IDLE;
                      end if;
                      cache_valid(to_integer(unsigned(sdram_Adr(3 downto 1)))) <= '1';
-                     cache_data(to_integer(unsigned(sdram_Adr(3 downto 1))))  <= sdram_Dout(15 downto 0); 
+                     cache_data(to_integer(unsigned(sdram_Adr(3 downto 1))))  <= sdram_Dout(15 downto 0);
+                     -- synthesis translate_off
+                     if (sim_trace = '1') then
+                        report "TRC fill16 store idx " & integer'image(to_integer(unsigned(sdram_Adr(3 downto 1)))) &
+                               " sdramadr " & to_hstring(unsigned(sdram_Adr)) &
+                               " data " & to_hstring(sdram_Dout(15 downto 0));
+                     end if;
+                     -- synthesis translate_on
                   end if;
                   
                when WAIT_CACHE32 =>
-                  if (sdram_done32 = '1') then
+                  -- a cancel kills the in-flight burst: without this exit the
+                  -- state would consume the NEXT transaction's done32 and
+                  -- poison the cache with foreign data
+                  if (sdram_cancel = '1') then
+                     cacheState <= CACHE_IDLE;
+                     -- synthesis translate_off
+                     if (sim_trace = '1') then
+                        report "TRC fill32 cancel sdramadr " & to_hstring(unsigned(sdram_Adr));
+                     end if;
+                     -- synthesis translate_on
+                  elsif (sdram_done32 = '1') then
                      cacheState <= CACHE_IDLE;
                      if (cache_valid /= x"FF") then -- prevent exceeding 8 cached words, rather drop it
                         cache_valid(to_integer(unsigned(sdram_Adr(3 downto 1)))) <= '1';
-                        cache_data(to_integer(unsigned(sdram_Adr(3 downto 1))))  <= sdram_Dout(31 downto 16); 
+                        cache_data(to_integer(unsigned(sdram_Adr(3 downto 1))))  <= sdram_Dout(31 downto 16);
                      end if;
-                  end if;   
+                     -- synthesis translate_off
+                     if (sim_trace = '1') then
+                        report "TRC fill32 store idx " & integer'image(to_integer(unsigned(sdram_Adr(3 downto 1)))) &
+                               " sdramadr " & to_hstring(unsigned(sdram_Adr)) &
+                               " data " & to_hstring(sdram_Dout(31 downto 16));
+                     end if;
+                     -- synthesis translate_on
+                  end if;
                
             end case;
             
@@ -451,15 +519,35 @@ begin
                end if;
                if (cache_next /= unsigned(cart_addr_1)) then
                   cache_valid <= (others => '0');
-                  cacheState <= WAIT_CACHE16;
-                  sdram_ena  <= '1';
-                  sdram_Adr  <= std_logic_vector(unsigned(sdram_Adr) + 2);
-   
-                  if (memory_remap = '1') then
-                     sdram_Adr <= std_logic_vector(to_unsigned(Softmap_GBA_Gamerom_ADDR, busadr_bits) + unsigned(cart_addr_1(19 downto 0)) + 2);
+                  if (hold_ena = '1') then
+                     -- a foreign channel owns the bus: skip the prefetch
+                     -- restart, the next read is a plain miss instead
+                     cacheEnable <= '0';
                   else
-                     sdram_Adr <= std_logic_vector(to_unsigned(Softmap_GBA_Gamerom_ADDR, busadr_bits) + unsigned(cart_addr_1(24 downto 0)) + 2);
-                  end if; 
+                     cacheState <= WAIT_CACHE16;
+                     sdram_ena  <= '1';
+                     sdram_Adr  <= std_logic_vector(unsigned(sdram_Adr) + 2);
+
+                     if (memory_remap = '1') then
+                        sdram_Adr <= std_logic_vector(to_unsigned(Softmap_GBA_Gamerom_ADDR, busadr_bits) + unsigned(cart_addr_1(19 downto 0)) + 2);
+                     else
+                        sdram_Adr <= std_logic_vector(to_unsigned(Softmap_GBA_Gamerom_ADDR, busadr_bits) + unsigned(cart_addr_1(24 downto 0)) + 2);
+                     end if;
+                     -- synthesis translate_off
+                     if (sim_trace = '1') then
+                        report "TRC remove restart addr1 " & to_hstring(unsigned(cart_addr_1)) &
+                               " next " & to_hstring(cache_next) & " cstate " & tCacheState'image(cacheState);
+                     end if;
+                     -- synthesis translate_on
+                  end if;
+               else
+                  null;
+                  -- synthesis translate_off
+                  if (sim_trace = '1') then
+                     report "TRC remove seq addr1 " & to_hstring(unsigned(cart_addr_1)) &
+                            " next " & to_hstring(cache_next) & " cstate " & tCacheState'image(cacheState);
+                  end if;
+                  -- synthesis translate_on
                end if;
             end if;
             
@@ -469,15 +557,27 @@ begin
                
                   flash_busy  <= '0';
                
-                  if (cart_ena_1 = '1' and clk6xIndex = 0) then
-                  
+                  if ((cart_ena_1 = '1' or launch_pending = '1') and clk6xIndex = 0) then
+                   -- cart_addr_1/rnw/32/writedata stay latched while the 1x side
+                   -- waits in WAITDATA, so a deferred launch reuses them as is
+                   if (hold_ena = '1') then
+                      launch_pending <= '1';
+                   else
+                      launch_pending <= '0';
+
                      cacheState  <= CACHE_IDLE;
                      
                      adr_save    <= cart_addr_1;
                      Dout_save   <= cart_writedata_1;
       
                      if (cart_rnw_1 = '1') then  -- read
-                     
+
+                        -- synthesis translate_off
+                        if (sim_trace = '1') then
+                           report "TRC cpu launch addr " & to_hstring(unsigned(cart_addr_1)) &
+                                  " cstate " & tCacheState'image(cacheState);
+                        end if;
+                        -- synthesis translate_on
                         cacheEnable <= '0';
                         sdram_rnw   <= '1';
                         cache_valid <= (others => '0');
@@ -551,11 +651,12 @@ begin
                               state <= IDLE;
       
                         end case;
-                        
+
                      end if;
-                  
+
+                   end if;
                   end if;
-                  
+
                -- reading
                when WAIT_SDRAM =>
                   if (cart_32_1 = '1' and sdram_done32 = '1') then 
@@ -564,8 +665,11 @@ begin
                      sdram_Adr        <= std_logic_vector(unsigned(sdram_Adr) + 2);
                   elsif (cart_32_1 = '0' and sdram_done16 = '1') then
                      state      <= IDLE;
-                     cart_readdata_6x <= x"0000" & sdram_Dout(15 downto 0); 
-                     if (cacheEnable = '1' and sdram_Adr(1) = '0' and sdram_rnw = '1') then
+                     cart_readdata_6x <= x"0000" & sdram_Dout(15 downto 0);
+                     -- do not chain into the burst tail when a same-edge
+                     -- cancel just killed it (WAIT_CACHE32 would then pair
+                     -- with a foreign done32)
+                     if (cacheEnable = '1' and sdram_Adr(1) = '0' and sdram_rnw = '1' and sdram_cancel = '0') then
                         cacheState <= WAIT_CACHE32;
                         sdram_Adr  <= std_logic_vector(unsigned(sdram_Adr) + 2);
                      end if;

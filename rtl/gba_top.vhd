@@ -13,9 +13,13 @@ entity gba_top is
       Softmap_GBA_Gamerom_ADDR : integer; -- count: 8388608    -- 32 Mbyte Data for GameRom
       Softmap_GBA_FLASH_ADDR   : integer; -- count:  131072    -- 128/512 Kbyte Data for GBA Flash
       Softmap_GBA_EEPROM_ADDR  : integer; -- count:    8192    -- 8/32 Kbyte Data for GBA EEProm
-      Softmap_SaveState_ADDR   : integer; -- count:  524288    -- 512 Kbyte Data for Savestate 
+      Softmap_SaveState_ADDR   : integer; -- count:  524288    -- 512 Kbyte Data for Savestate
       Softmap_Rewind_ADDR      : integer; -- count:  524288*64 -- 64*512 Kbyte Data for Savestates
       is_simu                  : std_logic := '0';
+      simu_export_trace        : std_logic := '1'; -- 0 = skip the per-instruction cpu trace file writer (simulation only)
+      strip_savestates         : std_logic := '0'; -- 1 = no savestates/rewind, only the reset controller remains (2P profile)
+      strip_cheats             : std_logic := '0'; -- 1 = no cheat engine (2P profile)
+      ewram_in_sdram           : std_logic := '0'; -- 1 = EWRAM lives in SDRAM instead of BRAM (2P profile)
       turbosound               : std_logic  -- sound buffer to play sound in turbo mode without sound pitched up
    );
    port 
@@ -63,6 +67,14 @@ entity gba_top is
       cart_waitcnt          : out    std_logic_vector(15 downto 0);
       dma_eepromcount       : out    unsigned(16 downto 0);
       cart_reset            : out    std_logic;
+      -- EWRAM in SDRAM (2P profile)
+      ewram_ena             : out    std_logic := '0';
+      ewram_rnw             : out    std_logic := '0';
+      ewram_addr            : out    std_logic_vector(15 downto 0) := (others => '0');
+      ewram_be              : out    std_logic_vector(3 downto 0) := (others => '0');
+      ewram_writedata       : out    std_logic_vector(31 downto 0) := (others => '0');
+      ewram_done            : in     std_logic := '0';
+      ewram_readdata        : in     std_logic_vector(31 downto 0) := (others => '0');
       -- savestate           
       SAVE_out_Din          : out    std_logic_vector(63 downto 0); -- data read from savestate
       SAVE_out_Dout         : in     std_logic_vector(63 downto 0); -- data written to savestate
@@ -93,7 +105,21 @@ entity gba_top is
       KeyR                  : in     std_logic;
       KeyL                  : in     std_logic;
       KeyPause              : in     std_logic;
-      -- debug interface          
+      -- link port (open drain (value, oe) pairs, inputs must be synchronized)
+      link_enable           : in     std_logic := '0';
+      link_role_parent      : in     std_logic := '1';
+      link_clk_out          : out    std_logic := '1';
+      link_clk_oe           : out    std_logic := '0';
+      link_clk_in           : in     std_logic := '1';
+      link_so_out           : out    std_logic := '1';
+      link_so_oe            : out    std_logic := '0';
+      link_si_in            : in     std_logic := '1';
+      link_sd_out           : out    std_logic := '1';
+      link_sd_oe            : out    std_logic := '0';
+      link_sd_in            : in     std_logic := '1';
+      -- temporary hardware diagnostic, see gba_serial.vhd/gba_wrap.vhd
+      debug_link_state      : out    std_logic_vector(70 downto 0) := (others => '0');
+      -- debug interface
       GBA_BusAddr           : in     std_logic_vector(27 downto 0);
       GBA_BusRnW            : in     std_logic;
       GBA_BusACC            : in     std_logic_vector(1 downto 0);
@@ -121,19 +147,9 @@ end entity;
 
 architecture arch of gba_top is
 
-   constant DEBUG_NOCPU : std_logic := '0'; 
+   constant DEBUG_NOCPU : std_logic := '0';
 
-   type tState is
-   (
-      PAUSING,
-      RUNNING,
-      WAITPAUSE,
-      WAITUNPAUSE
-   );
-   signal state : tState := PAUSING;
-   
-   signal ce              : std_logic := '0';   
-   signal pauseCnt        : unsigned(8 downto 0);
+   signal ce              : std_logic := '0';
    signal pause_active    : std_logic;
 
    -- debug
@@ -352,83 +368,60 @@ architecture arch of gba_top is
    signal debug_PF_countdown   : unsigned(3 downto 0);
 -- synthesis translate_on
    
-   signal lfsr          : unsigned(22 downto 0) := (others => '0');
-   
-begin 
+begin
 
    ------------- cycling
    inPause <= pause_active;
-   
-   process (clk1x)
-   begin
-      if rising_edge(clk1x) then
-         
-         ce            <= '0';
-         pause_active  <= '0';
-         
-         lfsr(22 downto 1) <= lfsr(21 downto 0);
-         lfsr(0) <= not(lfsr(22) xor lfsr(18));
-         
-         if (gbaon = '0' or savestate_loadstate = '1') then
-            state    <= PAUSING;
-            pauseCnt <= (others => '0');
-         else
-     
-            case (state) is
-            
-               when PAUSING =>
-                  if (pauseCnt(8) = '0') then
-                     pauseCnt <= pauseCnt + 1;
-                  else
-                     pause_active <= '1';
-                  end if;
-                  if (pauseCnt(8 downto 7) > 0 and pause = '0' and sleep_savestate = '0' and sleep_rewind = '0') then
-                     state <= WAITUNPAUSE;
-                  end if;
-                  if (dma_on_next = '1') then -- should never happen here, save exit
-                     state <= RUNNING;
-                  end if;
-                  
-               when RUNNING =>
-                  ce    <= '1';
-                  if (pause = '1' or sleep_savestate = '1' or sleep_rewind = '1' or (KeyPause = '1' and lfsr(5 downto 0) = 0)) then
-                     state <= WAITPAUSE;
-                  end if;
-                  
-               when WAITPAUSE =>
-                  ce    <= '1';
-                  if (dma_on_next = '0' and cpu_jump = '1') then
-                     state    <= PAUSING;
-                     ce       <= '0'; 
-                     pauseCnt <= (others => '0');
-                  end if;
 
-               when WAITUNPAUSE =>
-                  if (allowUnpause = '1' or is_simu = '1') then
-                     state <= RUNNING;
-                  end if;
-            
-            end case;
-            
-         end if;
-      
-      end if;
-   end process;
-   
+   ictrlpause : entity work.gba_ctrl_pause
+   generic map
+   (
+      is_simu => is_simu
+   )
+   port map
+   (
+      clk1x               => clk1x,
+      gbaon               => gbaon,
+      savestate_loadstate => savestate_loadstate,
+      pause               => pause,
+      allowUnpause        => allowUnpause,
+      sleep_savestate     => sleep_savestate,
+      sleep_rewind        => sleep_rewind,
+      dma_on_next         => dma_on_next,
+      cpu_jump            => cpu_jump,
+      KeyPause            => KeyPause,
+
+      ce                  => ce,
+      pause_active        => pause_active
+   );
+
 
    -- dummy modules
    igba_reservedregs : entity work.gba_reservedregs port map ( clk1x, gb_bus, reg_wired_or(7), reg_wired_done(7));
    
-   igba_serial       : entity work.gba_serial       
-   port map 
-   ( 
+   igba_serial       : entity work.gba_serial
+   port map
+   (
       clk100            => clk1x,
       ce                => ce,
-      gb_bus            => gb_bus,           
+      gb_bus            => gb_bus,
       wired_out         => reg_wired_or(8),
       wired_done        => reg_wired_done(8),
-                         
-      IRP_Serial        => IRP_Serial
+
+      link_enable       => link_enable,
+      link_role_parent  => link_role_parent,
+      link_clk_out      => link_clk_out,
+      link_clk_oe       => link_clk_oe,
+      link_clk_in       => link_clk_in,
+      link_so_out       => link_so_out,
+      link_so_oe        => link_so_oe,
+      link_si_in        => link_si_in,
+      link_sd_out       => link_sd_out,
+      link_sd_oe        => link_sd_oe,
+      link_sd_in        => link_sd_in,
+
+      IRP_Serial        => IRP_Serial,
+      debug_link_state  => debug_link_state
    );
    
    -- real modules
@@ -549,12 +542,14 @@ begin
    
    cart_reset <= reset;
    
+   gSavestates : if (strip_savestates = '0') generate
+   begin
    igba_savestates : entity work.gba_savestates
    generic map
    (
-      Softmap_GBA_FLASH_ADDR   => Softmap_GBA_FLASH_ADDR, 
+      Softmap_GBA_FLASH_ADDR   => Softmap_GBA_FLASH_ADDR,
       Softmap_GBA_EEPROM_ADDR  => Softmap_GBA_EEPROM_ADDR,
-      is_simu                  => is_simu                
+      is_simu                  => is_simu
    )
    port map
    (
@@ -591,16 +586,72 @@ begin
       SAVE_BusReadData      => mem_bus_din, 
       SAVE_BusReadDone      => mem_bus_done, 
                                             
-      bus_out_Din           => SAVE_out_Din,   
-      bus_out_Dout          => SAVE_out_Dout,  
-      bus_out_Adr           => SAVE_out_Adr,   
-      bus_out_rnw           => SAVE_out_rnw,   
-      bus_out_ena           => SAVE_out_ena,   
+      bus_out_Din           => SAVE_out_Din,
+      bus_out_Dout          => SAVE_out_Dout,
+      bus_out_Adr           => SAVE_out_Adr,
+      bus_out_rnw           => SAVE_out_rnw,
+      bus_out_ena           => SAVE_out_ena,
       bus_out_active        => SAVE_out_active,
       bus_out_be            => SAVE_out_be,
-      bus_out_done          => SAVE_out_done  
+      bus_out_done          => SAVE_out_done
    );
-     
+   end generate gSavestates;
+
+   gSavestatesStub : if (strip_savestates = '1') generate
+   begin
+   igba_savestates : entity work.gba_savestates_stub
+   generic map
+   (
+      Softmap_GBA_FLASH_ADDR   => Softmap_GBA_FLASH_ADDR,
+      Softmap_GBA_EEPROM_ADDR  => Softmap_GBA_EEPROM_ADDR,
+      is_simu                  => is_simu
+   )
+   port map
+   (
+      clk                   => clk1x,
+      gb_on                 => gbaon,
+      reset                 => reset,
+      register_reset        => register_reset,
+
+      load_done             => load_done,
+
+      increaseSSHeaderCount => increaseSSHeaderCount,
+      save                  => savestate_savestate,
+      load                  => savestate_loadstate,
+      savestate_address     => savestate_address,
+      savestate_busy        => savestate_busy,
+
+      internal_bus_out      => savestate_bus,
+      wired_out             => ss_wired_out,
+      wired_done            => ss_wired_done,
+
+      loading_savestate     => loading_savestate,
+      saving_savestate      => saving_savestate,
+      sleep_savestate       => sleep_savestate,
+      pause_active          => pause_active,
+
+      gb_bus                => gb_bus,
+
+      SAVE_BusAddr          => SAVE_BusAddr,
+      SAVE_BusRnW           => SAVE_BusRnW,
+      SAVE_BusACC           => SAVE_BusACC,
+      SAVE_BusWriteData     => SAVE_BusWriteData,
+      SAVE_Bus_ena          => SAVE_Bus_ena,
+
+      SAVE_BusReadData      => mem_bus_din,
+      SAVE_BusReadDone      => mem_bus_done,
+
+      bus_out_Din           => SAVE_out_Din,
+      bus_out_Dout          => SAVE_out_Dout,
+      bus_out_Adr           => SAVE_out_Adr,
+      bus_out_rnw           => SAVE_out_rnw,
+      bus_out_ena           => SAVE_out_ena,
+      bus_out_active        => SAVE_out_active,
+      bus_out_be            => SAVE_out_be,
+      bus_out_done          => SAVE_out_done
+   );
+   end generate gSavestatesStub;
+
    process (save_wired_or)
       variable wired_or : std_logic_vector(31 downto 0);
    begin
@@ -612,56 +663,80 @@ begin
    end process;
    ss_wired_done <= '0' when (save_wired_done = 0) else '1';
    
+   gStatemanager : if (strip_savestates = '0') generate
+   begin
    igba_statemanager : entity work.gba_statemanager
    generic map
    (
       Softmap_SaveState_ADDR   => Softmap_SaveState_ADDR,
-      Softmap_Rewind_ADDR      => Softmap_Rewind_ADDR   
+      Softmap_Rewind_ADDR      => Softmap_Rewind_ADDR
    )
    port map
    (
       clk100              => clk1x,
       gb_on               => gbaon,
 
-      rewind_on           => rewind_on,    
+      rewind_on           => rewind_on,
       rewind_active       => rewind_active,
-      
+
       savestate_number    => savestate_number,
       save                => save_state,
       load                => load_state,
-      
+
       sleep_rewind        => sleep_rewind,
-      vsync               => vblank_trigger,       
-      
+      vsync               => vblank_trigger,
+
       request_savestate   => savestate_savestate,
       request_loadstate   => savestate_loadstate,
-      request_address     => savestate_address,  
-      request_busy        => savestate_busy     
+      request_address     => savestate_address,
+      request_busy        => savestate_busy
    );
-   
+   end generate gStatemanager;
+
+   gStatemanagerStub : if (strip_savestates = '1') generate
+   begin
+      savestate_savestate <= '0';
+      savestate_loadstate <= '0';
+      savestate_address   <= 0;
+      sleep_rewind        <= '0';
+   end generate gStatemanagerStub;
+
+   gCheats : if (strip_cheats = '0') generate
+   begin
    igba_cheats : entity work.gba_cheats
    port map
    (
       clk            => clk1x,
       gb_on          => GBA_on,
-                      
+
       cheat_clear    => cheat_clear,
       cheats_enabled => cheats_enabled,
       cheat_on       => cheat_on,
       cheat_in       => cheat_in,
       cheats_active  => cheats_active,
-                     
+
       vsync          => vblank_trigger,
-                    
-      BusAddr        => Cheats_BusAddr,     
-      BusRnW         => Cheats_BusRnW,      
-      BusACC         => Cheats_BusACC,      
+
+      BusAddr        => Cheats_BusAddr,
+      BusRnW         => Cheats_BusRnW,
+      BusACC         => Cheats_BusACC,
       BusWriteData   => Cheats_BusWriteData,
-      Bus_ena_out    => Cheats_Bus_ena,     
-      BusReadData    => Cheats_BusReadData, 
+      Bus_ena_out    => Cheats_Bus_ena,
+      BusReadData    => Cheats_BusReadData,
       BusDone        => Cheats_Bus_done
    );
-   
+   end generate gCheats;
+
+   gCheatsStub : if (strip_cheats = '1') generate
+   begin
+      Cheats_BusAddr      <= (others => '0');
+      Cheats_BusRnW       <= '1';
+      Cheats_BusACC       <= "00";
+      Cheats_BusWriteData <= (others => '0');
+      Cheats_Bus_ena      <= '0';
+      cheats_active       <= '0';
+   end generate gCheatsStub;
+
    savestate_bus_ext  <= savestate_bus;
    save_wired_or(1)   <= ss_wired_out_ext;
    save_wired_done(1) <= ss_wired_done_ext;
@@ -676,7 +751,8 @@ begin
    igba_memorymux : entity work.gba_memorymux
    generic map
    (
-      is_simu                  => is_simu,     
+      is_simu                  => is_simu,
+      ewram_in_sdram           => ewram_in_sdram,
       Softmap_GBA_Gamerom_ADDR => Softmap_GBA_Gamerom_ADDR,
       Softmap_GBA_FLASH_ADDR   => Softmap_GBA_FLASH_ADDR,
       Softmap_GBA_EEPROM_ADDR  => Softmap_GBA_EEPROM_ADDR
@@ -701,7 +777,15 @@ begin
       cart_readdata        => cart_readdata, 
       
       cart_waitcnt         => REG_WAITCNT,
-      
+
+      ewram_ena            => ewram_ena,
+      ewram_rnw            => ewram_rnw,
+      ewram_addr           => ewram_addr,
+      ewram_be             => ewram_be,
+      ewram_writedata      => ewram_writedata,
+      ewram_done           => ewram_done,
+      ewram_readdata       => ewram_readdata,
+
 -- synthesis translate_off
       debug_PF_count       => debug_PF_count,    
       debug_PF_countdown   => debug_PF_countdown,
@@ -1084,14 +1168,44 @@ begin
 
       end if;
    end process;
-   
-   new_halt <= '1' when (PC_in_BIOS = '1' and cpu_bus_ena = '1' and cpu_bus_rnw = '0' and cpu_bus_acc = ACCESS_32BIT and (cpu_bus_Adr(31 downto 2) & "00") = x"04000300") else 
+
+   -- synthesis translate_off
+   -- Temporary diagnostic: trace Timer1's IRQ request and the CPU-visible
+   -- consequences, to see whether IRP_Timer(1) keeps pulsing on schedule
+   -- after the first one, or whether it (or its delivery to the CPU) stalls.
+   -- Remove once the 2P link retry-after-first-success issue is root-caused.
+   debug_timer1_mon : process (clk1x)
+      variable last_irp_timer1 : std_logic := 'U';
+      variable last_ime        : std_logic := 'U';
+      variable last_ie4        : std_logic := 'U';
+      variable last_cpu_irq    : std_logic := 'U';
+   begin
+      if rising_edge(clk1x) then
+         if (IRP_Timer(1) /= last_irp_timer1 or REG_IME(0) /= last_ime or
+             REG_IRP_IE(4) /= last_ie4 or cpu_irq /= last_cpu_irq) then
+            report clk1x'instance_name &
+                   " IRP_Timer1=" & std_logic'image(IRP_Timer(1)) &
+                   " IME=" & std_logic'image(REG_IME(0)) &
+                   " IE4=" & std_logic'image(REG_IRP_IE(4)) &
+                   " IRPFlags=" & to_hstring(IRPFlags) &
+                   " cpu_irq=" & std_logic'image(cpu_irq);
+            last_irp_timer1 := IRP_Timer(1);
+            last_ime        := REG_IME(0);
+            last_ie4        := REG_IRP_IE(4);
+            last_cpu_irq    := cpu_irq;
+         end if;
+      end if;
+   end process;
+   -- synthesis translate_on
+
+   new_halt <= '1' when (PC_in_BIOS = '1' and cpu_bus_ena = '1' and cpu_bus_rnw = '0' and cpu_bus_acc = ACCESS_32BIT and (cpu_bus_Adr(31 downto 2) & "00") = x"04000300") else
                '1' when (PC_in_BIOS = '1' and cpu_bus_ena = '1' and cpu_bus_rnw = '0' and cpu_bus_acc = ACCESS_16BIT and (cpu_bus_Adr(31 downto 1) & "0")  = x"04000300") else 
                '1' when (PC_in_BIOS = '1' and cpu_bus_ena = '1' and cpu_bus_rnw = '0' and cpu_bus_acc = ACCESS_8BIT  and  cpu_bus_Adr                      = x"04000301") else 
                '0';
    
 -- export
 -- synthesis translate_off
+   gexport : if simu_export_trace = '1' generate
    iexport : entity work.export
    port map
    (
@@ -1112,6 +1226,7 @@ begin
       PF_countdown      => debug_PF_countdown,
       sound_fifocount   => sound_fifocount
    );
+   end generate;
 -- synthesis translate_on
 
 
