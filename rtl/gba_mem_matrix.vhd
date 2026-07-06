@@ -76,7 +76,10 @@ architecture arch of gba_mem_matrix is
    function resolve(phys_offset : unsigned(25 downto 0)) return unsigned is
    begin
       if (phys_offset(25) = '1') then
-         return to_unsigned(Softmap_GBA_Gamerom_Ext_ADDR, 27) + resize(phys_offset, 27);
+         -- bit25 only SELECTS the ext half; it must not also be added as part of the
+         -- offset within it, or every ext-half mapping lands 32MB past where the ROM
+         -- copy actually put that data (see Softmap_GBA_Gamerom_Ext_ADDR's own base).
+         return to_unsigned(Softmap_GBA_Gamerom_Ext_ADDR, 27) + resize(phys_offset(24 downto 0), 27);
       else
          return to_unsigned(Softmap_GBA_Gamerom_ADDR, 27) + resize(phys_offset, 27);
       end if;
