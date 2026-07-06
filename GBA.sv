@@ -237,7 +237,7 @@ parameter CONF_STR = {
 `endif
 	"D0R[12],Reload Backup RAM;",
 	"D0R[13],Save Backup RAM;",
-	"D0O[23],Autosave,Off,On;",
+	"D0O[23],Autosave,On,Off;",
 	"D0-;",
 `ifndef GBA2P_LITE
 	"O[36],Savestates to SDCard,On,Off;",
@@ -282,7 +282,6 @@ parameter CONF_STR = {
 `else
 	"P2O[46:44],Multiplayer,Off,Link Cable (GPIO);",
 `endif
-	"H7P2O[47],Link Role,Parent,Child;",
    "P2-;",
 `ifdef GBA2P_LITE
 	"P2O[61],Player 1 Power,On,Off;",
@@ -355,7 +354,7 @@ wire [15:0] status_menumask = {
 	(status[46:44] == 3'd0),        // H9: hide Link Debug Overlay when Multiplayer is Off (1P profile: Off = 0)
 `endif
 	|status[21:20],                    // H8: hide 2P Separator Line unless 2P Display is Both
-	(status[46:44] != 3'd1),           // H7: hide Link Role unless Multiplayer is Link Cable (GPIO)
+	1'b1,                              // H7: unused (Link Role removed -- the cable's plug position picks the master, like real hardware)
 	~solar_quirk, status[27], cart_loaded, |cart_type, force_turbo, ~gg_active, ~bk_ena};
 wire        forced_scandoubler;
 reg  [31:0] sd_lba;
@@ -453,6 +452,8 @@ end
 reg [26:0] last_addr;
 reg [26:0] last_addr2;
 reg        flash_1m;
+reg        flash_1m2; // core 2's own flash_1m, scanned from its independent LOAD_2P stream
+reg  [63:0] str2;
 reg  [1:0] cart_type;
 reg        cart_loaded = 0;
 
@@ -533,6 +534,7 @@ defparam savestate_ui.INFO_TIMEOUT_BITS = 27;
 ////////////////////////////  SYSTEM  ///////////////////////////////////
 
 wire save_eeprom, save_sram, save_flash, ss_loaded;
+wire save_sram2, save_flash2; // core 2's own save flags (LOAD_2P only; no EEPROM yet)
 
 reg [79:0] time_dout = 41'd0;
 wire [79:0] time_din;
@@ -644,7 +646,6 @@ wire       link_internal    = (multiplayer_mode == 3'd0);
 wire       link_internal    = 1'b0;
 `endif
 wire       link_enable      = link_snac | link_internal;
-wire       link_role_parent = link_internal ? 1'b1 : ~status[47];
 
 wire [6:0] linkport_user_out;
 wire link_clk_out, link_clk_oe, link_clk_in;
@@ -704,6 +705,10 @@ gba_wrap
 	                                                 // 32MB buffer ends (0x2000000 + 32MB = 0x4000000) -- Rewind is a live feature in this
 	                                                 // build (unlike the 2P profile's dead Rewind/SaveState region), so this window must
 	                                                 // NOT overlap it. Genuinely free space (1P build only -- see big_rom_active).
+	.Softmap_GBA_FLASH_ADDR2(67108864),             // core 2's own Flash/SRAM backup (LOAD_2P only). Same base address as
+	                                                 // Softmap_GBA_Gamerom_Ext_ADDR above on purpose, not a collision: that
+	                                                 // window is 1P-only (big_rom_active), this one is 2P-only (SECOND_CORE),
+	                                                 // same mutual-exclusion argument as the Gamerom2/Rewind overlap above.
 	.strip_savestates(STRIP_2P),
 	.strip_cheats(STRIP_2P),
 	.ewram_in_sdram(STRIP_2P),
@@ -734,6 +739,17 @@ gba
 	.CyclesMissing(),                 // debug only for speed measurement, keep open
 	.CyclesVsyncSpeed(),              // debug only for speed measurement, keep open
 	.SramFlashEnable(~sram_quirk),
+	// rom_shared means core 2 is literally running core 1's cart image -- reuse
+	// core 1's already-correct detection instead of core 2's own scan, which
+	// only ever runs for a genuinely independent Load-Target:2P cart and stays
+	// at its reset value the rest of the time (that's the bug: 1P+2P is the
+	// common case, and it was always taking the never-scanned reset value).
+	.GBA_flash_1m2(rom_shared ? flash_1m : flash_1m2),
+	// core 2 doesn't get its own sram_quirk: every listed sram_quirk cart is a
+	// single-player nostalgia/compilation title, none are multiplayer games,
+	// so the anti-piracy-check-defeat mechanism has no realistic overlap with
+	// what actually gets loaded into a Load-Target:2P slot. Always enabled.
+	.SramFlashEnable2(1'b1),
 	.memory_remap(memory_remap_quirk),
    .increaseSSHeaderCount(!status[36]),
    .save_state(ss_save),
@@ -802,6 +818,8 @@ gba
 	.save_eeprom(save_eeprom),
 	.save_sram(save_sram),
 	.save_flash(save_flash),
+	.save_sram2(save_sram2),
+	.save_flash2(save_flash2),
 	.load_done(ss_loaded),
 
 	.bios_wraddr(bios_wraddr),
@@ -824,7 +842,6 @@ gba
    .KeyPause(joy[11]),
 
    .link_enable     (link_enable     ),
-   .link_role_parent(link_role_parent),
    .link_clk_out    (link_clk_out    ),
    .link_clk_oe     (link_clk_oe     ),
    .link_clk_in     (link_clk_in     ),
@@ -920,6 +937,23 @@ always @(posedge clk_6x) begin
 		if({str[55:0], rom_dout[7:0], rom_dout[15:8]} == "FLASH1M_V") flash_1m <= 1;
 
 		str <= {str[47:0], rom_dout[7:0], rom_dout[15:8]};
+	end
+
+	// core 2's own flash-size scan: mirrors the block above exactly, but for
+	// the LOAD_2P-only independent stream that block deliberately ignores.
+	// Only flash_1m2 is mirrored (not the full cart_id/quirk table above) --
+	// SramFlashEnable2 is a plain constant (see the GBA_flash_1m2 port
+	// comment at the gba_wrap instantiation) so there's no cart_id2 needed
+	// for anything else yet.
+	if (~ioctl_download && ioctl_download_1 && ioctl_index == 1 && load_target == LOAD_2P) begin
+		flash_1m2 <= 0;
+	end
+
+	if(rom_wr && load_target == LOAD_2P) begin
+		if({str2, rom_dout[7:0]} == "FLASH1M_V") flash_1m2 <= 1;
+		if({str2[55:0], rom_dout[7:0], rom_dout[15:8]} == "FLASH1M_V") flash_1m2 <= 1;
+
+		str2 <= {str2[47:0], rom_dout[7:0], rom_dout[15:8]};
 	end
 
 

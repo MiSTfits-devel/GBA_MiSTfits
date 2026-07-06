@@ -180,6 +180,7 @@ architecture sim of tb_gba2p_sdram is
    signal c2_link_so_out,  c2_link_so_oe,  c2_link_si_in  : std_logic;
    signal c2_link_sd_out,  c2_link_sd_oe,  c2_link_sd_in  : std_logic;
    signal l_sc, l_sd, l_si_c1, l_si_c2 : std_logic := '1';
+   signal l_so_c2 : std_logic := '1'; -- core 2's own SO level (for the wire monitor; c1's SI is cable-grounded)
 
    signal c1_vblank, c2_vblank : std_logic;
    signal c1_px_we, c2_px_we   : std_logic;
@@ -649,7 +650,8 @@ begin
       if rising_edge(clk1x) then
          l_sc    <= (c1_link_clk_out or not c1_link_clk_oe) and (c2_link_clk_out or not c2_link_clk_oe);
          l_sd    <= (c1_link_sd_out  or not c1_link_sd_oe ) and (c2_link_sd_out  or not c2_link_sd_oe );
-         l_si_c1 <= (c2_link_so_out  or not c2_link_so_oe );
+         l_si_c1 <= '0'; -- real cable: 1P plug grounds SI (that's what makes core 1 the master)
+         l_so_c2 <= (c2_link_so_out  or not c2_link_so_oe );
          l_si_c2 <= (c1_link_so_out  or not c1_link_so_oe );
       end if;
    end process;
@@ -675,7 +677,7 @@ begin
       if rising_edge(clk1x) then
          if (sc_1 = '0' and l_sc = '1') then
             parent_word := l_si_c2 & parent_word(15 downto 1); -- core 1's SO
-            child_word  := l_si_c1 & child_word(15 downto 1);  -- core 2's SO
+            child_word  := l_so_c2 & child_word(15 downto 1);  -- core 2's SO
             bits := bits + 1;
             idle := 0;
             if (bits = 16) then
@@ -800,7 +802,6 @@ begin
       KeyPause              => '0',
 
       link_enable           => '1',
-      link_role_parent      => '1',
       link_clk_out          => c1_link_clk_out,
       link_clk_oe           => c1_link_clk_oe,
       link_clk_in           => c1_link_clk_in,
@@ -934,7 +935,6 @@ begin
       KeyPause              => '0',
 
       link_enable           => '1',
-      link_role_parent      => '0',
       link_clk_out          => c2_link_clk_out,
       link_clk_oe           => c2_link_clk_oe,
       link_clk_in           => c2_link_clk_in,

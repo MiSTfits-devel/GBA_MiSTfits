@@ -109,7 +109,6 @@ entity gba_top is
       KeyPause              : in     std_logic;
       -- link port (open drain (value, oe) pairs, inputs must be synchronized)
       link_enable           : in     std_logic := '0';
-      link_role_parent      : in     std_logic := '1';
       link_clk_out          : out    std_logic := '1';
       link_clk_oe           : out    std_logic := '0';
       link_clk_in           : in     std_logic := '1';
@@ -411,7 +410,6 @@ begin
       wired_done        => reg_wired_done(8),
 
       link_enable       => link_enable,
-      link_role_parent  => link_role_parent,
       link_clk_out      => link_clk_out,
       link_clk_oe       => link_clk_oe,
       link_clk_in       => link_clk_in,

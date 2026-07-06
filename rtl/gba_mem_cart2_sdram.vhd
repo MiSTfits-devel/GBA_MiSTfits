@@ -17,20 +17,40 @@ use IEEE.numeric_std.all;
 --     hazard either way -- see gba_wrap's GBA_on1X_2 derivation.
 --   * reads behind the cart data return the open bus pattern, mirroring
 --     READAFTERPAK in memorymux_extern.
---   * EEPROM (0xD) reads answer "ready" (1), Flash/SRAM (0xE/0xF) reads answer
---     open bus (all 1) exactly like SramFlashEnable = 0 in memorymux_extern.
---     Core 2 has no save memory yet: all cart writes complete immediately and
---     are dropped.
+--   * EEPROM (0xD) reads answer "ready" (1); EEPROM writes still complete
+--     immediately and are dropped -- core 2 has no EEPROM save emulation
+--     yet, only Flash/SRAM (see below). Games that need EEPROM specifically
+--     on the 2P slot are a known follow-up gap.
+--   * Flash/SRAM (0xE/0xF): a real command-sequence state machine, ported
+--     from memorymux_extern's FLASHSRAMWRITEDECIDE/FLASHWRITE/FLASHREAD
+--     logic (same AMD-style unlock sequence, same autoselect/erase-complete
+--     read behavior). Gated by SramFlashEnable exactly like memorymux_extern.
+--     Shares one write-capable SDRAM window (Softmap_GBA_FLASH_ADDR2) for
+--     both Flash and SRAM, same reasoning as core 1: a cart has one save type
+--     or the other, never both, so they can safely alias.
+--
+--     Mirrors memorymux_extern's two-layer split, not a single state
+--     variable: `state1x` is the CPU-facing handshake (only it ever touches
+--     cart_done/cart_readdata), `innerState` is the flash/sram decoder,
+--     which can take many clk1x cycles (a full chip erase is 131072 words)
+--     without the CPU-facing side being involved until it's back at
+--     INNER_IDLE. Collapsing these into one state machine would fire
+--     cart_done after the FIRST unlock byte's single-cycle decode instead of
+--     waiting for the real result, and would have no way to make a later
+--     write block for the duration of an in-flight multi-word erase.
 --
 -- No prefetch cache: a single SDRAM roundtrip is well below the modeled cart
 -- waitstates in gba_memorymux, so core 2 only stalls extra while the shared
--- port is contended. Reads always run the full 32bit burst (done32), which
--- keeps the channel free of burst tails that could alias into other channels.
+-- port is contended. ROM reads always run the full 32bit burst (done32),
+-- which keeps the channel free of burst tails that could alias into other
+-- channels. Flash/SRAM ops are always 32bit-aligned single-word SDRAM
+-- accesses too, same discipline.
 entity gba_mem_cart2_sdram is
    generic
    (
       Softmap_GBA_Gamerom_ADDR  : integer; -- count: 8388608 -- 32 Mbyte Data for GameRom, shared with core 1
-      Softmap_GBA_Gamerom2_ADDR : integer := 0 -- count: 8388608 -- core 2's own independent 32 Mbyte window (used when rom_shared='0')
+      Softmap_GBA_Gamerom2_ADDR : integer := 0; -- count: 8388608 -- core 2's own independent 32 Mbyte window (used when rom_shared='0')
+      Softmap_GBA_FLASH_ADDR2   : integer := 0  -- core 2's own Flash/SRAM backup window
    );
    port
    (
@@ -43,10 +63,16 @@ entity gba_mem_cart2_sdram is
       MaxPakAddr      : in  std_logic_vector(24 downto 0);
       rom_shared      : in  std_logic := '1'; -- 1 = read core 1's shared ROM window; 0 = this core's own independent window
 
+      flash_1m        : in  std_logic := '0'; -- 1 when "FLASH1M_V" was found in core 2's cart
+      SramFlashEnable : in  std_logic := '1'; -- 0 = pretend no Flash/SRAM chip at all (sram_quirk2 equivalent)
+      save_flash      : out std_logic := '0';
+      save_sram       : out std_logic := '0';
+
       cart_ena        : in  std_logic;
       cart_32         : in  std_logic;
       cart_rnw        : in  std_logic;
       cart_addr       : in  std_logic_vector(27 downto 0);
+      cart_writedata  : in  std_logic_vector(7 downto 0) := (others => '0');
       cart_done       : out std_logic := '0';
       cart_readdata   : out std_logic_vector(31 downto 0) := (others => '0');
 
@@ -55,7 +81,10 @@ entity gba_mem_cart2_sdram is
       cart_busy       : out std_logic; -- SDRAM op in flight -> owns the request bus
 
       c2_sdram_ena    : out std_logic := '0';
+      c2_sdram_rnw    : out std_logic := '1';
       c2_sdram_Adr    : out std_logic_vector(26 downto 0) := (others => '0');
+      c2_sdram_Din    : out std_logic_vector(31 downto 0) := (others => '0');
+      c2_sdram_be     : out std_logic_vector(3 downto 0)  := "1111";
       sdram_Dout      : in  std_logic_vector(31 downto 0);
       sdram_done32    : in  std_logic
    );
@@ -63,13 +92,30 @@ end entity;
 
 architecture arch of gba_mem_cart2_sdram is
 
+   -- outer, CPU-facing handshake -- only this layer touches cart_done/cart_readdata
    type tState1X is
    (
       IDLE1X,
-      ANSWER,   -- request served without SDRAM, complete next cycle
-      WAITDATA
+      ANSWER,    -- request served without SDRAM, complete next cycle
+      WAITDATA,  -- SDRAM round trip in flight for a plain read, answer with readdata_6x on completion
+      WAITINNER  -- a flash/sram write is in flight; wait for innerState back to INNER_IDLE
    );
    signal state1x : tState1X := IDLE1X;
+
+   -- inner flash/sram command decoder, ported from memorymux_extern.vhd.
+   -- Runs independently of state1x once kicked off -- can take many clk1x
+   -- cycles (chip erase = 131072 words) with no CPU-facing signal touched
+   -- until it's back at INNER_IDLE.
+   type tInnerState is
+   (
+      INNER_IDLE,
+      FLASHSRAMWRITEDECIDE1,
+      FLASHSRAMWRITEDECIDE2,
+      FLASHWRITE,
+      FLASH_WRITEBLOCK,
+      FLASH_BLOCKWAIT
+   );
+   signal innerState : tInnerState := INNER_IDLE;
 
    type tState6X is
    (
@@ -88,6 +134,39 @@ architecture arch of gba_mem_cart2_sdram is
 
    signal rom_base : unsigned(26 downto 0);
 
+   -- latched write request, stable across the multi-cycle flash/sram decode
+   -- (mirrors memorymux_extern's adr_save/Dout_save discipline: cart_addr/
+   -- cart_writedata are only guaranteed valid the cycle cart_ena is seen)
+   signal adr_save  : std_logic_vector(27 downto 0) := (others => '0');
+   signal dout_save : std_logic_vector(7 downto 0)  := (others => '0');
+
+   -- FLASH, ported from memorymux_extern.vhd
+   type tFLASHSTATE is
+   (
+      FLASH_READ_ARRAY,
+      FLASH_CMD_1,
+      FLASH_CMD_2,
+      FLASH_AUTOSELECT,
+      FLASH_CMD_3,
+      FLASH_CMD_4,
+      FLASH_CMD_5,
+      FLASH_ERASE_COMPLETE,
+      FLASH_PROGRAM,
+      FLASH_SETBANK
+   );
+   signal flashState      : tFLASHSTATE := FLASH_READ_ARRAY;
+   signal flashReadState  : tFLASHSTATE := FLASH_READ_ARRAY;
+   signal flashBank       : std_logic := '0';
+   signal flashNotSRam    : std_logic := '0';
+   signal flashSRamdecide : std_logic := '0';
+   signal flashDeviceID       : std_logic_vector(7 downto 0);
+   signal flashManufacturerID : std_logic_vector(7 downto 0);
+
+   signal flash_saveaddr  : std_logic_vector(26 downto 0) := (others => '0');
+   signal flash_savecount : integer range 0 to 131072 := 0;
+   signal flash_savedata  : std_logic_vector(7 downto 0) := (others => '0');
+   signal flash_issave    : std_logic := '0'; -- 1 = this WRITEBLOCK run is a save_flash pulse, 0 = save_sram
+
 begin
 
    cart_active <= req_pending;
@@ -96,18 +175,31 @@ begin
    rom_base <= to_unsigned(Softmap_GBA_Gamerom_ADDR, 27) when (rom_shared = '1') else
                to_unsigned(Softmap_GBA_Gamerom2_ADDR, 27);
 
+   flashDeviceID       <= x"13" when flash_1m = '1' else x"1B";
+   flashManufacturerID <= x"62" when flash_1m = '1' else x"32";
+
    -- done/readdata are registered on clk1x before export, following the WP2
    -- discipline: the 6x->1x crossing must be a plain register capture.
    process (clk1x)
    begin
       if rising_edge(clk1x) then
 
-         cart_done <= '0';
+         cart_done  <= '0';
+         save_flash <= '0';
+         save_sram  <= '0';
 
          if (reset = '1') then
-            state1x     <= IDLE1X;
-            req_pending <= '0';
+            state1x         <= IDLE1X;
+            innerState      <= INNER_IDLE;
+            req_pending     <= '0';
+            flashState      <= FLASH_READ_ARRAY;
+            flashReadState  <= FLASH_READ_ARRAY;
+            flashBank       <= '0';
+            flashNotSRam    <= '0';
+            flashSRamdecide <= '0';
          else
+
+            -- ===== outer: CPU-facing handshake =====
             case (state1x) is
 
                when IDLE1X =>
@@ -115,9 +207,17 @@ begin
                      addr1_1 <= cart_addr(1);
                      c32_1   <= cart_32;
                      if (cart_rnw = '0') then
-                        -- no save memory on core 2 (yet): writes are dropped
-                        state1x <= ANSWER;
-                        ansdata  <= (others => '0');
+                        case (cart_addr(27 downto 24)) is
+                           when x"E" | x"F" =>
+                              adr_save   <= cart_addr;
+                              dout_save  <= cart_writedata;
+                              state1x    <= WAITINNER;
+                              innerState <= FLASHSRAMWRITEDECIDE1;
+                           when others =>
+                              -- ROM/EEPROM writes: no save memory there (yet), dropped as before
+                              state1x <= ANSWER;
+                              ansdata  <= (others => '0');
+                        end case;
                      else
                         case (cart_addr(27 downto 24)) is
 
@@ -129,6 +229,7 @@ begin
                               else
                                  state1x     <= WAITDATA;
                                  req_pending <= '1';
+                                 c2_sdram_rnw <= '1';
                                  if (memory_remap = '1') then
                                     c2_sdram_Adr <= std_logic_vector(rom_base + unsigned(cart_addr(19 downto 0)));
                                  else
@@ -140,9 +241,34 @@ begin
                               state1x <= ANSWER;
                               ansdata  <= x"00000001";
 
-                           when x"E" | x"F" => -- Flash/SRAM: open bus, like SramFlashEnable = 0
-                              state1x <= ANSWER;
-                              ansdata  <= (others => '1');
+                           when x"E" | x"F" => -- Flash/SRAM
+                              if (SramFlashEnable = '0') then
+                                 state1x <= ANSWER;
+                                 ansdata  <= (others => '1');
+                              else
+                                 case (flashReadState) is
+                                    when FLASH_READ_ARRAY =>
+                                       state1x      <= WAITDATA;
+                                       req_pending  <= '1';
+                                       c2_sdram_rnw <= '1';
+                                       c2_sdram_Adr <= std_logic_vector(to_unsigned(Softmap_GBA_FLASH_ADDR2, 27) + resize(4 * unsigned((flashBank & cart_addr(15 downto 0))), 27));
+                                    when FLASH_AUTOSELECT =>
+                                       state1x <= ANSWER;
+                                       if (cart_addr(7 downto 0) = x"00") then
+                                          ansdata <= flashManufacturerID & flashManufacturerID & flashManufacturerID & flashManufacturerID;
+                                       else
+                                          ansdata <= flashDeviceID & flashDeviceID & flashDeviceID & flashDeviceID;
+                                       end if;
+                                    when FLASH_ERASE_COMPLETE =>
+                                       flashState     <= FLASH_READ_ARRAY;
+                                       flashReadState <= FLASH_READ_ARRAY;
+                                       state1x        <= ANSWER;
+                                       ansdata         <= (others => '1');
+                                    when others =>
+                                       state1x <= ANSWER;
+                                       ansdata  <= (others => '1');
+                                 end case;
+                              end if;
 
                            when others =>
                               state1x <= ANSWER;
@@ -175,7 +301,176 @@ begin
                      end if;
                   end if;
 
+               when WAITINNER =>
+                  if (innerState = INNER_IDLE) then
+                     state1x       <= IDLE1X;
+                     cart_done     <= '1';
+                     cart_readdata <= (others => '0'); -- write: CPU discards this
+                  end if;
+
             end case;
+
+            -- ===== inner: flash/sram command-sequence decode, ported from memorymux_extern =====
+            case (innerState) is
+
+               when INNER_IDLE => null;
+
+               when FLASHSRAMWRITEDECIDE1 =>
+                  if (SramFlashEnable = '0') then
+                     innerState <= INNER_IDLE;
+                  else
+                     innerState      <= FLASHSRAMWRITEDECIDE2;
+                     flashSRamdecide <= '1';
+                     if (flashSRamdecide = '0' and adr_save = x"e005555") then
+                        flashNotSRam <= '1';
+                     end if;
+                  end if;
+
+               when FLASHSRAMWRITEDECIDE2 =>
+                  if (flashNotSRam = '1') then
+                     innerState <= FLASHWRITE;
+                  else
+                     -- SRAM: single byte write, shares the Flash window's base address
+                     flash_saveaddr  <= std_logic_vector(to_unsigned(Softmap_GBA_FLASH_ADDR2, 27) + resize(4 * unsigned(adr_save(15 downto 0)), 27));
+                     flash_savecount <= 1;
+                     flash_savedata  <= dout_save;
+                     flash_issave    <= '0';
+                     innerState      <= FLASH_WRITEBLOCK;
+                  end if;
+
+               when FLASHWRITE =>
+                  innerState <= INNER_IDLE;
+
+                  case (flashState) is
+                     when FLASH_READ_ARRAY =>
+                        if (adr_save(15 downto 0) = x"5555" and dout_save = x"AA") then
+                           flashState <= FLASH_CMD_1;
+                        end if;
+
+                     when FLASH_CMD_1 =>
+                        if (adr_save(15 downto 0) = x"2AAA" and dout_save = x"55") then
+                           flashState <= FLASH_CMD_2;
+                        else
+                           flashState <= FLASH_READ_ARRAY;
+                        end if;
+
+                     when FLASH_CMD_2 =>
+                        if (adr_save(15 downto 0) = x"5555") then
+                           if (dout_save = x"90") then
+                              flashState     <= FLASH_AUTOSELECT;
+                              flashReadState <= FLASH_AUTOSELECT;
+                           elsif (dout_save = x"80") then
+                              flashState <= FLASH_CMD_3;
+                           elsif (dout_save = x"F0") then
+                              flashState     <= FLASH_READ_ARRAY;
+                              flashReadState <= FLASH_READ_ARRAY;
+                           elsif (dout_save = x"A0") then
+                              flashState <= FLASH_PROGRAM;
+                           elsif (dout_save = x"B0" and flash_1m = '1') then
+                              flashState <= FLASH_SETBANK;
+                           else
+                              flashState     <= FLASH_READ_ARRAY;
+                              flashReadState <= FLASH_READ_ARRAY;
+                           end if;
+                        else
+                           flashState     <= FLASH_READ_ARRAY;
+                           flashReadState <= FLASH_READ_ARRAY;
+                        end if;
+
+                     when FLASH_CMD_3 =>
+                        if (adr_save(15 downto 0) = x"5555" and dout_save = x"AA") then
+                           flashState <= FLASH_CMD_4;
+                        else
+                           flashState     <= FLASH_READ_ARRAY;
+                           flashReadState <= FLASH_READ_ARRAY;
+                        end if;
+
+                     when FLASH_CMD_4 =>
+                        if (adr_save(15 downto 0) = x"2AAA" and dout_save = x"55") then
+                           flashState <= FLASH_CMD_5;
+                        else
+                           flashState     <= FLASH_READ_ARRAY;
+                           flashReadState <= FLASH_READ_ARRAY;
+                        end if;
+
+                     when FLASH_CMD_5 => -- SECTOR ERASE
+                        if (dout_save = x"30") then
+                           flash_saveaddr <= std_logic_vector(to_unsigned(Softmap_GBA_FLASH_ADDR2, 27));
+                           flash_saveaddr(13 downto  0) <= 14x"0";
+                           flash_saveaddr(17 downto 14) <= adr_save(15 downto 12);
+                           flash_saveaddr(18) <= flashBank;
+                           flash_savecount <= 4096;
+                           flash_savedata  <= (others => '1');
+                           flash_issave    <= '1';
+                           innerState      <= FLASH_WRITEBLOCK;
+                           flashReadState  <= FLASH_ERASE_COMPLETE;
+                        elsif (dout_save = x"10") then -- CHIP ERASE
+                           flash_saveaddr  <= std_logic_vector(to_unsigned(Softmap_GBA_FLASH_ADDR2, 27));
+                           flash_savecount <= 131072;
+                           flash_savedata  <= (others => '1');
+                           flash_issave    <= '1';
+                           innerState      <= FLASH_WRITEBLOCK;
+                           flashReadState  <= FLASH_ERASE_COMPLETE;
+                        else
+                           flashState     <= FLASH_READ_ARRAY;
+                           flashReadState <= FLASH_READ_ARRAY;
+                        end if;
+
+                     when FLASH_AUTOSELECT =>
+                        if (dout_save = x"F0") then
+                           flashState     <= FLASH_READ_ARRAY;
+                           flashReadState <= FLASH_READ_ARRAY;
+                        elsif (adr_save(15 downto 0) = x"5555" and dout_save = x"AA") then
+                           flashState <= FLASH_CMD_1;
+                        else
+                           flashState     <= FLASH_READ_ARRAY;
+                           flashReadState <= FLASH_READ_ARRAY;
+                        end if;
+
+                     when FLASH_PROGRAM =>
+                        flash_saveaddr  <= std_logic_vector(to_unsigned(Softmap_GBA_FLASH_ADDR2, 27) + resize(4 * unsigned((flashBank & adr_save(15 downto 0))), 27));
+                        flash_savecount <= 1;
+                        flash_savedata  <= dout_save;
+                        flash_issave    <= '1';
+                        innerState      <= FLASH_WRITEBLOCK;
+                        flashState      <= FLASH_READ_ARRAY;
+                        flashReadState  <= FLASH_READ_ARRAY;
+
+                     when FLASH_SETBANK =>
+                        if (adr_save(15 downto 0) = x"0000") then
+                           flashBank <= dout_save(0);
+                        end if;
+                        flashState     <= FLASH_READ_ARRAY;
+                        flashReadState <= FLASH_READ_ARRAY;
+
+                     when others => null;
+
+                  end case;
+
+               when FLASH_WRITEBLOCK =>
+                  req_pending     <= '1';
+                  c2_sdram_rnw    <= '0';
+                  c2_sdram_Adr    <= flash_saveaddr;
+                  c2_sdram_Din    <= x"000000" & flash_savedata;
+                  c2_sdram_be     <= "0001";
+                  save_flash      <= flash_issave;
+                  save_sram       <= not flash_issave;
+                  innerState      <= FLASH_BLOCKWAIT;
+                  flash_saveaddr  <= std_logic_vector(unsigned(flash_saveaddr) + 4);
+                  flash_savecount <= flash_savecount - 1;
+
+               when FLASH_BLOCKWAIT =>
+                  if (req_pending = '1' and state6x = C2_DONE) then
+                     req_pending <= '0';
+                     if (flash_savecount = 0) then
+                        innerState <= INNER_IDLE;
+                     else
+                        innerState <= FLASH_WRITEBLOCK;
+                     end if;
+                  end if;
+
+            end case;
+
          end if;
 
       end if;

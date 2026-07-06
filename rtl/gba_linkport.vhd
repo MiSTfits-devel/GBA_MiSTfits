@@ -14,17 +14,25 @@ use IEEE.numeric_std.all;
 --   * runs every input through a 2 stage synchronizer, because the other end
 --     of the cable lives in a different clock domain.
 --
--- The default pin mapping uses USER_IO 0/1/3/6: pins 2, 4 and 5 are shared
--- with HDMI I2S audio in sys_top and must stay untouched. Adjust the generics
--- to the actual adapter wiring, not this file's logic.
+-- The default pin mapping uses USER_IO 0/1/2/5, confirmed directly by Blue
+-- (the SNAC adapter's creator) -- SC=0, SO=1, SI=2, SD=5. SC/SO/SI independently
+-- matched the convention already deployed on real SNAC hardware by
+-- Gameboy_MiSTer's rtl/gb.v (USER_OUT[0]=SC, USER_OUT[1]=data out,
+-- USER_IN[2]=data in) -- pin 2 doubles as HDMI I2S in sys_top when SW[1]
+-- selects it, same tradeoff the GameBoy core already accepts. SD's pin 5 was
+-- independently confirmed on real hardware first, via a raw USER_IO overlay
+-- (gba_wrap.vhd's debug_link_state "P:" row) showing real activity there
+-- during a real GBA's BIOS boot, before Blue's answer arrived. Pin 4 is also
+-- HDMI-shared and must stay untouched. Adjust the generics to the actual
+-- adapter wiring, not this file's logic.
 
 entity gba_linkport is
    generic
    (
       PIN_SC : integer range 0 to 6 := 0;
       PIN_SO : integer range 0 to 6 := 1;
-      PIN_SI : integer range 0 to 6 := 3;
-      PIN_SD : integer range 0 to 6 := 6
+      PIN_SI : integer range 0 to 6 := 2;
+      PIN_SD : integer range 0 to 6 := 5
    );
    port
    (

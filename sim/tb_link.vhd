@@ -45,6 +45,7 @@ architecture sim of tb_link is
    signal b_clk_out, b_clk_oe, b_so_out, b_so_oe, b_sd_out, b_sd_oe : std_logic;
 
    signal b_connected : std_logic := '1'; -- 0 = unplug B from the cable
+   signal multi_cable : std_logic := '1'; -- 1 = GBA multi cable: A sits in the 1P plug, which grounds A's SI
 
    signal sc_line, sd_line, a_si, b_si : std_logic;
 
@@ -132,17 +133,14 @@ begin
                        (b_connected = '1' and b_clk_oe = '1' and b_clk_out = '0') else '1';
    sd_line <= '0' when (a_sd_oe = '1' and a_sd_out = '0') or
                        (b_connected = '1' and b_sd_oe = '1' and b_sd_out = '0') else '1';
-   a_si    <= '0' when (b_connected = '1' and b_so_oe = '1' and b_so_out = '0') else '1';
+   a_si    <= '0' when (multi_cable = '1') else
+              '0' when (b_connected = '1' and b_so_oe = '1' and b_so_out = '0') else '1';
    b_si    <= '0' when (a_so_oe = '1' and a_so_out = '0') else '1';
 
-   -- both ends actively transmitting on SD at once = protocol violation
-   process (clk)
-   begin
-      if rising_edge(clk) then
-         assert not (a_sd_oe = '1' and b_sd_oe = '1' and b_connected = '1')
-            report "SD driven by both ends" severity failure;
-      end if;
-   end process;
+   -- both ends actively transmitting a multiplayer frame at once = protocol
+   -- violation. Checked on the engines' own send state, not raw SD oe: in
+   -- Normal mode both ends legitimately hold SD low simultaneously (manual
+   -- p.108/111 -- open drain, no electrical conflict).
 
    iserial_a : entity work.gba_serial
    port map
@@ -153,7 +151,6 @@ begin
       wired_out        => wired_a,
       wired_done       => open,
       link_enable      => '1',
-      link_role_parent => '1',
       link_clk_out     => a_clk_out,
       link_clk_oe      => a_clk_oe,
       link_clk_in      => sc_line,
@@ -175,7 +172,6 @@ begin
       wired_out        => wired_b,
       wired_done       => open,
       link_enable      => '1',
-      link_role_parent => '0',
       link_clk_out     => b_clk_out,
       link_clk_oe      => b_clk_oe,
       link_clk_in      => sc_line,
@@ -187,6 +183,21 @@ begin
       link_sd_in       => sd_line,
       IRP_Serial       => irq_b
    );
+
+   check_double_tx : block
+      signal a_sending : std_logic;
+      signal b_sending : std_logic;
+   begin
+      a_sending <= << signal ^.iserial_a.multisendmode : std_logic >>;
+      b_sending <= << signal ^.iserial_b.multisendmode : std_logic >>;
+      process (clk)
+      begin
+         if rising_edge(clk) then
+            assert not (a_sending = '1' and b_sending = '1' and b_connected = '1')
+               report "multiplayer frame transmitted by both ends at once" severity failure;
+         end if;
+      end process;
+   end block;
 
    -- samples the first SD frame after cap_arm rises: waits for the start bit
    -- edge, then samples 16 data bits at their midpoints. cap_bits(k) = k-th
@@ -280,6 +291,11 @@ begin
 
       ------------------------------------------------------------------
       report "test 4: normal mode 8 bit, master 5A / slave A3";
+      -- normal mode over the multi cable is one-way by design (manual
+      -- p.111: the 1P plug grounds the master's SI). Model a direct
+      -- symmetric connection here (e.g. a Wireless Adapter on the port)
+      -- so the master receive path is exercised too.
+      multi_cable <= '0';
       b_connected <= '1';
       irq_clear <= '1';
       wait for 4 * CLK_PERIOD;
@@ -307,6 +323,7 @@ begin
       -- THROUGH THE LIVE READBACK, and the library gates on readback bits:
       -- master = not bit2, allReady = bit3, error = bit6, ids = bits 5:4.
       report "test 5: LinkCable.hpp choreography, 3 rounds";
+      multi_cable <= '1'; -- back on the multi cable (test 4 modeled a direct connection)
       irq_clear <= '1';
       wait for 4 * CLK_PERIOD;
       irq_clear <= '0';
