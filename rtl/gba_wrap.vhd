@@ -1734,9 +1734,21 @@ begin
                                 
                end if;
             
-            when ROMCOPY_NEXT => 
-               rom_addr         <= std_logic_vector(unsigned(rom_addr) + 2); 
-               romcopy_writepos <= std_logic_vector(unsigned(romcopy_writepos) + 4);       
+            when ROMCOPY_NEXT =>
+               rom_addr         <= std_logic_vector(unsigned(rom_addr) + 2);
+               -- >32MB Matrix carts (Shrek etc): the source file is a single contiguous
+               -- stream, but its second 32MB half lands in the separate
+               -- Softmap_GBA_Gamerom_Ext_ADDR window (chosen to sit after Rewind's buffer,
+               -- not contiguous with Gamerom_ADDR+32MB -- see that generic's comment in
+               -- gba_wrap's port list). Without this jump, everything past 32MB would keep
+               -- streaming into whatever lives right after the first 32MB (EWRAM/SaveState/
+               -- Rewind), and the Ext window big_rom_active reads from would stay unwritten.
+               if (Softmap_GBA_Gamerom_Ext_ADDR /= 0 and romcopy_target_core2 = '0' and
+                   (unsigned(rom_addr) + 2) = 33554432) then
+                  romcopy_writepos <= std_logic_vector(to_unsigned(Softmap_GBA_Gamerom_Ext_ADDR, 27));
+               else
+                  romcopy_writepos <= std_logic_vector(unsigned(romcopy_writepos) + 4);
+               end if;
                if (unsigned(rom_addr) + 2 < unsigned(romcopy_size)) then
                   ROMCOPYSTATE <= ROMCOPY_READDDR3; 
                   rdram_request(DDR3MUX_ROMCOPY) <= '1';   
