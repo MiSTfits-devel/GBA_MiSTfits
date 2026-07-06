@@ -225,6 +225,9 @@ wire reset = RESET | buttons[1] | status[0] | cart_download | bk_loading;
 `include "build_id.v"
 parameter CONF_STR = {
 	"GBA;SS3E000000:80000;",
+`ifdef GBA2P_LITE
+	"O[60:59],Load Target,1P,2P,1P+2P;",
+`endif
 	"FS1,GBA,Load,30080000;",
 	"-;",
 `ifndef GBA2P_LITE
@@ -239,6 +242,7 @@ parameter CONF_STR = {
 `ifndef GBA2P_LITE
 	"O[36],Savestates to SDCard,On,Off;",
 	"O[43],Autoincrement Slot,Off,On;",
+	"O[27],Rewind Capture,Off,On;",
 	"O[38:37],Savestate Slot,1,2,3,4;",
 	"h4H3R[17],Save state (Alt-F1);",
 	"h4H3R[18],Restore state (F1);",
@@ -262,6 +266,7 @@ parameter CONF_STR = {
 	"P1O[10:9],Flickerblend,Off,Blend,30Hz;",
 	"P1-;",
 	"P1O[8:7],Stereo Mix,None,25%,50%,100%;",
+	"P1O[19],Fast Forward Sound,On,Off;",
 `ifdef GBA2P_LITE
 	"P1O[49:48],2P Audio,Player 1,Player 2,Mix,Split P1-L P2-R;",
 	"P1O[21:20],2P Display,Both,Player 1,Player 2;",
@@ -279,8 +284,16 @@ parameter CONF_STR = {
 `endif
 	"H7P2O[47],Link Role,Parent,Child;",
    "P2-;",
+`ifdef GBA2P_LITE
+	"P2O[61],Player 1 Power,On,Off;",
+	"P2O[62],Player 2 Power,On,Off;",
+	"P2R[63],Reset Player 1;",
+	"P2R[1],Reset Player 2;",
+   "P2-;",
+`endif
    "P2-,Save setting + reload Core;",
 	"P2O[28],Homebrew BIOS,Off,On;",
+	"P2O[16],Turbo,Off,On;",
 
 	"P3,Miscellaneous;",
 	"P3-;",
@@ -310,11 +323,11 @@ parameter CONF_STR = {
 	"- ;",
 	"R0,Reset;",
 `ifdef GBA2P_LITE
-	"J1,A,B,L,R,Select,Start,Unused,Pause;",
+	"J1,A,B,L,R,Select,Start,FastForward,Pause;",
 `else
-	"J1,A,B,L,R,Select,Start,Savestates,Pause;",
+	"J1,A,B,L,R,Select,Start,FastForward,Pause,Rewind;",
 `endif
-	"jn,A,B,L,R,Select,Start,X,X;",
+	"jn,A,B,L,R,Select,Start,X,X,X;",
 	"I,",
 	"Load=DPAD Up|Save=Down|Slot=L+R,",
 	"Active Slot 1,",
@@ -438,13 +451,34 @@ always @(posedge clk_sys) begin
 end
 
 reg [26:0] last_addr;
+reg [26:0] last_addr2;
 reg        flash_1m;
 reg  [1:0] cart_type;
 reg        cart_loaded = 0;
+
+// Load Target (2P profile OSD, status[60:59]): which core(s) the next cart
+// load writes to. LOAD_1P leaves core 2's content/rom_shared untouched (the
+// fix for "2P must be off/unaffected when loading 1P"); LOAD_2P writes core
+// 2's own independent ROM window and un-shares it; LOAD_1P2P writes core 1's
+// window only (byte-for-byte the same copy as LOAD_1P) and then re-shares
+// core 2 onto it -- today's only behavior, and the default.
+localparam LOAD_1P   = 2'd0;
+localparam LOAD_2P   = 2'd1;
+localparam LOAD_1P2P = 2'd2;
+
+reg [1:0] load_target;
+reg       rom_shared = 0; // 0 = core 2 reads its own window (boots cartless until loaded -- multiboot testing); 1 = core 2 mirrors core 1's window
+reg       big_rom_pending = 0; // matrix_ident_quirk & size>32MB; ANDed with ~SECOND_CORE near the gba_wrap instantiation to make it 1P-only
 always @(posedge clk_sys) begin
 	reg old_download;
 	old_download <= cart_download;
-	if (old_download & ~cart_download) last_addr <= ioctl_addr;
+	if (~old_download & cart_download) load_target <= status[60:59];
+	if (old_download & ~cart_download) begin
+		if (load_target == LOAD_2P) last_addr2 <= ioctl_addr;
+		else                        last_addr  <= ioctl_addr;
+		if (load_target != LOAD_2P) big_rom_pending <= matrix_ident_quirk & (ioctl_addr > 27'd33554432);
+		if (load_target != LOAD_1P) rom_shared <= (load_target == LOAD_1P2P);
+	end
 end
 
 wire force_turbo = |cart_type;
@@ -482,7 +516,7 @@ savestate_ui savestate_ui
 	.joyDown        (joy_unmod[2]  ),
 	.joyUp          (joy_unmod[3]  ),
 	.joyStart       (joy_unmod[9]  ),
-	.joyRewind      (joy_unmod[11] ),
+	.joyRewind      (joy_unmod[13] ),
 	.rewindEnable   (status[27]    ),
 	.status_slot    (status[38:37] ),
 	.autoincslot    (status[43]    ),
@@ -553,11 +587,45 @@ wire [15:0] GBA_AUDIO_R;
 
 reg gba_on = 1'b0;
 reg pause = 1'b0;
+reg fast_forward, cpu_turbo;
+reg ff_latch;
 wire inPause;
+
+// FastForward button: a quick tap latches fast-forward on (tap again to
+// release); holding it past the threshold is a plain momentary speed boost
+// and does not touch the latch.
+always @(posedge clk_sys) begin : ffwd
+	reg last_ffw;
+	reg ff_was_held;
+	longint ff_count;
+
+	last_ffw <= joy_unmod[10];
+
+	if (joy_unmod[10])
+		ff_count <= ff_count + 1;
+
+	if (~last_ffw & joy_unmod[10]) begin
+		ff_latch <= 0;
+		ff_count <= 0;
+	end
+
+	if (last_ffw & ~joy_unmod[10]) begin // 100mhz clock, 0.1 seconds
+		ff_was_held <= 0;
+
+		if (ff_count < 10000000 && ~ff_was_held) begin
+			ff_was_held <= 1;
+			ff_latch <= 1;
+		end
+	end
+
+	fast_forward <= (joy_unmod[10] | ff_latch) & ~force_turbo;
+end
+
 always @(posedge clk_sys) begin
 	gba_on <= (~reset);
-   pause <= (status[5] & OSD_STATUS); // pause "pause in osd"
+   pause <= (status[5] & OSD_STATUS & ~status[27]); // pause "pause in osd", but not while rewind capture is on
    if (bram_tx_start & ~bram_tx_finish & ~bk_loading) pause <= 1'b1;
+   cpu_turbo <= ((status[16] & ~fast_forward) | force_turbo) & ~pause;
 end
 
 wire sdram_refresh;
@@ -626,8 +694,16 @@ gba_wrap
 	.Softmap_GBA_Gamerom_ADDR(524288),              //  32MB of ROM
 	.Softmap_GBA_EWRAM_ADDR  (34078720),            // 256KB EWRAM core 1 right after ROM (2P profile, needs 64MB SDRAM)
 	.Softmap_GBA_EWRAM2_ADDR (34340864),            // 256KB EWRAM core 2, right after core 1's slot (2P profile)
+	.Softmap_GBA_Gamerom2_ADDR(34603008),           // 32MB independent ROM for core 2 (LOAD_2P only), right after core 2's EWRAM.
+	                                                 // Overlaps Softmap_SaveState_ADDR/Softmap_Rewind_ADDR below, which is safe only
+	                                                 // because STRIP_2P and SECOND_CORE are always set together (see ifdef above) --
+	                                                 // savestates/rewind never run SDRAM traffic whenever this window is in use.
 	.Softmap_SaveState_ADDR  (58720256),            // 65536 (64bit) -- ~512kbyte Data for SaveState (separate memory)
 	.Softmap_Rewind_ADDR     (33554432),            // 65536 qwords*64 -- 64*512 Kbyte Data for Savestates
+	.Softmap_GBA_Gamerom_Ext_ADDR(67108864),        // second 32MB half for >32MB Matrix-mapper carts, right after Softmap_Rewind_ADDR's
+	                                                 // 32MB buffer ends (0x2000000 + 32MB = 0x4000000) -- Rewind is a live feature in this
+	                                                 // build (unlike the 2P profile's dead Rewind/SaveState region), so this window must
+	                                                 // NOT overlap it. Genuinely free space (1P build only -- see big_rom_active).
 	.strip_savestates(STRIP_2P),
 	.strip_cheats(STRIP_2P),
 	.ewram_in_sdram(STRIP_2P),
@@ -642,11 +718,19 @@ gba
 	.GBA_on(gba_on),  // switching from off to on = reset
    .pause(pause),
    .inPause(inPause),
-	.GBA_lockspeed(1'b1),       // 1 = 100% speed, 0 = max speed
-	.GBA_cputurbo(1'b0),
+	.GBA_lockspeed(~fast_forward),       // 1 = 100% speed, 0 = max speed
+	.GBA_cputurbo(cpu_turbo),
 	.GBA_flash_1m(flash_1m),          // 1 when string "FLASH1M_V" is anywhere in gamepak
 	.Underclock(status[42:41]),
    .MaxPakAddr(last_addr[26:2]),     // max byte address that will contain data, required for buggy games that read behind their own memory, e.g. zelda minish cap
+   .MaxPakAddr2(rom_shared ? last_addr[26:2] : last_addr2[26:2]), // core 2's own view of MaxPakAddr when independent; mirrors core 1's when shared
+   .core1_power(~status[61]),
+   .core2_power(~status[62]),
+   .core1_reset(status[63]),
+   .core2_reset(status[1]),
+   .rom_shared(rom_shared),
+   .romcopy_dest_is_core2(load_target == LOAD_2P),
+   .big_rom_active(big_rom_pending & ~SECOND_CORE),
 	.CyclesMissing(),                 // debug only for speed measurement, keep open
 	.CyclesVsyncSpeed(),              // debug only for speed measurement, keep open
 	.SramFlashEnable(~sram_quirk),
@@ -665,8 +749,8 @@ gba
 	.tilt(tilt_quirk),
 	.overlay_error_on(status[50]),
 	.overlay_link_on(status[14]),
-   .rewind_on(1'b0),
-   .rewind_active(1'b0),
+   .rewind_on(status[27]),
+   .rewind_active(status[27] & joy_unmod[13]),
    .savestate_number(ss_slot),
 
    .RTC_timestampNew(RTC_time[32]),
@@ -806,6 +890,8 @@ reg tilt_quirk = 0;            // game exchanges some addresses to be Tilt modul
 reg solar_quirk = 0;           // game has solar module
 reg rtc_noselect_quirk = 0;    // Sennen Kazoku never selects the RTC device (GPIO bit 2) before talking
                                 // to it -- every other RTC cart does, so this bypass is scoped to just it
+reg matrix_ident_quirk = 0;    // game code starts with 'M' -- "Matrix" bank-switch mapper (GBA Video/Shrek carts),
+                                // combined with size>32MB below to actually enable the extra addressing/remap
 
 always @(posedge clk_6x) begin
 
@@ -822,9 +908,14 @@ always @(posedge clk_6x) begin
       tilt_quirk         <= 0;
       solar_quirk        <= 0;
       rtc_noselect_quirk <= 0;
+      matrix_ident_quirk <= 0;
    end
 
-	if(rom_wr) begin
+	// Header scan (flash-size string, cart_id quirks): describes core 1's
+	// cart only. A LOAD_2P-only copy streams core 2's independent ROM through
+	// this same rom_wr/rom_addr/rom_dout tap -- gate it out so it can't
+	// clobber flags that are supposed to keep describing core 1's cart.
+	if(rom_wr && load_target != LOAD_2P) begin
 		if({str, rom_dout[7:0]} == "FLASH1M_V") flash_1m <= 1;
 		if({str[55:0], rom_dout[7:0], rom_dout[15:8]} == "FLASH1M_V") flash_1m <= 1;
 
@@ -832,11 +923,12 @@ always @(posedge clk_6x) begin
 	end
 
 
-	if(rom_wr) begin
+	if(rom_wr && load_target != LOAD_2P) begin
 		if(rom_addr[26:4] == 'hA) begin
 			if(rom_addr[3:0] >= 12) cart_id[{4'd14 - rom_addr[3:0], 3'd0} +:16] <= {rom_dout[7:0],rom_dout[15:8]};
 		end
 		if(rom_addr == 'hB0) begin
+			if(cart_id[31:24] == "M") matrix_ident_quirk <= 1; // GBA Video / "Matrix" mapper carts (Shrek, Shark Tale, etc): game code starts with 'M'
 			if(cart_id[31:8] == "AR8" ) begin sram_quirk <= 1;                                             end // Rocky US
 			if(cart_id[31:8] == "ARO" ) begin sram_quirk <= 1;                                             end // Rocky EU
 			if(cart_id[31:8] == "ALG" ) begin sram_quirk <= 1;                                             end // Dragon Ball Z - The Legacy of Goku

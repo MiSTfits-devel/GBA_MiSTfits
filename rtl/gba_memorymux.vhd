@@ -33,6 +33,11 @@ entity gba_memorymux is
       cart_rnw             : out    std_logic := '0';
       cart_addr            : out    std_logic_vector(27 downto 0) := (others => '0');
       cart_writedata       : out    std_logic_vector(7 downto 0) := (others => '0');
+      -- full pre-truncation write value/byte-enables, purely additive tap for
+      -- wide cart-mapped registers (Matrix mapper); existing cart_writedata
+      -- (and everything reading it -- flash/sram/GPIO) is untouched
+      cart_writedata32     : out    std_logic_vector(31 downto 0) := (others => '0');
+      cart_be32            : out    std_logic_vector(3 downto 0) := (others => '0');
       cart_done            : in     std_logic := '0';
       cart_readdata        : in     std_logic_vector(31 downto 0);
       
@@ -526,6 +531,8 @@ begin
       cart_32        <= '0';
       cart_rnw       <= mem_bus_rnw;
       cart_writedata <= rotate_writedata(7 downto 0);
+      cart_writedata32 <= rotate_writedata;
+      cart_be32        <= rotate_BE;
       cart_addr      <= mem_bus_Adr(27 downto 0);
       if (mem_bus_Adr(27 downto 24) = x"E" or mem_bus_Adr(27 downto 24) = x"F") then
          cart_addr(1 downto 0) <= mem_bus_Adr(1 downto 0) or bus_lowbits;
