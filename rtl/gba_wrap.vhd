@@ -15,6 +15,8 @@ entity gba_wrap is
       Softmap_GBA_EEPROM_ADDR  : integer; -- count:    8192    -- 8/32 Kbyte Data for GBA EEProm
       Softmap_GBA_EWRAM_ADDR   : integer := 0; -- count: 262144 -- 256 Kbyte Data for EWRAM core 1 (2P profile)
       Softmap_GBA_EWRAM2_ADDR  : integer := 0; -- count: 262144 -- 256 Kbyte Data for EWRAM core 2 (2P profile)
+      Softmap_GBA_Gamerom2_ADDR: integer := 0; -- count: 8388608 -- 32 Mbyte independent ROM for core 2 (2P profile, LOAD_2P only)
+      Softmap_GBA_Gamerom_Ext_ADDR: integer := 0; -- count: 8388608 -- second 32 Mbyte half for >32MB "Matrix"-mapper carts (GBA Video/Shrek); 1P (single-core) build only
       Softmap_SaveState_ADDR   : integer; -- count:  524288    -- 512 Kbyte Data for Savestate
       Softmap_Rewind_ADDR      : integer; -- count:  524288*64 -- 64*512 Kbyte Data for Savestates
       is_simu                  : std_logic := '0';
@@ -33,11 +35,21 @@ entity gba_wrap is
       GBA_on                : in     std_logic;  -- switching from off to on = reset
       pause                 : in     std_logic;
       inPause               : out    std_logic;
+      -- per-core power/reset (2P profile): independent of the shared GBA_on/pause
+      -- above, which still gate both cores together (e.g. during any HPS download).
+      -- These add finer-grained per-core control on top of that shared base.
+      core1_power           : in     std_logic := '1';
+      core2_power           : in     std_logic := '1';
+      core1_reset           : in     std_logic := '0'; -- momentary, same idiom as the shared reset trigger
+      core2_reset           : in     std_logic := '0';
+      rom_shared            : in     std_logic := '1'; -- 1 = core 2 reads core 1's ROM window; 0 = core 2's own independent window
+      big_rom_active        : in     std_logic := '0'; -- 1 = core 1's cart is a >32MB Matrix-mapper cart (GBA Video/Shrek); 1P build only
       GBA_lockspeed         : in     std_logic;  -- 1 = 100% speed, 0 = max speed
       GBA_cputurbo          : in     std_logic;  -- 1 = cpu free running, all other 16 mhz
       GBA_flash_1m          : in     std_logic;  -- 1 when string "FLASH1M_V" is anywhere in gamepak
       Underclock            : in     std_logic_vector(1 downto 0);
       MaxPakAddr            : in     std_logic_vector(24 downto 0); -- max byte address that will contain data, required for buggy games that read behind their own memory, e.g. zelda minish cap
+      MaxPakAddr2           : in     std_logic_vector(24 downto 0) := (others => '0'); -- core 2's own MaxPakAddr (2P profile): mirrors MaxPakAddr when rom_shared='1', independent otherwise
       CyclesMissing         : out    std_logic_vector(31 downto 0); -- debug only for speed measurement, keep open
       CyclesVsyncSpeed      : out    std_logic_vector(31 downto 0); -- debug only for speed measurement, keep open
       SramFlashEnable       : in     std_logic;
@@ -102,9 +114,10 @@ entity gba_wrap is
       ddr3_BE               : out    std_logic_vector(7 downto 0) := (others => '0'); 
       ddr3_WE               : out    std_logic := '0';
       ddr3_RD               : out    std_logic := '0';   
-      -- romcopy                     
+      -- romcopy
       romcopy_start         : in     std_logic;
       romcopy_size          : in     unsigned(26 downto 0);
+      romcopy_dest_is_core2 : in     std_logic := '0'; -- latched at romcopy_start: copy targets core 2's independent window instead of core 1's
       rom_addr              : out    std_logic_vector(26 downto 0);
       rom_dout              : out    std_logic_vector(15 downto 0);
       rom_wr                : out    std_logic := '0';
@@ -216,6 +229,10 @@ architecture arch of gba_wrap is
    signal cart_rnw          : std_logic;
    signal cart_addr         : std_logic_vector(27 downto 0);
    signal cart_writedata    : std_logic_vector(7 downto 0);
+   signal cart_writedata32  : std_logic_vector(31 downto 0);
+   signal cart_be32         : std_logic_vector(3 downto 0);
+   signal matrix_remap_hit  : std_logic;
+   signal matrix_remap_addr : std_logic_vector(26 downto 0);
    signal cart_done         : std_logic;
    signal cart_readdata     : std_logic_vector(31 downto 0);
    signal cart_waitcnt      : std_logic_vector(15 downto 0);
@@ -223,6 +240,7 @@ architecture arch of gba_wrap is
    signal cart_reset        : std_logic; 
    
    signal MaxPakAddr_modified  : std_logic_vector(24 downto 0);
+   signal MaxPakAddr2_modified : std_logic_vector(24 downto 0);
 
    -- EWRAM in SDRAM (2P profile): mux between the extern scheduler and the EWRAM channel
    signal mmx_sdram_Din     : std_logic_vector(31 downto 0);
@@ -452,7 +470,9 @@ architecture arch of gba_wrap is
    
    signal romcopy_writedata : std_logic_vector(63 downto 0);
    
-   signal GBA_on1X : std_logic := '0';
+   signal GBA_on1X_1 : std_logic := '0';
+   signal GBA_on1X_2 : std_logic := '0';
+   signal romcopy_target_core2 : std_logic := '0'; -- latched at romcopy_start: this copy is destined for core 2's independent window
 
    -- Temporary hardware diagnostic: hex nibble -> ASCII, see the link debug
    -- overlay below. Remove once the real-hardware link-establishment bug
@@ -486,7 +506,7 @@ begin
    (
       clk1x                 => clk1x                ,       
       -- settings                                   
-      GBA_on                => GBA_on1X             ,
+      GBA_on                => GBA_on1X_1           ,
       pause                 => pause or (requestPause and (not is_simu)),
       allowUnpause          => allowUnpause         ,
       inPause               => inPauseCore          ,
@@ -520,9 +540,11 @@ begin
       cart_idle             => cart_idle,      
       cart_32               => cart_32,      
       cart_rnw              => cart_rnw,      
-      cart_addr             => cart_addr,     
+      cart_addr             => cart_addr,
       cart_writedata        => cart_writedata,
-      cart_done             => cart_done,     
+      cart_writedata32      => cart_writedata32,
+      cart_be32             => cart_be32,
+      cart_done             => cart_done,
       cart_readdata         => cart_readdata, 
       cart_waitcnt          => cart_waitcnt,
       dma_eepromcount       => dma_eepromcount,
@@ -643,21 +665,46 @@ begin
       if rising_edge(clk6x) then
    
          if (memory_remap = '1') then
-            MaxPakAddr_modified <= (others => '1');
+            MaxPakAddr_modified  <= (others => '1');
+            MaxPakAddr2_modified <= (others => '1');
          else
-            MaxPakAddr_modified <= MaxPakAddr;
+            MaxPakAddr_modified  <= MaxPakAddr;
+            MaxPakAddr2_modified <= MaxPakAddr2;
          end if;
-         
+
       end if;
    end process;
+
+   igba_mem_matrix : entity work.gba_mem_matrix
+   generic map
+   (
+      Softmap_GBA_Gamerom_ADDR     => Softmap_GBA_Gamerom_ADDR,
+      Softmap_GBA_Gamerom_Ext_ADDR => Softmap_GBA_Gamerom_Ext_ADDR
+   )
+   port map
+   (
+      clk1x            => clk1x,
+      reset            => cart_reset,
+      active           => big_rom_active,
+
+      cart_ena         => cart_ena,
+      cart_rnw         => cart_rnw,
+      cart_addr        => cart_addr,
+      cart_writedata32 => cart_writedata32,
+      cart_be32        => cart_be32,
+
+      remap_hit        => matrix_remap_hit,
+      remap_sdram_addr => matrix_remap_addr
+   );
 
    imemorymux_extern : entity work.memorymux_extern
    generic map
    (
-      is_simu                  => is_simu,                 
+      is_simu                  => is_simu,
       Softmap_GBA_Gamerom_ADDR => Softmap_GBA_Gamerom_ADDR,
-      Softmap_GBA_FLASH_ADDR   => Softmap_GBA_FLASH_ADDR,  
-      Softmap_GBA_EEPROM_ADDR  => Softmap_GBA_EEPROM_ADDR 
+      Softmap_GBA_Gamerom_Ext_ADDR => Softmap_GBA_Gamerom_Ext_ADDR,
+      Softmap_GBA_FLASH_ADDR   => Softmap_GBA_FLASH_ADDR,
+      Softmap_GBA_EEPROM_ADDR  => Softmap_GBA_EEPROM_ADDR
    )
    port map
    (
@@ -710,10 +757,13 @@ begin
                                              
       dma_eepromcount      => dma_eepromcount,
       flash_1m             => GBA_flash_1m,       
-      MaxPakAddr           => MaxPakAddr_modified,     
-      memory_remap         => memory_remap,   
-                          
-      save_eeprom          => save_eeprom,    
+      MaxPakAddr           => MaxPakAddr_modified,
+      memory_remap         => memory_remap,
+      big_rom_active       => big_rom_active,
+      matrix_remap_hit     => matrix_remap_hit,
+      matrix_remap_addr    => matrix_remap_addr,
+
+      save_eeprom          => save_eeprom,
       save_sram            => save_sram,      
       save_flash           => save_flash,     
                                              
@@ -851,7 +901,7 @@ begin
       port map
       (
          clk1x                 => clk1x                ,
-         GBA_on                => GBA_on1X             ,
+         GBA_on                => GBA_on1X_2           ,
          pause                 => pause or (requestPause and (not is_simu)),
          allowUnpause          => allowUnpause         ,
          inPause               => open                 ,
@@ -1002,7 +1052,8 @@ begin
       icart2_sdram : entity work.gba_mem_cart2_sdram
       generic map
       (
-         Softmap_GBA_Gamerom_ADDR => Softmap_GBA_Gamerom_ADDR
+         Softmap_GBA_Gamerom_ADDR  => Softmap_GBA_Gamerom_ADDR,
+         Softmap_GBA_Gamerom2_ADDR => Softmap_GBA_Gamerom2_ADDR
       )
       port map
       (
@@ -1012,7 +1063,8 @@ begin
          reset           => c2_cart_reset,
 
          memory_remap    => memory_remap,
-         MaxPakAddr      => MaxPakAddr_modified,
+         MaxPakAddr      => MaxPakAddr2_modified,
+         rom_shared      => rom_shared,
 
          cart_ena        => c2_cart_ena,
          cart_32         => c2_cart_32,
@@ -1564,15 +1616,33 @@ begin
    rdram_writeMask(DDR3MUX_ROMCOPY)  <= x"FF";
    rdram_dataWrite(DDR3MUX_ROMCOPY)  <= 64x"0";
 
+   -- Per-core power-on derivation. Both still gate off the shared GBA_on (any
+   -- HPS download/reset holds both off, as before). On top of that:
+   -- core 1 rides through a copy only if that copy doesn't target its own
+   -- window (i.e. a LOAD_2P-only copy never touches core 1);
+   -- core 2 rides through a copy only if it's independent (rom_shared='0')
+   -- AND the copy is a LOAD_1P one that doesn't target its window either --
+   -- every other combination means core 2's window is either being written
+   -- right now or about to be viewed through a freshly-flipped rom_shared,
+   -- so it needs to reboot too. Both terms key off the FSM's own
+   -- ROMCOPYSTATE=IDLE check (unchanged, still correct: no outstanding
+   -- unacked write when IDLE is reached, see ROMCOPY_WRITESDRAM4).
    process (clk1x)
    begin
       if (rising_edge(clk1x)) then
-   
-         GBA_on1X <= '0';
-         if (GBA_on = '1' and ROMCOPYSTATE = ROMCOPY_IDLE) then
-            GBA_on1X <= '1';
+
+         GBA_on1X_1 <= '0';
+         if (GBA_on = '1' and core1_power = '1' and core1_reset = '0' and
+             (ROMCOPYSTATE = ROMCOPY_IDLE or romcopy_target_core2 = '1')) then
+            GBA_on1X_1 <= '1';
          end if;
-         
+
+         GBA_on1X_2 <= '0';
+         if (GBA_on = '1' and core2_power = '1' and core2_reset = '0' and
+             (ROMCOPYSTATE = ROMCOPY_IDLE or (rom_shared = '0' and romcopy_target_core2 = '0'))) then
+            GBA_on1X_2 <= '1';
+         end if;
+
       end if;
    end process;
 
@@ -1594,10 +1664,20 @@ begin
                rom_addr                       <= (others => '0');
                romcopy_writepos               <= 27x"0000000";
                if (romcopy_start = '1') then
-                  ROMCOPYSTATE <= ROMCOPY_CLEANSAVERAM;
-                  rom_copy     <= '1';
-                  romcopy_req  <= '1';
-                  romcopy_data <= (others => '1');
+                  rom_copy             <= '1';
+                  romcopy_target_core2 <= romcopy_dest_is_core2;
+                  if (romcopy_dest_is_core2 = '1') then
+                     -- core 2's independent window has no save-staging area
+                     -- to clear (core 2 has no save memory) -- skip straight
+                     -- to the DDR3-read/SDRAM-write loop at its own base.
+                     romcopy_writepos               <= std_logic_vector(to_unsigned(Softmap_GBA_Gamerom2_ADDR, 27));
+                     ROMCOPYSTATE                   <= ROMCOPY_READDDR3;
+                     rdram_request(DDR3MUX_ROMCOPY) <= '1';
+                  else
+                     ROMCOPYSTATE <= ROMCOPY_CLEANSAVERAM;
+                     romcopy_req  <= '1';
+                     romcopy_data <= (others => '1');
+                  end if;
                end if;
                
             when ROMCOPY_CLEANSAVERAM =>

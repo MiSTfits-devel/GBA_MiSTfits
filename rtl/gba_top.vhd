@@ -62,6 +62,8 @@ entity gba_top is
       cart_rnw              : out    std_logic := '0';
       cart_addr             : out    std_logic_vector(27 downto 0) := (others => '0');
       cart_writedata        : out    std_logic_vector(7 downto 0) := (others => '0');
+      cart_writedata32      : out    std_logic_vector(31 downto 0) := (others => '0');
+      cart_be32             : out    std_logic_vector(3 downto 0) := (others => '0');
       cart_done             : in     std_logic := '0';
       cart_readdata         : in     std_logic_vector(31 downto 0);
       cart_waitcnt          : out    std_logic_vector(15 downto 0);
@@ -773,6 +775,8 @@ begin
       cart_rnw             => cart_rnw,      
       cart_addr            => cart_addr,     
       cart_writedata       => cart_writedata,
+      cart_writedata32     => cart_writedata32,
+      cart_be32            => cart_be32,
       cart_done            => cart_done,     
       cart_readdata        => cart_readdata, 
       

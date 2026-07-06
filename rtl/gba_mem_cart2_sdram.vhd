@@ -8,9 +8,13 @@ use IEEE.numeric_std.all;
 -- bus from the shared SDRAM port as a guest channel with the same
 -- allow/active/busy handshake as gba_mem_ewram_sdram.
 --
---   * ROM reads (0x8..0xC) hit the shared ROM image in SDRAM. Both cores boot
---     the same cart until two-ROM support lands (WP5); the image is read only,
---     so serving two masters is race free and needs no locking.
+--   * ROM reads (0x8..0xC) hit one of two SDRAM windows selected by
+--     rom_shared: core 1's ROM image (read-only, race free, no locking
+--     needed) when shared, or this core's own independent
+--     Softmap_GBA_Gamerom2_ADDR window when not. The caller (gba_wrap) holds
+--     this core in reset for the duration of any copy that targets whichever
+--     window it's currently pointed at, so there's no live read-during-write
+--     hazard either way -- see gba_wrap's GBA_on1X_2 derivation.
 --   * reads behind the cart data return the open bus pattern, mirroring
 --     READAFTERPAK in memorymux_extern.
 --   * EEPROM (0xD) reads answer "ready" (1), Flash/SRAM (0xE/0xF) reads answer
@@ -25,7 +29,8 @@ use IEEE.numeric_std.all;
 entity gba_mem_cart2_sdram is
    generic
    (
-      Softmap_GBA_Gamerom_ADDR : integer -- count: 8388608 -- 32 Mbyte Data for GameRom
+      Softmap_GBA_Gamerom_ADDR  : integer; -- count: 8388608 -- 32 Mbyte Data for GameRom, shared with core 1
+      Softmap_GBA_Gamerom2_ADDR : integer := 0 -- count: 8388608 -- core 2's own independent 32 Mbyte window (used when rom_shared='0')
    );
    port
    (
@@ -36,6 +41,7 @@ entity gba_mem_cart2_sdram is
 
       memory_remap    : in  std_logic;
       MaxPakAddr      : in  std_logic_vector(24 downto 0);
+      rom_shared      : in  std_logic := '1'; -- 1 = read core 1's shared ROM window; 0 = this core's own independent window
 
       cart_ena        : in  std_logic;
       cart_32         : in  std_logic;
@@ -80,10 +86,15 @@ architecture arch of gba_mem_cart2_sdram is
    signal c32_1       : std_logic := '0';
    signal ansdata      : std_logic_vector(31 downto 0) := (others => '0');
 
+   signal rom_base : unsigned(26 downto 0);
+
 begin
 
    cart_active <= req_pending;
    cart_busy   <= '1' when (state6x = C2_WAIT) else '0';
+
+   rom_base <= to_unsigned(Softmap_GBA_Gamerom_ADDR, 27) when (rom_shared = '1') else
+               to_unsigned(Softmap_GBA_Gamerom2_ADDR, 27);
 
    -- done/readdata are registered on clk1x before export, following the WP2
    -- discipline: the 6x->1x crossing must be a plain register capture.
@@ -119,9 +130,9 @@ begin
                                  state1x     <= WAITDATA;
                                  req_pending <= '1';
                                  if (memory_remap = '1') then
-                                    c2_sdram_Adr <= std_logic_vector(to_unsigned(Softmap_GBA_Gamerom_ADDR, 27) + unsigned(cart_addr(19 downto 0)));
+                                    c2_sdram_Adr <= std_logic_vector(rom_base + unsigned(cart_addr(19 downto 0)));
                                  else
-                                    c2_sdram_Adr <= std_logic_vector(to_unsigned(Softmap_GBA_Gamerom_ADDR, 27) + unsigned(cart_addr(24 downto 0)));
+                                    c2_sdram_Adr <= std_logic_vector(rom_base + unsigned(cart_addr(24 downto 0)));
                                  end if;
                               end if;
 

@@ -11,7 +11,8 @@ entity memorymux_extern is
    (
       is_simu                  : std_logic;
       sim_trace                : std_logic := '0'; -- report cache/SDRAM events (unit benches only)
-      Softmap_GBA_Gamerom_ADDR : integer; -- count: 8388608  -- 32 Mbyte Data for GameRom
+      Softmap_GBA_Gamerom_ADDR    : integer; -- count: 8388608  -- 32 Mbyte Data for GameRom
+      Softmap_GBA_Gamerom_Ext_ADDR: integer := 0; -- count: 8388608 -- second 32 Mbyte half for >32MB "Matrix"-mapper carts (GBA Video/Shrek), only reachable when big_rom_active='1'
       Softmap_GBA_FLASH_ADDR   : integer; -- count:  131072  -- 128/512 Kbyte Data for GBA Flash
       Softmap_GBA_EEPROM_ADDR  : integer  -- count:    8192  -- 8/32 Kbyte Data for GBA EEProm
    );
@@ -68,6 +69,18 @@ entity memorymux_extern is
       flash_1m             : in     std_logic;
       MaxPakAddr           : in     std_logic_vector(24 downto 0);
       memory_remap         : in     std_logic;
+      -- ">32MB cart (GBA Video/Matrix mapper): real hardware repurposes what's
+      -- normally a redundant wait-state-mirror address bit (cart_addr(25),
+      -- distinguishing 0x8/0x9 from 0xA/0xB) as a genuine extra address bit,
+      -- unlocking a second 32MB half via Softmap_GBA_Gamerom_Ext_ADDR. Off by
+      -- default -- every existing <=32MB cart is completely unaffected.
+      big_rom_active       : in     std_logic := '0';
+      -- Matrix mapper's 8KB remap window (gba_mem_matrix.vhd): when set for
+      -- the CURRENT cart_addr, use matrix_remap_addr verbatim instead of
+      -- rom_base_addr + offset. Combinational on the same cart_addr this
+      -- module is about to register into cart_addr_1, so both land in step.
+      matrix_remap_hit     : in     std_logic := '0';
+      matrix_remap_addr    : in     std_logic_vector(26 downto 0) := (others => '0');
       
       save_eeprom          : out    std_logic := '0';
       save_sram            : out    std_logic := '0';
@@ -115,6 +128,8 @@ architecture arch of memorymux_extern is
    signal cart_idle_1            : std_logic := '0';
    signal cart_rnw_1             : std_logic := '0';
    signal cart_addr_1            : std_logic_vector(27 downto 0) := (others => '0');
+   signal matrix_remap_hit_1     : std_logic := '0';
+   signal matrix_remap_addr_1    : std_logic_vector(26 downto 0) := (others => '0');
    signal cart_writedata_1       : std_logic_vector(7 downto 0) := (others => '0');
    
    signal cart_readdata_6x       : std_logic_vector(31 downto 0) := (others => '0');
@@ -219,8 +234,15 @@ architecture arch of memorymux_extern is
    signal rom_debug_refresh : unsigned(31 downto 0) := (others => '0');
    signal rom_debug_done16  : unsigned(31 downto 0) := (others => '0');
    signal rom_debug_data    : unsigned(31 downto 0) := (others => '0');
-   
-begin 
+
+   -- selects which 32MB half a ROM read lands in; see big_rom_active above
+   signal rom_base_addr     : unsigned(busadr_bits-1 downto 0);
+
+begin
+
+   rom_base_addr <= to_unsigned(Softmap_GBA_Gamerom_Ext_ADDR, busadr_bits) when (big_rom_active = '1' and cart_addr_1(25) = '1') else
+                    to_unsigned(Softmap_GBA_Gamerom_ADDR, busadr_bits);
+
 
    flashDeviceID       <= x"13" when flash_1m = '1' else x"1B"; -- 0x09; for 1m?
    flashManufacturerID <= x"62" when flash_1m = '1' else x"32"; -- 0xc2; for 1m?
@@ -256,8 +278,13 @@ begin
    cache_index16 <= to_integer(unsigned(cart_addr(3 downto 1)));
    cache_index32 <= to_integer(unsigned(cart_addr(3 downto 1)) + 1);
    
-   cache_hit16 <= '1' when (cache_valid(cache_index16) = '1' and unsigned(cart_addr(27 downto 1)) >= cache_next(27 downto 1) and unsigned(cart_addr(27 downto 1)) < (cache_next(27 downto 1) + 8)) else '0';
-   cache_hit32 <= '1' when (cache_valid(cache_index32) = '1'                                                                 and unsigned(cart_addr(27 downto 1)) < (cache_next(27 downto 1) + 7)) else '0';
+   -- the prefetch cache fills/hits purely by cart_addr, with no notion of the
+   -- Matrix remap table (gba_mem_matrix.vhd) -- a hit inside the remapped 8KB
+   -- window could silently return data from the wrong SDRAM offset. Simplest
+   -- safe fix: disable the cache outright while a Matrix cart is active. Costs
+   -- some read performance on a rare, niche cart type; never costs correctness.
+   cache_hit16 <= '1' when (big_rom_active = '0' and cache_valid(cache_index16) = '1' and unsigned(cart_addr(27 downto 1)) >= cache_next(27 downto 1) and unsigned(cart_addr(27 downto 1)) < (cache_next(27 downto 1) + 8)) else '0';
+   cache_hit32 <= '1' when (big_rom_active = '0' and cache_valid(cache_index32) = '1'                                                                 and unsigned(cart_addr(27 downto 1)) < (cache_next(27 downto 1) + 7)) else '0';
    
    process (clk1x)
    begin
@@ -277,9 +304,11 @@ begin
                   cart_idle_1 <= cart_idle;
                   if (cart_ena = '1') then
                      cart_addr_1      <= cart_addr;
-                     cart_rnw_1       <= cart_rnw;      
-                     cart_32_1        <= cart_32;      
-                     cart_writedata_1 <= cart_writedata;                  
+                     cart_rnw_1       <= cart_rnw;
+                     cart_32_1        <= cart_32;
+                     cart_writedata_1 <= cart_writedata;
+                     matrix_remap_hit_1  <= matrix_remap_hit;
+                     matrix_remap_addr_1 <= matrix_remap_addr;
                      if (cart_rnw = '1' and cache_hit16 = '1' and (cart_32 = '0' or cache_hit32 = '1')) then
                         cart_done        <= '1';
                         if (cart_32 = '1') then
@@ -529,9 +558,9 @@ begin
                      sdram_Adr  <= std_logic_vector(unsigned(sdram_Adr) + 2);
 
                      if (memory_remap = '1') then
-                        sdram_Adr <= std_logic_vector(to_unsigned(Softmap_GBA_Gamerom_ADDR, busadr_bits) + unsigned(cart_addr_1(19 downto 0)) + 2);
+                        sdram_Adr <= std_logic_vector(rom_base_addr + unsigned(cart_addr_1(19 downto 0)) + 2);
                      else
-                        sdram_Adr <= std_logic_vector(to_unsigned(Softmap_GBA_Gamerom_ADDR, busadr_bits) + unsigned(cart_addr_1(24 downto 0)) + 2);
+                        sdram_Adr <= std_logic_vector(rom_base_addr + unsigned(cart_addr_1(24 downto 0)) + 2);
                      end if;
                      -- synthesis translate_off
                      if (sim_trace = '1') then
@@ -590,19 +619,25 @@ begin
                         case (cart_addr_1(27 downto 24)) is
                         
                            when x"8" | x"9" | x"A" | x"B" | x"C" =>
-                              if (unsigned(cart_addr_1(24 downto 2)) >= unsigned(MaxPakAddr)) then
+                              if (matrix_remap_hit_1 = '0' and unsigned(cart_addr_1(24 downto 2)) >= unsigned(MaxPakAddr)) then
                                  state <= READAFTERPAK;
                               else
                                  sdram_ena   <= '1';
                                  state       <= WAIT_SDRAM;
-                                 cacheEnable <= '1';
+                                 -- never engage the prefetch cache for a Matrix-remapped read: it fills/hits
+                                 -- purely by cart_addr with no notion of the remap table, and once engaged it
+                                 -- can keep running in the background (see the cache-refill-restart path)
+                                 -- using stale, non-remap-aware address math.
+                                 cacheEnable <= not matrix_remap_hit_1;
                               end if;
-                              
-                              if (memory_remap = '1') then
-                                 sdram_Adr <= std_logic_vector(to_unsigned(Softmap_GBA_Gamerom_ADDR, busadr_bits) + unsigned(cart_addr_1(19 downto 0)));
+
+                              if (matrix_remap_hit_1 = '1') then
+                                 sdram_Adr <= matrix_remap_addr_1; -- Matrix mapper's 8KB remap window overrides the normal offset entirely
+                              elsif (memory_remap = '1') then
+                                 sdram_Adr <= std_logic_vector(rom_base_addr + unsigned(cart_addr_1(19 downto 0)));
                               else
-                                 sdram_Adr <= std_logic_vector(to_unsigned(Softmap_GBA_Gamerom_ADDR, busadr_bits) + unsigned(cart_addr_1(24 downto 0)));
-                              end if;  
+                                 sdram_Adr <= std_logic_vector(rom_base_addr + unsigned(cart_addr_1(24 downto 0)));
+                              end if;
                               
                               if (specialmodule = '1') then
                                  if (unsigned(cart_addr_1(27 downto 0)) >= 16#80000C4# and unsigned(cart_addr_1(27 downto 0)) <= 16#80000C8#) then
