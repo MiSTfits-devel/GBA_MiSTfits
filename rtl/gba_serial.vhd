@@ -31,7 +31,6 @@ entity gba_serial is
       wired_done        : out   std_logic;
 
       link_enable       : in    std_logic := '0';  -- 1 = SIO modes operate the link lines
-      link_role_parent  : in    std_logic := '1';  -- 1 = this unit is parent/master on the cable
       link_clk_out      : out   std_logic := '1';  -- SC
       link_clk_oe       : out   std_logic := '0';
       link_clk_in       : in    std_logic := '1';
@@ -104,6 +103,41 @@ architecture arch of gba_serial is
       ENGINE_MULTI   -- Multiplayer frames on SD, SC as busy line
    );
    signal engineMode      : tEngineMode;
+
+   -- Multiplayer roles come from the cable, exactly like real hardware
+   -- (AGBProgrammingManual p.113 / Figure 101): the link cable's 1P-position
+   -- plug grounds that unit's SI terminal, every other unit's SI hangs off
+   -- the previous unit's SO. The unit whose SI reads LO is the master; there
+   -- is no software- or OSD-selectable role on a real GBA. role_master is
+   -- latched from the sensed SI level while the bus is idle (a slave's SI
+   -- legitimately toggles mid-exchange -- that's the SO daisy chain -- so
+   -- it must never be re-evaluated during one).
+   signal role_master     : std_logic := '0';
+
+   -- child-side exchange framing: engaged spans from the first start bit of
+   -- an exchange until the master releases SC (the SYNC signal) -- that
+   -- release is a LEVEL check on the synchronized wire, so unlike the old
+   -- waitmasterend edge-wait it cannot be "missed"; eng_timeout is a pure
+   -- safety net so a master dying mid-exchange can never wedge the child.
+   signal engaged         : std_logic := '0';
+   signal frames_rx       : unsigned(1 downto 0) := (others => '0');
+   signal sent_this_ex    : std_logic := '0';
+   signal eng_timeout     : unsigned(20 downto 0) := (others => '0');
+
+   -- SO daisy chain (manual p.113): each unit pulls its SO low once its own
+   -- frame is sent -- that is the next unit's go-ahead to answer -- and
+   -- releases it when the exchange concludes.
+   signal so_drive_low    : std_logic := '0';
+
+   -- Multi-Player ID (SIOCNT d5:4): assigned by bus position at each
+   -- exchange -- 0 for the master, the number of frames that preceded a
+   -- slave's own. Persists between exchanges like real hardware.
+   signal multi_id        : std_logic_vector(1 downto 0) := "00";
+
+   -- SIOMULTI2/3 receive very real data on a 3/4-unit cable; these replace
+   -- the old hardcoded-FFFF readbacks (init FFFF per exchange, per manual).
+   signal SIOMULTI2_link  : std_logic_vector(15 downto 0) := (others => '1');
+   signal SIOMULTI3_link  : std_logic_vector(15 downto 0) := (others => '1');
 
    signal SIO_start       : std_logic := '0';
    signal exchange_busy   : std_logic;
@@ -202,21 +236,43 @@ begin
                  ENGINE_STUB   when REG_SIOCNT(13 downto 12) = "11"          else -- UART: not implemented
                  ENGINE_NORMAL;
 
-   -- the child side of a multiplayer exchange runs without a local start bit,
-   -- so busy must cover the externally triggered phases as well
-   exchange_busy <= (SIO_start or multisendmode or startbitreceived) when (engineMode = ENGINE_MULTI and link_role_parent = '0') else
+   -- a slave in a multiplayer exchange runs without a local start bit (its
+   -- d07 is a pure busy status, manual p.117), so busy must cover the
+   -- externally triggered phases as well
+   exchange_busy <= (multisendmode or startbitreceived or engaged) when (engineMode = ENGINE_MULTI and role_master = '0') else
                     SIO_start;
 
-   SIOCNT_READBACK <= REG_SIOCNT(15 downto 8) & exchange_busy & REG_SIOCNT(6 downto 0) when engineMode /= ENGINE_MULTI else
-                      REG_SIOCNT(15 downto 8) & exchange_busy & "00" & (not link_role_parent) & link_sd_in & (not link_role_parent) & REG_SIOCNT(1 downto 0);
+   -- Normal mode d02 is the LIVE SI terminal level (manual p.111) -- e.g.
+   -- the Wireless Adapter's software polls it as the adapter-ready line.
+   -- Multiplayer d05:4 is the position-assigned Multi-Player ID, d03/d02 the
+   -- live SD/SI terminal levels (manual p.117-118), d06 error unimplemented.
+   SIOCNT_READBACK <= REG_SIOCNT(15 downto 8) & exchange_busy & REG_SIOCNT(6 downto 3) & link_si_in & REG_SIOCNT(1 downto 0) when (engineMode = ENGINE_NORMAL and link_enable = '1') else
+                      REG_SIOCNT(15 downto 8) & exchange_busy & REG_SIOCNT(6 downto 0)                                       when engineMode /= ENGINE_MULTI else
+                      REG_SIOCNT(15 downto 8) & exchange_busy & '0' & multi_id & link_sd_in & link_si_in & REG_SIOCNT(1 downto 0);
 
-   RCNT_READBACK   <= REG_RCNT when engineMode /= ENGINE_MULTI else
-                      REG_RCNT(15 downto 4) & '1' & (not link_role_parent) & link_sd_in & link_clk_in;
+   -- RCNT: multiplayer mode mirrors the live terminals; general-purpose
+   -- (GPIO) mode reads input-direction pins live and output-direction pins
+   -- as written -- the Wireless Adapter's reset ping runs in this mode.
+   process (engineMode, REG_RCNT, link_enable, link_si_in, link_sd_in, link_clk_in)
+   begin
+      if (engineMode = ENGINE_MULTI) then
+         RCNT_READBACK <= REG_RCNT(15 downto 4) & '1' & link_si_in & link_sd_in & link_clk_in;
+      elsif (link_enable = '1' and REG_RCNT(15 downto 14) = "10") then
+         RCNT_READBACK <= REG_RCNT;
+         if (REG_RCNT(4) = '0') then RCNT_READBACK(0) <= link_clk_in; end if;
+         if (REG_RCNT(5) = '0') then RCNT_READBACK(1) <= link_sd_in;  end if;
+         if (REG_RCNT(6) = '0') then RCNT_READBACK(2) <= link_si_in;  end if;
+         if (REG_RCNT(7) = '0') then RCNT_READBACK(3) <= '1';         end if; -- SO: nothing else ever drives it
+      else
+         RCNT_READBACK <= REG_RCNT;
+      end if;
+   end process;
 
-   SIOMULTI2_RB    <= REG_SIOMULTI2 when link_enable = '0' else x"FFFF"; -- units 2/3 don't exist on a 2 player cable
-   SIOMULTI3_RB    <= REG_SIOMULTI3 when link_enable = '0' else x"FFFF";
+   SIOMULTI2_RB    <= REG_SIOMULTI2 when link_enable = '0' else SIOMULTI2_link;
+   SIOMULTI3_RB    <= REG_SIOMULTI3 when link_enable = '0' else SIOMULTI3_link;
 
    process (clk100)
+      variable rx_slot : unsigned(1 downto 0);
    begin
       if rising_edge(clk100) then
 
@@ -249,6 +305,28 @@ begin
          case (engineMode) is
 
             when ENGINE_STUB =>
+               -- RCNT general-purpose (GPIO) mode: software bit-bangs the
+               -- pins directly, direction bits 7:4 (SO/SI/SD/SC), data bits
+               -- 3:0. The Wireless Adapter's reset ping (SD held high then
+               -- low with SO as output) runs here. Note the physical port
+               -- is open drain: "driving high" releases the line, which
+               -- reads high through the pull-up -- same net effect.
+               if (link_enable = '1' and REG_RCNT(15 downto 14) = "10") then
+                  if (REG_RCNT(4) = '1') then
+                     link_clk_oe  <= '1';
+                     link_clk_out <= REG_RCNT(0);
+                  end if;
+                  if (REG_RCNT(5) = '1') then
+                     link_sd_oe  <= '1';
+                     link_sd_out <= REG_RCNT(1);
+                  end if;
+                  -- SI has no output driver on this port (receive only)
+                  if (REG_RCNT(7) = '1') then
+                     link_so_oe  <= '1';
+                     link_so_out <= REG_RCNT(3);
+                  end if;
+               end if;
+
                -- transfers complete on schedule, data is left untouched
                if (SIO_start = '1') then
                   if (ce = '1') then
@@ -275,13 +353,22 @@ begin
 
             when ENGINE_NORMAL =>
 
-               if (REG_SIOCNT(0) = '0') then
-                  -- slave: SO is always an output; between transfers it shows
-                  -- the "SO during inactivity" bit, games use it as a ready line
-                  link_so_oe <= '1';
-                  if (SIO_start = '0') then
-                     link_so_out <= REG_SIOCNT(3);
-                  end if;
+               -- Normal mode outputs LO from the SD terminal, master and
+               -- slave alike (manual p.108/111). This doubles as the real
+               -- "not in multiplayer mode yet" announcement: a peer already
+               -- in multiplayer mode reads SD (SIOCNT d03) LO until we
+               -- switch modes too -- the rendezvous real software gates on.
+               link_sd_oe  <= '1';
+               link_sd_out <= '0';
+
+               -- SO is always an output; between transfers it shows the
+               -- "Transfer Enable Flag Send" bit d03 (manual p.111: "output
+               -- from the SO terminal until the start of a transfer") --
+               -- for the master too, e.g. the Wireless Adapter login
+               -- wiggles it as a handshake line.
+               link_so_oe <= '1';
+               if (SIO_start = '0') then
+                  link_so_out <= REG_SIOCNT(3);
                end if;
 
                if (SIO_start = '1') then
@@ -363,10 +450,14 @@ begin
 
             when ENGINE_MULTI =>
                -- 18 bit frames (start + 16 data + stop) on SD at the selected
-               -- baud rate: the parent sends first, the child answers. The
-               -- parent holds SC low while the exchange runs.
+               -- baud rate. The cable-designated master (SI grounded by the
+               -- 1P plug) holds SC low (the SYNC signal) for the whole
+               -- exchange and sends its frame first; each unit then pulls
+               -- its own SO low once its frame is out -- the go-ahead for
+               -- the unit hanging off its SO->SI cross to take the next
+               -- slot (manual p.113, Figures 101/102).
 
-               if (link_role_parent = '1') then
+               if (role_master = '1') then
                   if (SIO_start = '1') then
                      link_clk_oe  <= '1';
                      link_clk_out <= '0';
@@ -381,6 +472,11 @@ begin
                   link_sd_out <= '1';
                end if;
 
+               if (so_drive_low = '1') then
+                  link_so_oe  <= '1';
+                  link_so_out <= '0';
+               end if;
+
                -- NOTE: ce is the core's run/pause gate, not a divided bit
                -- clock -- it reads as constantly '1' while running (see
                -- gba_ctrl_pause's RUNNING state). The send/receive timing
@@ -389,6 +485,13 @@ begin
                -- increment hasn't landed yet.
                if (ce = '1') then
                   cycles <= cycles + 1;
+
+                  -- role follows the sensed SI level whenever the bus is
+                  -- idle (see role_master's declaration for why never
+                  -- mid-exchange)
+                  if (SIO_start = '0' and multisendmode = '0' and startbitreceived = '0' and engaged = '0') then
+                     role_master <= not link_si_in;
+                  end if;
 
                   if (multisendmode = '1') then
                      -- sending our frame
@@ -400,27 +503,14 @@ begin
                         if (bitcount = 17) then
                            bitcount      <= 0;
                            multisendmode <= '0';
-                           if (link_role_parent = '1') then
-                              waitchild <= (others => '0');   -- now wait for the answer
+                           so_drive_low  <= '1'; -- the next unit's go-ahead
+                           if (role_master = '1') then
+                              -- the master's own frame lands in SIOMULTI0
+                              -- on every unit, including itself
+                              SIODATA32_RB(15 downto 0) <= REG_SIODATA8;
+                              waitchild <= (others => '0');   -- now wait for the answers
                            else
-                              -- NOTE: AGBProgrammingManual p.113-114 implies a
-                              -- slave's busy flag should stay set until the
-                              -- master concludes the WHOLE exchange (it may
-                              -- still be polling phantom slave2/slave3 slots),
-                              -- not clear the instant it finishes sending. A
-                              -- prior attempt at this (wait for link_clk_in to
-                              -- release before completing) caused the child to
-                              -- get permanently stuck on real hardware -- the
-                              -- release was evidently not observed reliably.
-                              -- Reverted to completing immediately; the data
-                              -- registers are already correct at this point
-                              -- regardless, so no data is lost by clearing
-                              -- busy early.
-                              SIO_start      <= '0';
                               justsent_guard <= '1';
-                              if (REG_SIOCNT(14) = '1') then
-                                 IRP_Serial <= '1';
-                              end if;
                            end if;
                         else
                            bitcount <= bitcount + 1;
@@ -430,9 +520,9 @@ begin
                   elsif (justsent_guard = '1') then
                      justsent_guard <= '0';
 
-                  elsif (link_role_parent = '0' or SIO_start = '1') then
-                     -- receiving a frame; the child listens even without a local
-                     -- start bit, real child units are started by the parent
+                  elsif (role_master = '0' or SIO_start = '1') then
+                     -- receiving a frame; slaves listen even without a local
+                     -- start bit, real slave units are started by the master
                      if (startbitreceived = '0') then
                         -- Per AGBProgrammingManual p.113, SC going low is the
                         -- SYNC signal that marks a transfer window; SD only
@@ -448,32 +538,78 @@ begin
                            cycles           <= to_unsigned(multispeed / 2, cycles'length);
                            bitcount         <= 1;
                            startbitreceived <= '1';
-                        elsif (link_role_parent = '1' and waitchild >= to_unsigned(multispeed, 12) * 64) then
+                           eng_timeout      <= (others => '0');
+                           if (role_master = '0' and engaged = '0') then
+                              -- SYNC + first start bit = a new exchange:
+                              -- slaves initialize all data registers to
+                              -- FFFF, like real ones do (manual p.113)
+                              engaged        <= '1';
+                              frames_rx      <= (others => '0');
+                              sent_this_ex   <= '0';
+                              SIODATA32_RB   <= (others => '1');
+                              SIOMULTI1_RB   <= (others => '1');
+                              SIOMULTI2_link <= (others => '1');
+                              SIOMULTI3_link <= (others => '1');
+                           end if;
+                        elsif (role_master = '1' and SIO_start = '1' and waitchild >= to_unsigned(multispeed, 12) * 64) then
                            -- This slot's wait expired with no start bit. Per
                            -- AGBProgrammingManual p.113-114 the master always
                            -- sequentially polls up to 3 slave slots -- even
                            -- on a 2-unit cable it must still time out on the
                            -- phantom 2nd (and 3rd) slot before the exchange
-                           -- is really over, not just after slot 1.
-                           if (slave_slot = 0) then
-                              -- no slave1 answered either: open-bus fallback
-                              -- like real hardware does for absent units
-                              SIODATA32_RB <= x"FFFF" & REG_SIODATA8;
-                              SIOMULTI1_RB <= x"FFFF";
-                           end if;
+                           -- is really over, not just after slot 1. Absent
+                           -- units simply keep the FFFF written at start.
                            waitchild <= (others => '0');
                            if (slave_slot = 2) then
-                              slave_slot <= (others => '0');
-                              SIO_start  <= '0';
+                              slave_slot   <= (others => '0');
+                              SIO_start    <= '0';
+                              so_drive_low <= '0';
+                              multi_id     <= "00";
                               if (REG_SIOCNT(14) = '1') then
                                  IRP_Serial <= '1';
                               end if;
                            else
                               slave_slot <= slave_slot + 1;
                            end if;
-                        else
-                           if (link_role_parent = '1') then
+                        elsif (role_master = '1') then
+                           if (SIO_start = '1') then
                               waitchild <= waitchild + 1;
+                           end if;
+                        elsif (engaged = '1') then
+                           if (sent_this_ex = '0' and frames_rx /= 0 and link_si_in = '0') then
+                              -- our turn: the unit before us pulled our SI
+                              -- low. Our slot index (and Multi-Player ID) is
+                              -- the number of frames that came before us.
+                              multisendmode <= '1';
+                              multidataout  <= '0' & bitswap16(REG_SIODATA8) & '1';
+                              cycles        <= (others => '0');
+                              bitcount      <= 0;
+                              sent_this_ex  <= '1';
+                              multi_id      <= std_logic_vector(frames_rx);
+                              case (frames_rx) is
+                                 when "01"   => SIOMULTI1_RB <= REG_SIODATA8;
+                                                SIODATA32_RB(31 downto 16) <= REG_SIODATA8;
+                                 when "10"   => SIOMULTI2_link <= REG_SIODATA8;
+                                 when others => SIOMULTI3_link <= REG_SIODATA8;
+                              end case;
+                           elsif (link_clk_in = '1' or eng_timeout >= to_unsigned(multispeed, 12) * 256) then
+                              -- SC released: the master concluded the whole
+                              -- exchange. This is a level check on the
+                              -- synchronized wire -- it cannot be "missed"
+                              -- the way an edge could (see the waitmasterend
+                              -- regression history); the timeout is a pure
+                              -- safety net against a master dying mid-
+                              -- exchange with SC held low.
+                              engaged      <= '0';
+                              sent_this_ex <= '0';
+                              frames_rx    <= (others => '0');
+                              so_drive_low <= '0';
+                              SIO_start    <= '0';
+                              if (REG_SIOCNT(14) = '1') then
+                                 IRP_Serial <= '1';
+                              end if;
+                           else
+                              eng_timeout <= eng_timeout + 1;
                            end if;
                         end if;
                      elsif (cycles + 1 >= multispeed) then
@@ -498,24 +634,24 @@ begin
                         -- and confirm (15 downto 0) is correct.
                         bitcount         <= 0;
                         startbitreceived <= '0';
-                        if (link_role_parent = '1') then
-                           -- parent got a real answer for this slot -- still
-                           -- has to poll the remaining phantom slots (see
-                           -- above) before the exchange is really done.
-                           -- Only slot 0 may land in SIOMULTI1: a frame
-                           -- "received" during a phantom slot 1/2 window
-                           -- (glitch, stale echo) must not clobber the good
-                           -- slot-0 data captured moments earlier -- the
-                           -- timeout path above already guards its FFFF
-                           -- fallback the same way.
-                           if (slave_slot = 0) then
-                              SIODATA32_RB <= bitswap16(multidatain(15 downto 0)) & REG_SIODATA8;
-                              SIOMULTI1_RB <= bitswap16(multidatain(15 downto 0));
-                           end if;
+                        eng_timeout      <= (others => '0');
+                        if (role_master = '1') then
+                           -- master got a real answer for this slot -- still
+                           -- has to poll the remaining slots (see above)
+                           -- before the exchange is really done. Each slot's
+                           -- frame lands in its own register (manual p.114).
+                           case (slave_slot) is
+                              when "00"   => SIOMULTI1_RB <= bitswap16(multidatain(15 downto 0));
+                                             SIODATA32_RB(31 downto 16) <= bitswap16(multidatain(15 downto 0));
+                              when "01"   => SIOMULTI2_link <= bitswap16(multidatain(15 downto 0));
+                              when others => SIOMULTI3_link <= bitswap16(multidatain(15 downto 0));
+                           end case;
                            waitchild    <= (others => '0');
                            if (slave_slot = 2) then
-                              slave_slot <= (others => '0');
-                              SIO_start  <= '0';
+                              slave_slot   <= (others => '0');
+                              SIO_start    <= '0';
+                              so_drive_low <= '0';
+                              multi_id     <= "00";
                               if (REG_SIOCNT(14) = '1') then
                                  IRP_Serial <= '1';
                               end if;
@@ -523,12 +659,23 @@ begin
                               slave_slot <= slave_slot + 1;
                            end if;
                         else
-                           -- child got the parent frame and answers with its own
-                           SIODATA32_RB  <= REG_SIODATA8 & bitswap16(multidatain(15 downto 0));
-                           SIOMULTI1_RB  <= REG_SIODATA8;
-                           multisendmode <= '1';
-                           multidataout  <= '0' & bitswap16(REG_SIODATA8) & '1';
-                           cycles        <= (others => '0');
+                           -- slave got a frame: its slot index is the count
+                           -- of frames seen so far, including our own sent
+                           -- one if we already had our turn
+                           rx_slot := frames_rx;
+                           if (sent_this_ex = '1') then
+                              rx_slot := frames_rx + 1;
+                           end if;
+                           case (rx_slot) is
+                              when "00"   => SIODATA32_RB(15 downto 0) <= bitswap16(multidatain(15 downto 0));
+                              when "01"   => SIOMULTI1_RB <= bitswap16(multidatain(15 downto 0));
+                                             SIODATA32_RB(31 downto 16) <= bitswap16(multidatain(15 downto 0));
+                              when "10"   => SIOMULTI2_link <= bitswap16(multidatain(15 downto 0));
+                              when others => SIOMULTI3_link <= bitswap16(multidatain(15 downto 0));
+                           end case;
+                           if (frames_rx /= 3) then
+                              frames_rx <= frames_rx + 1;
+                           end if;
                         end if;
                      else
                         bitcount <= bitcount + 1;
@@ -541,30 +688,52 @@ begin
 
          if (SIOCNT_written = '1') then
             if (REG_SIOCNT(7) = '1') then
-               SIO_start        <= '1';
-               bitcount         <= 0;
-               cycles           <= (others => '0');
-               waitchild        <= (others => '0');
-               startbitreceived <= '0';
-               slave_slot       <= (others => '0');
-               justsent_guard   <= '0';
                if (engineMode = ENGINE_MULTI) then
-                  if (link_role_parent = '1') then
-                     multisendmode <= '1';
-                     multidataout  <= '0' & bitswap16(REG_SIODATA8) & '1';
+                  -- only the cable-designated master can start an exchange;
+                  -- a slave's d07 write is ignored (its d07 is a read-only
+                  -- busy status, manual p.117) -- crucially it must NOT
+                  -- reset an in-flight reception.
+                  if (link_si_in = '0') then
+                     role_master      <= '1';
+                     SIO_start        <= '1';
+                     bitcount         <= 0;
+                     cycles           <= (others => '0');
+                     waitchild        <= (others => '0');
+                     startbitreceived <= '0';
+                     slave_slot       <= (others => '0');
+                     justsent_guard   <= '0';
+                     so_drive_low     <= '0';
+                     multisendmode    <= '1';
+                     multidataout     <= '0' & bitswap16(REG_SIODATA8) & '1';
+                     -- all data registers initialize to FFFF at exchange
+                     -- start (manual p.113); own/received frames overwrite
+                     -- their slots as the exchange progresses
+                     SIODATA32_RB     <= (others => '1');
+                     SIOMULTI1_RB     <= (others => '1');
+                     SIOMULTI2_link   <= (others => '1');
+                     SIOMULTI3_link   <= (others => '1');
                   end if;
-                  SIODATA32_RB <= (others => '1');
-                  SIOMULTI1_RB <= (others => '1');
                else
-                  multisendmode <= '0';
+                  SIO_start        <= '1';
+                  bitcount         <= 0;
+                  cycles           <= (others => '0');
+                  waitchild        <= (others => '0');
+                  startbitreceived <= '0';
+                  slave_slot       <= (others => '0');
+                  justsent_guard   <= '0';
+                  multisendmode    <= '0';
                end if;
             elsif (engineMode /= ENGINE_STUB) then
                -- clearing the start bit cancels a running transfer
-               SIO_start        <= '0';
-               multisendmode    <= '0';
-               startbitreceived <= '0';
-               slave_slot       <= (others => '0');
-               justsent_guard   <= '0';
+               SIO_start          <= '0';
+               multisendmode      <= '0';
+               startbitreceived   <= '0';
+               slave_slot         <= (others => '0');
+               justsent_guard     <= '0';
+               engaged            <= '0';
+               sent_this_ex       <= '0';
+               frames_rx          <= (others => '0');
+               so_drive_low       <= '0';
             end if;
          end if;
 
@@ -592,6 +761,15 @@ begin
             sd_in_prev       <= '1';
             slave_slot       <= (others => '0');
             justsent_guard   <= '0';
+            role_master      <= '0';
+            engaged          <= '0';
+            sent_this_ex     <= '0';
+            frames_rx        <= (others => '0');
+            eng_timeout      <= (others => '0');
+            so_drive_low     <= '0';
+            multi_id         <= "00";
+            SIOMULTI2_link   <= (others => '1');
+            SIOMULTI3_link   <= (others => '1');
             bitcount         <= 0;
             cycles           <= (others => '0');
             waitchild        <= (others => '0');
@@ -667,7 +845,7 @@ begin
                 link_clk_out /= last_clk_out or link_clk_oe /= last_clk_oe or
                 SIOMULTI1_RB /= last_multi1) then
                report clk100'instance_name &
-                      " parent=" & std_logic'image(link_role_parent) &
+                      " master=" & std_logic'image(role_master) &
                       " SIO_start=" & std_logic'image(SIO_start) &
                       " multisend=" & std_logic'image(multisendmode) &
                       " bitcount=" & integer'image(bitcount) &

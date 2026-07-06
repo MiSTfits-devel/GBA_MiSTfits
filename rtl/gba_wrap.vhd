@@ -17,6 +17,7 @@ entity gba_wrap is
       Softmap_GBA_EWRAM2_ADDR  : integer := 0; -- count: 262144 -- 256 Kbyte Data for EWRAM core 2 (2P profile)
       Softmap_GBA_Gamerom2_ADDR: integer := 0; -- count: 8388608 -- 32 Mbyte independent ROM for core 2 (2P profile, LOAD_2P only)
       Softmap_GBA_Gamerom_Ext_ADDR: integer := 0; -- count: 8388608 -- second 32 Mbyte half for >32MB "Matrix"-mapper carts (GBA Video/Shrek); 1P (single-core) build only
+      Softmap_GBA_FLASH_ADDR2  : integer := 0; -- count:  131072    -- core 2's own Flash/SRAM backup window (2P profile, LOAD_2P only)
       Softmap_SaveState_ADDR   : integer; -- count:  524288    -- 512 Kbyte Data for Savestate
       Softmap_Rewind_ADDR      : integer; -- count:  524288*64 -- 64*512 Kbyte Data for Savestates
       is_simu                  : std_logic := '0';
@@ -53,6 +54,8 @@ entity gba_wrap is
       CyclesMissing         : out    std_logic_vector(31 downto 0); -- debug only for speed measurement, keep open
       CyclesVsyncSpeed      : out    std_logic_vector(31 downto 0); -- debug only for speed measurement, keep open
       SramFlashEnable       : in     std_logic;
+      GBA_flash_1m2         : in     std_logic := '0'; -- core 2's own flash_1m (2P profile, LOAD_2P only)
+      SramFlashEnable2      : in     std_logic := '1'; -- core 2's own SramFlashEnable
       memory_remap          : in     std_logic;
       increaseSSHeaderCount : in     std_logic;
       save_state            : in     std_logic;
@@ -133,6 +136,8 @@ entity gba_wrap is
       save_eeprom           : out    std_logic;
       save_sram             : out    std_logic;
       save_flash            : out    std_logic;
+      save_sram2            : out    std_logic := '0'; -- core 2's own save flags (2P profile, LOAD_2P only; no EEPROM yet)
+      save_flash2           : out    std_logic := '0';
       load_done             : out    std_logic;                     -- savestate successfully loaded
       -- Keys - all active high   
       KeyA                  : in     std_logic; 
@@ -151,7 +156,6 @@ entity gba_wrap is
       KeyPause              : in     std_logic;
       -- link port (open drain (value, oe) pairs, inputs must be synchronized)
       link_enable           : in     std_logic := '0';
-      link_role_parent      : in     std_logic := '1';
       link_clk_out          : out    std_logic := '1';
       link_clk_oe           : out    std_logic := '0';
       link_clk_in           : in     std_logic := '1';
@@ -162,7 +166,7 @@ entity gba_wrap is
       link_sd_oe            : out    std_logic := '0';
       link_sd_in            : in     std_logic := '1';
       -- second core (2P profile): internal link + player 2 keys
-      link_2p               : in     std_logic := '0'; -- 1 = core 1 link lines come from the internal core<->core cable, core 1 is parent
+      link_2p               : in     std_logic := '0'; -- 1 = core 1 link lines come from the internal core<->core cable, core 1 in the 1P plug position (SI grounded = master-capable)
       Key2A                 : in     std_logic := '0';
       Key2B                 : in     std_logic := '0';
       Key2Select            : in     std_logic := '0';
@@ -308,6 +312,10 @@ architecture arch of gba_wrap is
    signal cart2_busy        : std_logic;
    signal c2_sdram_ena      : std_logic;
    signal c2_sdram_Adr      : std_logic_vector(26 downto 0);
+   signal c2_sdram_rnw      : std_logic;
+   signal c2_sdram_Din      : std_logic_vector(31 downto 0);
+   signal c2_sdram_be       : std_logic_vector(3 downto 0);
+   signal c2_cart_writedata : std_logic_vector(7 downto 0);
 
    -- core 1 link lines (to/from gba_top), muxed between the external SNAC
    -- port and the internal core<->core cable
@@ -418,14 +426,21 @@ architecture arch of gba_wrap is
    -- link-establishment bug is root-caused.
    signal c1_debug_link_state    : std_logic_vector(70 downto 0);
    signal c2_debug_link_state    : std_logic_vector(70 downto 0) := (others => '0');
-   signal c1_linktext            : unsigned(20*8-1 downto 0);
-   signal c2_linktext            : unsigned(20*8-1 downto 0);
+   signal c1_linktext            : unsigned(30*8-1 downto 0);
+   signal c2_linktext            : unsigned(30*8-1 downto 0);
    signal c1_datatext            : unsigned(13*8-1 downto 0);
    signal c2_datatext            : unsigned(13*8-1 downto 0);
    signal c1_multitext           : unsigned(13*8-1 downto 0);
    signal c2_multitext           : unsigned(13*8-1 downto 0);
-   signal c1_ch_S, c1_ch_M, c1_ch_B, c1_ch_E, c1_ch_D, c1_ch_K : unsigned(7 downto 0);
-   signal c2_ch_S, c2_ch_M, c2_ch_B, c2_ch_E, c2_ch_D, c2_ch_K : unsigned(7 downto 0);
+   signal c1_ch_S, c1_ch_M, c1_ch_B, c1_ch_E : unsigned(7 downto 0);
+   signal c2_ch_S, c2_ch_M, c2_ch_B, c2_ch_E : unsigned(7 downto 0);
+   -- wire-level readout using the real GBA pin names, not engine-state
+   -- letters -- SC/SD/SI are the live sensed level, SO is our own effective
+   -- open-drain output level (oe=0 or out=1 reads as released/HI, matching
+   -- the wired-AND convention everywhere else in this design)
+   signal c1_ch_SC, c1_ch_SD, c1_ch_SI, c1_ch_SO : unsigned(7 downto 0);
+   signal c2_ch_SC, c2_ch_SD, c2_ch_SI, c2_ch_SO : unsigned(7 downto 0);
+   signal c1_so_level, c2_so_level : std_logic;
    signal c1_ch_T3, c1_ch_T2, c1_ch_T1, c1_ch_T0 : unsigned(7 downto 0);
    signal c1_ch_R3, c1_ch_R2, c1_ch_R1, c1_ch_R0 : unsigned(7 downto 0);
    signal c2_ch_T3, c2_ch_T2, c2_ch_T1, c2_ch_T0 : unsigned(7 downto 0);
@@ -435,6 +450,7 @@ architecture arch of gba_wrap is
    signal c2_ch_M23, c2_ch_M22, c2_ch_M21, c2_ch_M20 : unsigned(7 downto 0);
    signal c2_ch_M33, c2_ch_M32, c2_ch_M31, c2_ch_M30 : unsigned(7 downto 0);
    signal linkdebugEna           : std_logic;
+   signal linkdebugEna_c2        : std_logic; -- C2 row only makes sense with a second core to describe
    signal overlay_link1_data     : std_logic_vector(14 downto 0);
    signal overlay_link1_ena      : std_logic;
    signal overlay_link2_data     : std_logic_vector(14 downto 0);
@@ -590,7 +606,6 @@ begin
       KeyPause              => KeyPause             ,
       -- link port
       link_enable           => link_enable          ,
-      link_role_parent      => link_role_parent     ,
       link_clk_out          => c1_link_clk_out      ,
       link_clk_oe           => c1_link_clk_oe       ,
       link_clk_in           => c1_link_clk_in       ,
@@ -833,7 +848,7 @@ begin
       sdram_ena <= mmx_sdram_ena or ew_sdram_ena or ew2_sdram_ena or c2_sdram_ena;
       sdram_rnw <= ew_sdram_rnw  when (ewram_busy = '1') else
                    ew2_sdram_rnw when (ew2_busy   = '1') else
-                   '1'           when (cart2_busy = '1') else
+                   c2_sdram_rnw  when (cart2_busy = '1') else
                    mmx_sdram_rnw;
       sdram_Adr <= ew_sdram_Adr  when (ewram_busy = '1') else
                    ew2_sdram_Adr when (ew2_busy   = '1') else
@@ -841,9 +856,11 @@ begin
                    mmx_sdram_Adr;
       sdram_Din <= ew_sdram_Din  when (ewram_busy = '1') else
                    ew2_sdram_Din when (ew2_busy   = '1') else
+                   c2_sdram_Din  when (cart2_busy = '1') else
                    mmx_sdram_Din;
       sdram_be  <= ew_sdram_be   when (ewram_busy = '1') else
                    ew2_sdram_be  when (ew2_busy   = '1') else
+                   c2_sdram_be   when (cart2_busy = '1') else
                    "1111";
 
    end generate gEwramSdram;
@@ -936,7 +953,7 @@ begin
          cart_32               => c2_cart_32,
          cart_rnw              => c2_cart_rnw,
          cart_addr             => c2_cart_addr,
-         cart_writedata        => open,
+         cart_writedata        => c2_cart_writedata,
          cart_done             => c2_cart_done,
          cart_readdata         => c2_cart_readdata,
          cart_waitcnt          => open,
@@ -979,9 +996,10 @@ begin
          KeyR                  => Key2R,
          KeyL                  => Key2L,
          KeyPause              => '0',
-         -- link port: internal cable only, core 2 is always the child
+         -- link port: internal cable only; core 2 sits in the cable's 2P
+         -- position (its SI hangs off core 1's SO), so per the real cable
+         -- topology it can only ever be a slave
          link_enable           => link_2p,
-         link_role_parent      => '0',
          link_clk_out          => c2_link_clk_out,
          link_clk_oe           => c2_link_clk_oe,
          link_clk_in           => c2_link_clk_in,
@@ -1053,7 +1071,8 @@ begin
       generic map
       (
          Softmap_GBA_Gamerom_ADDR  => Softmap_GBA_Gamerom_ADDR,
-         Softmap_GBA_Gamerom2_ADDR => Softmap_GBA_Gamerom2_ADDR
+         Softmap_GBA_Gamerom2_ADDR => Softmap_GBA_Gamerom2_ADDR,
+         Softmap_GBA_FLASH_ADDR2   => Softmap_GBA_FLASH_ADDR2
       )
       port map
       (
@@ -1066,10 +1085,16 @@ begin
          MaxPakAddr      => MaxPakAddr2_modified,
          rom_shared      => rom_shared,
 
+         flash_1m        => GBA_flash_1m2,
+         SramFlashEnable => SramFlashEnable2,
+         save_flash      => save_flash2,
+         save_sram       => save_sram2,
+
          cart_ena        => c2_cart_ena,
          cart_32         => c2_cart_32,
          cart_rnw        => c2_cart_rnw,
          cart_addr       => c2_cart_addr,
+         cart_writedata  => c2_cart_writedata,
          cart_done       => c2_cart_done,
          cart_readdata   => c2_cart_readdata,
 
@@ -1078,7 +1103,10 @@ begin
          cart_busy       => cart2_busy,
 
          c2_sdram_ena    => c2_sdram_ena,
+         c2_sdram_rnw    => c2_sdram_rnw,
          c2_sdram_Adr    => c2_sdram_Adr,
+         c2_sdram_Din    => c2_sdram_Din,
+         c2_sdram_be     => c2_sdram_be,
          sdram_Dout      => sdram_Dout,
          sdram_done32    => sdram_done32
       );
@@ -1091,7 +1119,10 @@ begin
          if rising_edge(clk1x) then
             l2_sc    <= (c1_link_clk_out or not c1_link_clk_oe) and (c2_link_clk_out or not c2_link_clk_oe);
             l2_sd    <= (c1_link_sd_out  or not c1_link_sd_oe ) and (c2_link_sd_out  or not c2_link_sd_oe );
-            l2_si_c1 <= (c2_link_so_out  or not c2_link_so_oe );
+            -- the real cable's 1P plug grounds that unit's SI -- that is
+            -- what makes it the master (AGBProgrammingManual Figure 101);
+            -- core 1 sits in the 1P position of this internal cable
+            l2_si_c1 <= '0';
             l2_si_c2 <= (c1_link_so_out  or not c1_link_so_oe );
          end if;
       end process;
@@ -1193,9 +1224,14 @@ begin
       cart2_active  <= '0';
       cart2_busy    <= '0';
       c2_sdram_ena  <= '0';
+      c2_sdram_rnw  <= '1';
       c2_sdram_Adr  <= (others => '0');
+      c2_sdram_Din  <= (others => '0');
+      c2_sdram_be   <= (others => '0');
       c2_cart_done  <= '0';
       c2_cart_readdata <= (others => '0');
+      save_flash2   <= '0';
+      save_sram2    <= '0';
 
       pixel2_shade_x    <= 0;
       pixel2_shade_y    <= 0;
@@ -1373,17 +1409,24 @@ begin
 
    -- Temporary hardware diagnostic: on-screen link debug overlay, showing
    -- both cores' ENGINE_MULTI state ("Cn S<SIO_start> M<multisendmode>
-   -- B<startbitreceived> E<hex exchange count> D<SD wire> K<SC wire>") so
-   -- the real-hardware link-establishment bug can be diagnosed by
-   -- photographing the screen. Remove once root-caused.
-   linkdebugEna <= link_enable and overlay_link_on;
+   -- B<startbitreceived> E<hex exchange count>") plus the four link pins by
+   -- their real GBA names ("SC<x> SD<x> SI<x> SO<x>") so the real-hardware
+   -- link-establishment bug can be diagnosed by photographing the screen.
+   -- Remove once root-caused.
+   linkdebugEna    <= link_enable and overlay_link_on;
+   linkdebugEna_c2 <= linkdebugEna and second_core;
+
+   c1_so_level <= '1' when (c1_link_so_oe = '0' or c1_link_so_out = '1') else '0';
+   c2_so_level <= '1' when (c2_link_so_oe = '0' or c2_link_so_out = '1') else '0';
 
    c1_ch_S <= x"31" when c1_debug_link_state(6) = '1' else x"30";
    c1_ch_M <= x"31" when c1_debug_link_state(5) = '1' else x"30";
    c1_ch_B <= x"31" when c1_debug_link_state(4) = '1' else x"30";
    c1_ch_E <= hexchar(c1_debug_link_state(3 downto 0));
-   c1_ch_D <= x"31" when c1_link_sd_in  = '1' else x"30";
-   c1_ch_K <= x"31" when c1_link_clk_in = '1' else x"30";
+   c1_ch_SC <= x"31" when c1_link_clk_in = '1' else x"30";
+   c1_ch_SD <= x"31" when c1_link_sd_in  = '1' else x"30";
+   c1_ch_SI <= x"31" when c1_link_si_in  = '1' else x"30";
+   c1_ch_SO <= x"31" when c1_so_level    = '1' else x"30";
    c1_ch_R3 <= hexchar(c1_debug_link_state(22 downto 19));
    c1_ch_R2 <= hexchar(c1_debug_link_state(18 downto 15));
    c1_ch_R1 <= hexchar(c1_debug_link_state(14 downto 11));
@@ -1405,8 +1448,10 @@ begin
    c2_ch_M <= x"31" when c2_debug_link_state(5) = '1' else x"30";
    c2_ch_B <= x"31" when c2_debug_link_state(4) = '1' else x"30";
    c2_ch_E <= hexchar(c2_debug_link_state(3 downto 0));
-   c2_ch_D <= x"31" when c2_link_sd_in  = '1' else x"30";
-   c2_ch_K <= x"31" when c2_link_clk_in = '1' else x"30";
+   c2_ch_SC <= x"31" when c2_link_clk_in = '1' else x"30";
+   c2_ch_SD <= x"31" when c2_link_sd_in  = '1' else x"30";
+   c2_ch_SI <= x"31" when c2_link_si_in  = '1' else x"30";
+   c2_ch_SO <= x"31" when c2_so_level    = '1' else x"30";
    c2_ch_R3 <= hexchar(c2_debug_link_state(22 downto 19));
    c2_ch_R2 <= hexchar(c2_debug_link_state(18 downto 15));
    c2_ch_R1 <= hexchar(c2_debug_link_state(14 downto 11));
@@ -1441,8 +1486,10 @@ begin
                   x"4D" & c1_ch_M & x"20" &
                   x"42" & c1_ch_B & x"20" &
                   x"45" & c1_ch_E & x"20" &
-                  x"44" & c1_ch_D & x"20" &
-                  x"4B" & c1_ch_K;
+                  x"53" & x"43" & c1_ch_SC & x"20" &
+                  x"53" & x"44" & c1_ch_SD & x"20" &
+                  x"53" & x"49" & c1_ch_SI & x"20" &
+                  x"53" & x"4F" & c1_ch_SO;
    c1_datatext <= x"54" & x"3A" & c1_ch_T3 & c1_ch_T2 & c1_ch_T1 & c1_ch_T0 & x"20" &
                   x"52" & x"3A" & c1_ch_R3 & c1_ch_R2 & c1_ch_R1 & c1_ch_R0;
    c1_multitext <= x"32" & x"3A" & c1_ch_M23 & c1_ch_M22 & c1_ch_M21 & c1_ch_M20 & x"20" &
@@ -1453,14 +1500,16 @@ begin
                   x"4D" & c2_ch_M & x"20" &
                   x"42" & c2_ch_B & x"20" &
                   x"45" & c2_ch_E & x"20" &
-                  x"44" & c2_ch_D & x"20" &
-                  x"4B" & c2_ch_K;
+                  x"53" & x"43" & c2_ch_SC & x"20" &
+                  x"53" & x"44" & c2_ch_SD & x"20" &
+                  x"53" & x"49" & c2_ch_SI & x"20" &
+                  x"53" & x"4F" & c2_ch_SO;
    c2_datatext <= x"54" & x"3A" & c2_ch_T3 & c2_ch_T2 & c2_ch_T1 & c2_ch_T0 & x"20" &
                   x"52" & x"3A" & c2_ch_R3 & c2_ch_R2 & c2_ch_R1 & c2_ch_R0;
    c2_multitext <= x"32" & x"3A" & c2_ch_M23 & c2_ch_M22 & c2_ch_M21 & c2_ch_M20 & x"20" &
                    x"33" & x"3A" & c2_ch_M33 & c2_ch_M32 & c2_ch_M31 & c2_ch_M30;
 
-   ioverlayLink1 : entity work.overlay generic map (20, 2, 20, 15x"03E0", 15x"0000")
+   ioverlayLink1 : entity work.overlay generic map (30, 2, 20, 15x"03E0", 15x"0000")
    port map
    (
       clk                    => clk1x,
@@ -1499,12 +1548,12 @@ begin
       textstring             => c1_multitext
    );
 
-   ioverlayLink2 : entity work.overlay generic map (20, 2, 80, 15x"7FE0", 15x"0000")
+   ioverlayLink2 : entity work.overlay generic map (30, 2, 80, 15x"7FE0", 15x"0000")
    port map
    (
       clk                    => clk1x,
       ce                     => '1',
-      ena                    => linkdebugEna,
+      ena                    => linkdebugEna_c2,
       i_pixel_out_x          => pixel_out_x,
       i_pixel_out_y          => pixel_out_y,
       o_pixel_out_data       => overlay_link2_data,
@@ -1517,7 +1566,7 @@ begin
    (
       clk                    => clk1x,
       ce                     => '1',
-      ena                    => linkdebugEna,
+      ena                    => linkdebugEna_c2,
       i_pixel_out_x          => pixel_out_x,
       i_pixel_out_y          => pixel_out_y,
       o_pixel_out_data       => overlay_data2_data,
@@ -1530,7 +1579,7 @@ begin
    (
       clk                    => clk1x,
       ce                     => '1',
-      ena                    => linkdebugEna,
+      ena                    => linkdebugEna_c2,
       i_pixel_out_x          => pixel_out_x,
       i_pixel_out_y          => pixel_out_y,
       o_pixel_out_data       => overlay_multi2_data,

@@ -217,7 +217,7 @@ begin
       if rising_edge(clk) then
          l_sc    <= (c1_link_clk_out or not c1_link_clk_oe) and (c2_link_clk_out or not c2_link_clk_oe);
          l_sd    <= (c1_link_sd_out  or not c1_link_sd_oe ) and (c2_link_sd_out  or not c2_link_sd_oe );
-         l_si_c1 <= (c2_link_so_out  or not c2_link_so_oe );
+         l_si_c1 <= '0'; -- real cable: 1P plug grounds SI (that's what makes core 1 the master)
          l_si_c2 <= (c1_link_so_out  or not c1_link_so_oe );
       end if;
    end process;
@@ -342,7 +342,6 @@ begin
       KeyPause              => '0',
 
       link_enable           => '1',
-      link_role_parent      => '1',
       link_clk_out          => c1_link_clk_out,
       link_clk_oe           => c1_link_clk_oe,
       link_clk_in           => c1_link_clk_in,
@@ -476,7 +475,6 @@ begin
       KeyPause              => '0',
 
       link_enable           => '1',
-      link_role_parent      => '0',
       link_clk_out          => c2_link_clk_out,
       link_clk_oe           => c2_link_clk_oe,
       link_clk_in           => c2_link_clk_in,
