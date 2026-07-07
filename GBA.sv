@@ -766,6 +766,14 @@ gba
    .videoVshift(status[58:56]),
 	.specialmodule(gpio_quirk | status[40]),
 	.rtc_noselect_quirk(rtc_noselect_quirk),
+	// core 2's GPIO/RTC device (2P profile): reuse core 1's already-scanned
+	// gpio_quirk when the ROM is genuinely shared (the common 1P+2P case,
+	// same reasoning as GBA_flash_1m2 above) -- core 2's own independent
+	// LOAD_2P stream has no cart_id2 quirk table (known follow-up gap, same
+	// as SramFlashEnable2). The manual GPIO HACK OSD override (status[40])
+	// always applies to both cores regardless of sharing.
+	.specialmodule2((rom_shared & gpio_quirk) | status[40]),
+	.rtc_noselect_quirk2(rom_shared & rtc_noselect_quirk),
 	.solar_in(status[31:29]),
 	.tilt(tilt_quirk),
 	.overlay_error_on(status[50]),

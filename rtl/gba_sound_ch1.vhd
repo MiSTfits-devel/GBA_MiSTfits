@@ -239,15 +239,16 @@ begin
                   if (Channel_Sweep_Time /= "000") then
                      if (sweepcnt >= unsigned(Channel_Sweep_Time)) then
                         sweepcnt <= (others => '0');
-                        if (Channel_Sweep_Frequency_Direction = "0") then -- increase
-                           freq_divider <= freq_divider + sweep_next;
-                           if (freq_divider + sweep_next >= 2048) then
-                              ch_on <= '0';
-                           end if;
-                        else
-                           freq_divider <= freq_divider - sweep_next;
-                           if (sweep_next > freq_divider) then
-                              ch_on <= '0';
+                        if (unsigned(Channel_Number_of_sweep_shift) /= 0) then
+                           if (Channel_Sweep_Frequency_Direction = "0") then -- increase
+                              freq_divider <= freq_divider + sweep_next;
+                              if (freq_divider + sweep_next >= 2048) then
+                                 ch_on <= '0';
+                              end if;
+                           else -- decrease: underflow keeps previous frequency, channel keeps playing
+                              if (sweep_next <= freq_divider) then
+                                 freq_divider <= freq_divider - sweep_next;
+                              end if;
                            end if;
                         end if;
                      end if;

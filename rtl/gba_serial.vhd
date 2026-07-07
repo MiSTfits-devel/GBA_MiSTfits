@@ -129,6 +129,19 @@ architecture arch of gba_serial is
    -- releases it when the exchange concludes.
    signal so_drive_low    : std_logic := '0';
 
+   -- Communication Error Flag (SIOCNT d06, manual p.118): "This error flag
+   -- is automatically set ... [when] the stop bit for the receive data is
+   -- not HI (Framing Error)." Checked against the live SD level at the same
+   -- instant each reception's bitcount=18 completion samples it, for every
+   -- frame received during an exchange (master polling a slot, or a slave
+   -- receiving the master's or an earlier slave's frame) -- sticky across
+   -- an exchange, cleared only when the next one starts. The manual's other
+   -- trigger ("SI does not become LO during the SYNC interval", a broken
+   -- daisy-chain gap on a 3+ unit cable) needs per-unit chain-position
+   -- tracking this engine doesn't have and is deliberately left
+   -- unimplemented -- out of scope for a 2-unit cable.
+   signal comm_error      : std_logic := '0';
+
    -- Multi-Player ID (SIOCNT d5:4): assigned by bus position at each
    -- exchange -- 0 for the master, the number of frames that preceded a
    -- slave's own. Persists between exchanges like real hardware.
@@ -245,10 +258,11 @@ begin
    -- Normal mode d02 is the LIVE SI terminal level (manual p.111) -- e.g.
    -- the Wireless Adapter's software polls it as the adapter-ready line.
    -- Multiplayer d05:4 is the position-assigned Multi-Player ID, d03/d02 the
-   -- live SD/SI terminal levels (manual p.117-118), d06 error unimplemented.
+   -- live SD/SI terminal levels (manual p.117-118), d06 comm_error (see its
+   -- declaration above for the framing-error-only scope).
    SIOCNT_READBACK <= REG_SIOCNT(15 downto 8) & exchange_busy & REG_SIOCNT(6 downto 3) & link_si_in & REG_SIOCNT(1 downto 0) when (engineMode = ENGINE_NORMAL and link_enable = '1') else
                       REG_SIOCNT(15 downto 8) & exchange_busy & REG_SIOCNT(6 downto 0)                                       when engineMode /= ENGINE_MULTI else
-                      REG_SIOCNT(15 downto 8) & exchange_busy & '0' & multi_id & link_sd_in & link_si_in & REG_SIOCNT(1 downto 0);
+                      REG_SIOCNT(15 downto 8) & exchange_busy & comm_error & multi_id & link_sd_in & link_si_in & REG_SIOCNT(1 downto 0);
 
    -- RCNT: multiplayer mode mirrors the live terminals; general-purpose
    -- (GPIO) mode reads input-direction pins live and output-direction pins
@@ -553,6 +567,7 @@ begin
                               engaged        <= '1';
                               frames_rx      <= (others => '0');
                               sent_this_ex   <= '0';
+                              comm_error     <= '0';
                               SIODATA32_RB   <= (others => '1');
                               SIOMULTI1_RB   <= (others => '1');
                               SIOMULTI2_link <= (others => '1');
@@ -642,6 +657,15 @@ begin
                         bitcount         <= 0;
                         startbitreceived <= '0';
                         eng_timeout      <= (others => '0');
+                        -- manual p.118 framing error: the stop bit we just
+                        -- finished receiving should read HI. link_sd_in here
+                        -- is the live wire level at the stop bit's own
+                        -- sample point, one cycle before this shift's result
+                        -- becomes visible in multidatain (see the comment
+                        -- above on the capture window).
+                        if (link_sd_in = '0') then
+                           comm_error <= '1';
+                        end if;
                         if (role_master = '1') then
                            -- master got a real answer for this slot -- still
                            -- has to poll the remaining slots (see above)
@@ -710,6 +734,7 @@ begin
                      slave_slot       <= (others => '0');
                      justsent_guard   <= '0';
                      so_drive_low     <= '0';
+                     comm_error       <= '0';
                      multisendmode    <= '1';
                      multidataout     <= '0' & bitswap16(REG_SIODATA8) & '1';
                      -- all data registers initialize to FFFF at exchange
@@ -741,6 +766,7 @@ begin
                sent_this_ex       <= '0';
                frames_rx          <= (others => '0');
                so_drive_low       <= '0';
+               comm_error         <= '0';
             end if;
          end if;
 
@@ -774,6 +800,7 @@ begin
             frames_rx        <= (others => '0');
             eng_timeout      <= (others => '0');
             so_drive_low     <= '0';
+            comm_error       <= '0';
             multi_id         <= "00";
             SIOMULTI2_link   <= (others => '1');
             SIOMULTI3_link   <= (others => '1');
