@@ -28,6 +28,18 @@ use IEEE.numeric_std.all;
 --     Shares one write-capable SDRAM window (Softmap_GBA_FLASH_ADDR2) for
 --     both Flash and SRAM, same reasoning as core 1: a cart has one save type
 --     or the other, never both, so they can safely alias.
+--   * GPIO port (0x080000C4..0x080000C8, inside the 0x8 ROM window): ported
+--     from memorymux_extern's specialmodule/READ_GPIO handling. Without this,
+--     core 2 had no GPIO device at all -- reads/writes there just fell
+--     through to the ordinary ROM path, so any RTC-using cart (Pokemon
+--     Emerald/Ruby/Sapphire, Boktai, WarioWare Twisted) saw a device that
+--     never responds and concluded its battery had died. The actual
+--     gba_gpioRTCSolarGyro instance lives in gba_wrap (a second one,
+--     alongside core 1's), matching the existing pattern where this module
+--     stays a thin cart-bus decoder and defers the real device logic to a
+--     shared, reusable entity -- this file only exports the same 6-wire
+--     GPIO_readEna/done/Din/Dout/writeEna/addr bus that memorymux_extern
+--     does.
 --
 --     Mirrors memorymux_extern's two-layer split, not a single state
 --     variable: `state1x` is the CPU-facing handshake (only it ever touches
@@ -68,6 +80,18 @@ entity gba_mem_cart2_sdram is
       save_flash      : out std_logic := '0';
       save_sram       : out std_logic := '0';
 
+      -- GPIO port passthrough (0x080000C4..0x080000C8): same 6-wire bus
+      -- memorymux_extern exposes, driving a second gba_gpioRTCSolarGyro
+      -- instance in gba_wrap. specialmodule mirrors core 1's GPIO_HACK OSD
+      -- bit and gpio_quirk (see GBA.sv's specialmodule2 port wiring).
+      specialmodule   : in  std_logic := '0';
+      GPIO_readEna    : out std_logic := '0';
+      GPIO_done       : in  std_logic := '0';
+      GPIO_Din        : in  std_logic_vector(3 downto 0) := (others => '0');
+      GPIO_Dout       : out std_logic_vector(3 downto 0) := (others => '0');
+      GPIO_writeEna   : out std_logic := '0';
+      GPIO_addr       : out std_logic_vector(1 downto 0) := (others => '0');
+
       cart_ena        : in  std_logic;
       cart_32         : in  std_logic;
       cart_rnw        : in  std_logic;
@@ -98,7 +122,8 @@ architecture arch of gba_mem_cart2_sdram is
       IDLE1X,
       ANSWER,    -- request served without SDRAM, complete next cycle
       WAITDATA,  -- SDRAM round trip in flight for a plain read, answer with readdata_6x on completion
-      WAITINNER  -- a flash/sram write is in flight; wait for innerState back to INNER_IDLE
+      WAITINNER, -- a flash/sram write is in flight; wait for innerState back to INNER_IDLE
+      WAITGPIO   -- a GPIO read is in flight; wait for GPIO_done from the gba_gpioRTCSolarGyro instance
    );
    signal state1x : tState1X := IDLE1X;
 
@@ -184,9 +209,11 @@ begin
    begin
       if rising_edge(clk1x) then
 
-         cart_done  <= '0';
-         save_flash <= '0';
-         save_sram  <= '0';
+         cart_done     <= '0';
+         save_flash    <= '0';
+         save_sram     <= '0';
+         GPIO_readEna  <= '0';
+         GPIO_writeEna <= '0';
 
          if (reset = '1') then
             state1x         <= IDLE1X;
@@ -213,6 +240,14 @@ begin
                               dout_save  <= cart_writedata;
                               state1x    <= WAITINNER;
                               innerState <= FLASHSRAMWRITEDECIDE1;
+                           when x"8" =>
+                              state1x <= ANSWER;
+                              ansdata  <= (others => '0');
+                              if (specialmodule = '1' and unsigned(cart_addr(27 downto 0)) >= 16#80000C4# and unsigned(cart_addr(27 downto 0)) <= 16#80000C8#) then
+                                 GPIO_writeEna <= '1';
+                                 GPIO_addr     <= std_logic_vector(to_unsigned(to_integer(unsigned(cart_addr(3 downto 1))) - 4 / 2, 2));
+                                 GPIO_Dout     <= cart_writedata(3 downto 0);
+                              end if;
                            when others =>
                               -- ROM/EEPROM writes: no save memory there (yet), dropped as before
                               state1x <= ANSWER;
@@ -222,7 +257,11 @@ begin
                         case (cart_addr(27 downto 24)) is
 
                            when x"8" | x"9" | x"A" | x"B" | x"C" =>
-                              if (unsigned(cart_addr(24 downto 2)) >= unsigned(MaxPakAddr)) then
+                              if (specialmodule = '1' and unsigned(cart_addr(27 downto 0)) >= 16#80000C4# and unsigned(cart_addr(27 downto 0)) <= 16#80000C8#) then
+                                 state1x      <= WAITGPIO;
+                                 GPIO_readEna <= '1';
+                                 GPIO_addr    <= std_logic_vector(to_unsigned(to_integer(unsigned(cart_addr(3 downto 1))) - 4 / 2, 2));
+                              elsif (unsigned(cart_addr(24 downto 2)) >= unsigned(MaxPakAddr)) then
                                  -- open bus behind the cart data, like READAFTERPAK
                                  state1x <= ANSWER;
                                  ansdata  <= std_logic_vector(unsigned(cart_addr(16 downto 1)) + 1) & cart_addr(16 downto 1);
@@ -306,6 +345,16 @@ begin
                      state1x       <= IDLE1X;
                      cart_done     <= '1';
                      cart_readdata <= (others => '0'); -- write: CPU discards this
+                  end if;
+
+               when WAITGPIO =>
+                  -- unconditional low-nibble readback, no addr1_1 halfword swap:
+                  -- GPIO is only ever accessed 16bit, matching memorymux_extern's
+                  -- READ_GPIO (see rtl/memorymux_extern.vhd).
+                  if (GPIO_done = '1') then
+                     state1x       <= IDLE1X;
+                     cart_done     <= '1';
+                     cart_readdata <= x"0000000" & GPIO_Din;
                   end if;
 
             end case;

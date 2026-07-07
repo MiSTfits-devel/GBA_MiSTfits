@@ -74,6 +74,13 @@ entity gba_wrap is
       -- github.com/MiSTer-devel/GBA_MiSTer/issues/150). Restoring the real
       -- check by default and only bypassing it for this one cart id.
       rtc_noselect_quirk    : in     std_logic;
+      -- core 2's own GPIO device (2P profile): mirrors specialmodule/
+      -- rtc_noselect_quirk above for a second gba_gpioRTCSolarGyro instance
+      -- serving core 2's cart bus. GBA.sv derives these the same way it
+      -- derives GBA_flash_1m2 -- reuse core 1's already-scanned gpio_quirk
+      -- when rom_shared='1' (the common case), independent/off otherwise.
+      specialmodule2        : in     std_logic := '0';
+      rtc_noselect_quirk2   : in     std_logic := '0';
       solar_in              : in     std_logic_vector(2 downto 0);
       tilt                  : in     std_logic;                    -- 0 = off, 1 = use tilt at address 0x0E008200, 0x0E008300, 0x0E008400, 0x0E008500
       overlay_error_on      : in     std_logic;
@@ -915,6 +922,19 @@ begin
       signal l2_si_c1         : std_logic := '1'; -- core 2 SO -> core 1 SI (cable crosses SO/SI)
       signal l2_si_c2         : std_logic := '1'; -- core 1 SO -> core 2 SI
       constant zero_pbus      : std_logic_vector(proc_buswidth-1 downto 0) := (others => '0');
+      -- core 2's GPIO device (2P profile): same 6-wire bus memorymux_extern
+      -- exposes for core 1, driving a second gba_gpioRTCSolarGyro instance.
+      -- No savestate bus exists here (strip_savestates='1' whenever
+      -- second_core='1'), so the instance gets a benign zeroed bus instead
+      -- of gba_top2's stripped-open savestate_bus_ext -- matches
+      -- gba_savestates_stub's own tied-off default exactly.
+      signal c2_GPIO_readEna  : std_logic;
+      signal c2_GPIO_done     : std_logic;
+      signal c2_GPIO_Din      : std_logic_vector(3 downto 0);
+      signal c2_GPIO_Dout     : std_logic_vector(3 downto 0);
+      signal c2_GPIO_writeEna : std_logic;
+      signal c2_GPIO_addr     : std_logic_vector(1 downto 0);
+      constant zero_savestate_bus : proc_bus_gb_type := ((others => '0'), (others => '0'), '0', '0', "00", "0000", '0');
    begin
 
       igba_top2 : entity work.gba_top
@@ -1106,6 +1126,14 @@ begin
          save_flash      => save_flash2,
          save_sram       => save_sram2,
 
+         specialmodule   => specialmodule2,
+         GPIO_readEna    => c2_GPIO_readEna,
+         GPIO_done       => c2_GPIO_done,
+         GPIO_Din        => c2_GPIO_Din,
+         GPIO_Dout       => c2_GPIO_Dout,
+         GPIO_writeEna   => c2_GPIO_writeEna,
+         GPIO_addr       => c2_GPIO_addr,
+
          cart_ena        => c2_cart_ena,
          cart_32         => c2_cart_32,
          cart_rnw        => c2_cart_rnw,
@@ -1125,6 +1153,50 @@ begin
          c2_sdram_be     => c2_sdram_be,
          sdram_Dout      => sdram_Dout,
          sdram_done32    => sdram_done32
+      );
+
+      -- core 2's GPIO/RTC/Solar/Rumble device: real-time clock and battery
+      -- status share core 1's live feed (RTC_timestampNew/In are wall-clock
+      -- time, not per-cart state) and core 1's already-loaded saved-time
+      -- (RTC_timestampSaved/savedtimeIn/saveLoaded) -- core 2 has no
+      -- independent save file to load its own RTC state from yet (see
+      -- gba_mem_cart2_sdram.vhd's save_flash2/save_sram2 comments), so
+      -- mirroring core 1's valid, already-loaded state is what stops a
+      -- fresh RTC read on core 2 from looking like a dead battery. Output
+      -- side (RTC_timestampOut/savedtimeOut/inuse, rumble) has nothing to
+      -- persist to yet and is left open -- independent core 2 RTC
+      -- persistence is a follow-up, same as the deferred save-to-file work.
+      igba_gpioRTCSolarGyro2 : entity work.gba_gpioRTCSolarGyro
+      port map
+      (
+         clk1x                => clk1x,
+         reset                => c2_cart_reset,
+         GBA_on               => GBA_on,
+         rtc_noselect_quirk   => rtc_noselect_quirk2,
+
+         savestate_bus        => zero_savestate_bus,
+         ss_wired_out         => open,
+         ss_wired_done        => open,
+
+         GPIO_readEna         => c2_GPIO_readEna,
+         GPIO_done            => c2_GPIO_done,
+         GPIO_Din             => c2_GPIO_Din,
+         GPIO_Dout            => c2_GPIO_Dout,
+         GPIO_writeEna        => c2_GPIO_writeEna,
+         GPIO_addr            => c2_GPIO_addr,
+
+         RTC_timestampNew     => RTC_timestampNew,
+         RTC_timestampIn      => RTC_timestampIn,
+         RTC_timestampSaved   => RTC_timestampSaved,
+         RTC_savedtimeIn      => RTC_savedtimeIn,
+         RTC_saveLoaded       => RTC_saveLoaded,
+         RTC_timestampOut     => open,
+         RTC_savedtimeOut     => open,
+         RTC_inuse            => open,
+
+         rumble               => open,
+         AnalogX              => AnalogTiltX,
+         solar_in             => solar_in
       );
 
       -- internal link cable: open drain wired AND of both ends. SO/SI cross

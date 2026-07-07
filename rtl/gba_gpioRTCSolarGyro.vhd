@@ -243,8 +243,18 @@ begin
             rumble    <= '0';
             
             saveRTC   <= '0';
-            
+
             RTC_inuse <= RTC_saveLoaded;
+
+            -- POWER bit (CTLval(7)): real S-3516A sets this on a genuine
+            -- power loss/reset and it stays sticky until the game clears it.
+            -- No prior RTC save = the chip is coming up fresh, so report a
+            -- power loss the way real hardware would after a dead battery.
+            if (RTC_saveLoaded = '0') then
+               CTLval <= x"C0";
+            else
+               CTLval <= x"40";
+            end if;
             
          elsif (gba_on = '1') then
          
