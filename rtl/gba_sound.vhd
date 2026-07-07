@@ -121,8 +121,13 @@ architecture arch of gba_sound is
    signal soundmix7_l : signed(15 downto 0) := (others => '0'); 
    signal soundmix7_r : signed(15 downto 0) := (others => '0'); 
    
-   signal soundmix8_l : signed(15 downto 0) := (others => '0'); 
-   signal soundmix8_r : signed(15 downto 0) := (others => '0'); 
+   signal soundclip_l : unsigned(9 downto 0) := to_unsigned(16#200#, 10);
+   signal soundclip_r : unsigned(9 downto 0) := to_unsigned(16#200#, 10);
+
+   signal pwm_cnt     : integer range 0 to 511 := 0;
+
+   signal soundmix8_l : signed(15 downto 0) := (others => '0');
+   signal soundmix8_r : signed(15 downto 0) := (others => '0');
    
    -- savestates
    signal SAVESTATE_SOUNDON      : std_logic_vector(3 downto 0);
@@ -384,9 +389,14 @@ begin
    );
    
    process (clk1x)
+      variable biased_l   : integer;
+      variable biased_r   : integer;
+      variable samp_l     : unsigned(9 downto 0);
+      variable samp_r     : unsigned(9 downto 0);
+      variable pwm_period : integer range 64 to 512;
    begin
       if rising_edge(clk1x) then
-        
+
          -- PSG_FIFO_Master_Enable should usually also reset all sound registers
          gbsound_on <= ce and PSG_FIFO_Master_Enable(PSG_FIFO_Master_Enable'left);
         
@@ -481,10 +491,44 @@ begin
             soundmix7_r <= soundmix6_r;
          end if;
          
-         -- skip sound bias and clip on signed instead
-         soundmix8_l <= soundmix7_l; -- + to_integer(unsigned(REG_SOUNDBIAS));
-         soundmix8_r <= soundmix7_r; -- + to_integer(unsigned(REG_SOUNDBIAS));
-      
+         -- PWM output stage (AGB Programming Manual "10.8 Sound PWM Control"):
+         -- the bias level is added and the result clipped to the 10bit range the
+         -- PWM circuit accepts, just like real hardware does before modulation
+         biased_l := to_integer(soundmix7_l) + to_integer(unsigned(REG_SOUNDBIAS(9 downto 0)));
+         biased_r := to_integer(soundmix7_r) + to_integer(unsigned(REG_SOUNDBIAS(9 downto 0)));
+         if    (biased_l < 0)       then soundclip_l <= (others => '0');
+         elsif (biased_l > 16#3FF#) then soundclip_l <= (others => '1');
+         else                            soundclip_l <= to_unsigned(biased_l, 10);
+         end if;
+         if    (biased_r < 0)       then soundclip_r <= (others => '0');
+         elsif (biased_r > 16#3FF#) then soundclip_r <= (others => '1');
+         else                            soundclip_r <= to_unsigned(biased_r, 10);
+         end if;
+
+         -- the PWM circuit resamples at 32.768kHz..262.144kHz with 9..6 bit
+         -- amplitude resolution, selected by SOUNDBIAS d15-14 (Table 22). This
+         -- sample&hold decimation is audible on hardware (the noise channel LFSR
+         -- can toggle at 262kHz) and games mix for it -- passing the raw mix to
+         -- the framework resampler instead aliases it away (issue #143).
+         samp_l := soundclip_l;
+         samp_r := soundclip_r;
+         case (REG_SOUNDBIAS(15 downto 14)) is
+            when "00"   => pwm_period := 512; samp_l(0 downto 0) := "0";    samp_r(0 downto 0) := "0";    -- 9bit /  32.768kHz
+            when "01"   => pwm_period := 256; samp_l(1 downto 0) := "00";   samp_r(1 downto 0) := "00";   -- 8bit /  65.536kHz
+            when "10"   => pwm_period := 128; samp_l(2 downto 0) := "000";  samp_r(2 downto 0) := "000";  -- 7bit / 131.072kHz
+            when others => pwm_period :=  64; samp_l(3 downto 0) := "0000"; samp_r(3 downto 0) := "0000"; -- 6bit / 262.144kHz
+         end case;
+
+         if (ce = '1') then
+            if (pwm_cnt + 1 >= pwm_period) then
+               pwm_cnt     <= 0;
+               soundmix8_l <= to_signed(to_integer(samp_l) - 16#200#, 16);
+               soundmix8_r <= to_signed(to_integer(samp_r) - 16#200#, 16);
+            else
+               pwm_cnt <= pwm_cnt + 1;
+            end if;
+         end if;
+
       end if;
    end process;
    
