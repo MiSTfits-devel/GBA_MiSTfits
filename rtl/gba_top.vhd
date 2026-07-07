@@ -1159,10 +1159,26 @@ begin
             cpu_unhalt   <= '0';
             cpu_irq_next <= '0';
             cpu_irq      <= cpu_irq_next;
-            if ((IRPFLags and REG_IRP_IE) /= x"0000") then
-               cpu_unhalt <= '1';
-               if (REG_IME(0) = '1') then
-                  cpu_irq_next <= '1';
+            if (REG_HALTCNT(15) = '1') then
+               -- Stop mode (AGB Programming Manual p.141, "Stop Function"):
+               -- unlike Halt, the system clock itself stops, so only Key,
+               -- Game Pak, and SIO general-purpose-mode requests can cancel
+               -- it -- Timer/DMA/Video/Sound IRQs can't even set their IF
+               -- bit while stopped. Game Pak IRQ isn't modeled in this core
+               -- (see the IRP_Gamepak comment above), so that wake path
+               -- remains an existing gap, same as it is for Halt.
+               if ((IRPFLags and REG_IRP_IE and x"1080") /= x"0000") then -- bit7 Serial, bit12 Joypad
+                  cpu_unhalt <= '1';
+                  if (REG_IME(0) = '1') then
+                     cpu_irq_next <= '1';
+                  end if;
+               end if;
+            else
+               if ((IRPFLags and REG_IRP_IE) /= x"0000") then
+                  cpu_unhalt <= '1';
+                  if (REG_IME(0) = '1') then
+                     cpu_irq_next <= '1';
+                  end if;
                end if;
             end if;
 
