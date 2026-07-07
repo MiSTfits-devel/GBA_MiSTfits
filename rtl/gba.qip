@@ -32,6 +32,8 @@ set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_joypad
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_reservedregs.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_serial.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_linkport.vhd ]
+set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_wireless.vhd ]
+set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_wireless_uart.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_sound.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_sound_ch1.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_sound_ch3.vhd ]
