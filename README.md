@@ -1,8 +1,8 @@
 # [Gameboy Advance](https://en.wikipedia.org/wiki/Game_Boy_Advance) for [MiSTer Platform](https://github.com/MiSTer-devel/Main_MiSTer/wiki)
 
 ## Funky New Mode!
-This fork from [MiSTfits](https://github.com/MiSTfits-devel/) is based off the old new `accuracy` port and includes both 1P
-and 2P builds inline with configuration targets and macros.
+This fork from [MiSTfits](https://github.com/MiSTfits-devel/) is based off the "old new" `accuracy` port and includes both 1P
+and 2P builds in line with configuration targets and macros.
 
 ## HW Requirements/Features
 Using SDRAM with your MiSTer is highly recommended, as some games may run poorly when using just DDR-RAM as a fallback.
@@ -34,9 +34,11 @@ because the BIOS checks for Nintendo Logo included in the ROM,
 which was an old and no-longer-valid copyright protection.
 
 ### A temp workaround
-To use these ROMs without renaming or removing the the boot.rom, 
+To use these ROMs without renaming or removing the boot.rom, 
 you can activate the "Homebrew BIOS" settings in OSD.
-As the BIOS is already replaced at boot time, you must save this settings and hard reset/reload the GBA core.
+
+As the BIOS is already replaced at boot time, you must save these 
+settings and hard reset/reload the GBA core.
 
 ### How to patch your old ROMs
 As part of FOSS toolchains, `gbafix.exe` and similar programs can be found free of charge with valid legal 
@@ -84,6 +86,8 @@ Titles restored in 1P or 2P:
       - pin/state machine readouts
       - overlay toggles
   - backported fixes from GBA_MiSTer `accuracy` branch
+  - solved memory issues
+    - 1P and 2P consoles both load cart(s) from SDRAM if possible
   - *WIP: support for SNAC GB EXT adapter to trade with real hardware*
   - *WIP: GBA Wireless Adapter emulation and ARM-hosted networking for RetroArch online crossplay*
 - **GBA1P(+2P) core** reorganization and **accuracy fixes**
@@ -91,8 +95,13 @@ Titles restored in 1P or 2P:
     - *now fixed in most Pokemon ROMhacks*
   - **video glitches**
     - mosaic misapplication of BG3 to BG2, dropping BG3
-  - memory issues
-  - timing issues
+    - **TL;DR:** mimicks the sound of an original GBA console
+    - authentic `SOUNDBIAS PWM` output stage
+      - bias & clipping, 32–262 kHz sample & hold, etc.
+    - fixes missing/muted noise-channel percussion
+      - Sonic Advance 2
+      - Pokemon RSE/FRLG
+  - solved timing issues
   - tweaked some overzealous, rare patches to be disabled by default
     - these automatically re-enable on the game(s) they were designed for when detected
   - *WIP: "Shrek" cart mapper for exotic GBA video titles*
