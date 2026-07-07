@@ -178,7 +178,7 @@ module emu
 );
 
 assign ADC_BUS  = 'Z;
-assign {UART_RTS, UART_TXD, UART_DTR} = 0;
+assign {UART_RTS, UART_DTR} = 0;
 assign USER_OUT = linkport_user_out; // all released ('1) unless the link port claims its pins
 
 assign AUDIO_S   = 1;
@@ -278,9 +278,9 @@ parameter CONF_STR = {
 	"H6P2O[31:29],Solar Sensor,0%,15%,30%,42%,55%,70%,85%,100%;",
 	"P2-;",
 `ifdef GBA2P_LITE
-	"P2O[46:44],Multiplayer,2P Link (Internal),Link Cable (GPIO),Off;",
+	"P2O[46:44],Multiplayer,2P Link (Internal),Link Cable (GPIO),Off,Wireless Adapter;",
 `else
-	"P2O[46:44],Multiplayer,Off,Link Cable (GPIO);",
+	"P2O[46:44],Multiplayer,Off,Link Cable (GPIO),Wireless Adapter;",
 `endif
    "P2-;",
 `ifdef GBA2P_LITE
@@ -645,7 +645,12 @@ wire       link_internal    = (multiplayer_mode == 3'd0);
 `else
 wire       link_internal    = 1'b0;
 `endif
-wire       link_enable      = link_snac | link_internal;
+`ifdef GBA2P_LITE
+wire       link_wireless    = (multiplayer_mode == 3'd3);
+`else
+wire       link_wireless    = (multiplayer_mode == 3'd2);
+`endif
+wire       link_enable      = link_snac | link_internal | link_wireless;
 
 wire [6:0] linkport_user_out;
 wire link_clk_out, link_clk_oe, link_clk_in;
@@ -842,6 +847,9 @@ gba
    .KeyPause(joy[11]),
 
    .link_enable     (link_enable     ),
+   .link_wireless   (link_wireless   ),
+   .uart_rx         (UART_RXD        ),
+   .uart_tx         (UART_TXD        ),
    .link_clk_out    (link_clk_out    ),
    .link_clk_oe     (link_clk_oe     ),
    .link_clk_in     (link_clk_in     ),

@@ -156,6 +156,9 @@ entity gba_wrap is
       KeyPause              : in     std_logic;
       -- link port (open drain (value, oe) pairs, inputs must be synchronized)
       link_enable           : in     std_logic := '0';
+      link_wireless         : in     std_logic := '0'; -- Multiplayer = Wireless Adapter: core 1 talks to the AGB-015 emulation
+      uart_rx               : in     std_logic := '1'; -- HPS UART, rfu_daemon on the other end
+      uart_tx               : out    std_logic := '1';
       link_clk_out          : out    std_logic := '1';
       link_clk_oe           : out    std_logic := '0';
       link_clk_in           : in     std_logic := '1';
@@ -316,6 +319,19 @@ architecture arch of gba_wrap is
    signal c2_sdram_Din      : std_logic_vector(31 downto 0);
    signal c2_sdram_be       : std_logic_vector(3 downto 0);
    signal c2_cart_writedata : std_logic_vector(7 downto 0);
+
+   -- Wireless Adapter emulation: link-line view of the AGB-015 transport
+   -- (registered like the internal cable, same synchronizer discipline)
+   signal wl_sc_out, wl_sc_oe, wl_so_out, wl_so_oe : std_logic;
+   signal wl_sc_line   : std_logic := '1';
+   signal wl_si_c1     : std_logic := '1'; -- adapter SO -> core 1 SI
+   signal wl_si_adp    : std_logic := '1'; -- core 1 SO -> adapter SI
+   signal wl_sd_adp    : std_logic := '1'; -- core 1 SD -> adapter (ping)
+   signal wl_uart_txd  : std_logic_vector(7 downto 0);
+   signal wl_uart_txv  : std_logic;
+   signal wl_uart_txr  : std_logic;
+   signal wl_uart_rxd  : std_logic_vector(7 downto 0);
+   signal wl_uart_rxv  : std_logic;
 
    -- core 1 link lines (to/from gba_top), muxed between the external SNAC
    -- port and the internal core<->core cable
@@ -1127,9 +1143,12 @@ begin
          end if;
       end process;
 
-      c1_link_clk_in <= l2_sc    when (link_2p = '1') else link_clk_in;
-      c1_link_si_in  <= l2_si_c1 when (link_2p = '1') else link_si_in;
-      c1_link_sd_in  <= l2_sd    when (link_2p = '1') else link_sd_in;
+      c1_link_clk_in <= wl_sc_line when (link_wireless = '1') else
+                        l2_sc      when (link_2p = '1')       else link_clk_in;
+      c1_link_si_in  <= wl_si_c1   when (link_wireless = '1') else
+                        l2_si_c1   when (link_2p = '1')       else link_si_in;
+      c1_link_sd_in  <= '1'        when (link_wireless = '1') else
+                        l2_sd      when (link_2p = '1')       else link_sd_in;
 
       c2_link_clk_in <= l2_sc;
       c2_link_si_in  <= l2_si_c2;
@@ -1207,9 +1226,9 @@ begin
    gNoSecondCore : if (second_core = '0') generate
    begin
 
-      c1_link_clk_in <= link_clk_in;
-      c1_link_si_in  <= link_si_in;
-      c1_link_sd_in  <= link_sd_in;
+      c1_link_clk_in <= wl_sc_line when (link_wireless = '1') else link_clk_in;
+      c1_link_si_in  <= wl_si_c1   when (link_wireless = '1') else link_si_in;
+      c1_link_sd_in  <= '1'        when (link_wireless = '1') else link_sd_in;
 
       ew2_active    <= '0';
       ew2_busy      <= '0';
@@ -1810,9 +1829,52 @@ begin
       end if;
    end process;
 
+   -- AGB-015 Wireless Adapter emulation (Multiplayer = Wireless Adapter):
+   -- the adapter transport hangs off core 1's link lines like a device
+   -- plugged straight into the port; all RFU command semantics live in the
+   -- ARM-side rfu_daemon behind the framework UART (MidiLink pattern).
+   process (clk1x)
+   begin
+      if rising_edge(clk1x) then
+         wl_sc_line <= (c1_link_clk_out or not c1_link_clk_oe) and (wl_sc_out or not wl_sc_oe);
+         wl_si_c1   <= (wl_so_out      or not wl_so_oe);
+         wl_si_adp  <= (c1_link_so_out or not c1_link_so_oe);
+         wl_sd_adp  <= (c1_link_sd_out or not c1_link_sd_oe);
+      end if;
+   end process;
+
+   igba_wireless : entity work.gba_wireless
+   port map
+   (
+      clk          => clk1x,
+      reset        => not GBA_on1X_1,
+      wireless_ena => link_wireless,
+      link_sc_in   => wl_sc_line,
+      link_sc_out  => wl_sc_out,
+      link_sc_oe   => wl_sc_oe,
+      link_si_in   => wl_si_adp,
+      link_so_out  => wl_so_out,
+      link_so_oe   => wl_so_oe,
+      link_sd_in   => wl_sd_adp,
+      hps_tx_data  => wl_uart_txd,
+      hps_tx_valid => wl_uart_txv,
+      hps_tx_ready => wl_uart_txr,
+      hps_rx_data  => wl_uart_rxd,
+      hps_rx_valid => wl_uart_rxv
+   );
+
+   igba_wireless_uart : entity work.gba_wireless_uart
+   port map
+   (
+      clk       => clk1x,
+      reset     => not GBA_on1X_1,
+      uart_rx   => uart_rx,
+      uart_tx   => uart_tx,
+      tx_data   => wl_uart_txd,
+      tx_valid  => wl_uart_txv,
+      tx_ready  => wl_uart_txr,
+      rx_data   => wl_uart_rxd,
+      rx_valid  => wl_uart_rxv
+   );
+
 end architecture;
-
-
-
-
-

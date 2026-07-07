@@ -385,6 +385,11 @@ begin
                      if (clockin_1 = '0' and link_clk_in = '1') then
                         if (REG_SIOCNT(12) = '1') then
                            SIODATA32_RB <= SIODATA32_RB(30 downto 0) & link_si_in;
+                           -- SIODATA32_H IS SIOMULTI1 (same architectural
+                           -- register) and reads are a wired-or of both
+                           -- readbacks -- receive must update both or the
+                           -- stale one ORs garbage into every 32-bit read
+                           SIOMULTI1_RB <= SIODATA32_RB(30 downto 15);
                         else
                            SIODATA8_RB <= x"00" & SIODATA8_RB(6 downto 0) & link_si_in;
                         end if;
@@ -425,6 +430,8 @@ begin
                            link_clk_out <= '1';
                            if (REG_SIOCNT(12) = '1') then
                               SIODATA32_RB <= SIODATA32_RB(30 downto 0) & link_si_in;
+                              -- see the slave path: SIODATA32_H is SIOMULTI1
+                              SIOMULTI1_RB <= SIODATA32_RB(30 downto 15);
                            else
                               SIODATA8_RB <= x"00" & SIODATA8_RB(6 downto 0) & link_si_in;
                            end if;

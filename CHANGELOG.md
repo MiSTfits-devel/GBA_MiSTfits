@@ -55,8 +55,32 @@ the GBA as master, so most of what it needs is correctness we now have:
 - **SO shows d03 between Normal-mode transfers for the master too**: the
   login sequence wiggles it as a handshake.
 
-Untested against a real dongle so far; full AGB-015 *emulation* (wireless
-play between the two internal cores) is not implemented.
+Untested against a real dongle so far.
+
+### Wireless Adapter emulation (new: Multiplayer = "Wireless Adapter")
+
+A full AGB-015 transport now lives in the core (`rtl/gba_wireless.vhd`,
+protocol spec in `docs/agb015_protocol.md`, derived from LinkRawWireless,
+pret's librfu, and Nintendo's AGB Wireless Controller manual Appendix B):
+GPIO ping detection, the 10-word "NINTENDO" keystream login, 0x9966 STWI
+command framing with the per-word SO/SI handshake, the clock-reversal
+phase where the adapter masters the bus to inject 0x27/0x28/0x29 events,
+and the 100 ms word watchdog. Command *semantics* live on the ARM side:
+packets cross the framework UART (the MidiLink pattern) to
+`support/rfu_daemon/`, which implements the RFU state machine -- the same
+transport/logic split RetroArch's gpSP uses, so its RFU1 room protocol
+(over RetroArch netpacket sessions) is the intended network backend.
+Unit-proven end to end in `sim/run_wireless_tb.sh` with a real gba_serial
+driven exactly like an RFU driver drives the GBA: login, Hello,
+SystemStatus payload, wait -> reversal -> adapter-initiated notify ->
+clock handback. Networking hooks in the daemon are stubs so far: games
+can boot wireless menus, host, and scan an empty airspace; joining
+gpSP/RetroArch rooms is the next milestone.
+
+The bench also flushed out a latent gba_serial bug affecting any real
+dongle: Normal-32 receive updated SIODATA32 but not SIOMULTI1 (the same
+architectural register), so the wired-or readback returned stale bits on
+every 32-bit read. Fixed in both master and slave paths.
 
 ## 2026-07-05/06
 
