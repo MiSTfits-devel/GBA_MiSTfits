@@ -11,13 +11,21 @@ entity gba_gpu_colorshade is
 
       pixel_in_x           : in    integer range 0 to 239;
       pixel_in_y           : in    integer range 0 to 159;
-      pixel_in_data        : in    std_logic_vector(14 downto 0);  
+      pixel_in_data        : in    std_logic_vector(14 downto 0);
       pixel_in_we          : in    std_logic := '0';
-                  
+      -- opaque passthrough tag, e.g. to let a caller multiplex several pixel
+      -- streams through one shared instance and know which stream a given
+      -- output pixel came from -- threaded through the same pipeline
+      -- registers as pixel_x/y/we so it is latency-correct in both the
+      -- shaded (6 cycle) and bypass (1 cycle, shade_mode="000") paths by
+      -- construction, without the caller needing to know either latency.
+      pixel_in_tag         : in    std_logic := '0';
+
       pixel_out_x          : out   integer range 0 to 239;
       pixel_out_y          : out   integer range 0 to 159;
-      pixel_out_data       : out   std_logic_vector(17 downto 0);  
-      pixel_out_we         : out   std_logic := '0'
+      pixel_out_data       : out   std_logic_vector(17 downto 0);
+      pixel_out_we         : out   std_logic := '0';
+      pixel_out_tag        : out   std_logic := '0'
    );
 end entity;
 
@@ -158,39 +166,44 @@ architecture arch of gba_gpu_colorshade is
    signal pixel_1_y      : integer range 0 to 159;
    signal pixel_1_addr   : integer range 0 to 38399;
    signal pixel_1_we     : std_logic := '0';
+   signal pixel_1_tag    : std_logic := '0';
    signal color_linear_1 : integer range 0 to 1023;
    signal color_linear_2 : integer range 0 to 1023;
    signal color_linear_3 : integer range 0 to 1023;
-   
+
    signal pixel_2_x      : integer range 0 to 239;
    signal pixel_2_2x     : integer range 0 to 479;
    signal pixel_2_y      : integer range 0 to 159;
    signal pixel_2_addr   : integer range 0 to 38399;
    signal pixel_2_we     : std_logic := '0';
+   signal pixel_2_tag    : std_logic := '0';
    type t_shade_precalc is array(1 to 3, 1 to 3) of integer range -1048575 to 1048575;
    signal shade_precalc : t_shade_precalc := (others => (others => 0));
-   
+
    signal pixel_3_x      : integer range 0 to 239;
    signal pixel_3_2x     : integer range 0 to 479;
    signal pixel_3_y      : integer range 0 to 159;
    signal pixel_3_addr   : integer range 0 to 38399;
    signal pixel_3_we     : std_logic := '0';
+   signal pixel_3_tag    : std_logic := '0';
    type t_shade_linear is array(1 to 3) of integer range -2047 to 2047;
    signal shade_linear : t_shade_linear;
-   
+
    signal pixel_4_x     : integer range 0 to 239;
    signal pixel_4_2x    : integer range 0 to 479;
    signal pixel_4_y     : integer range 0 to 159;
    signal pixel_4_addr  : integer range 0 to 38399;
    signal pixel_4_we    : std_logic := '0';
+   signal pixel_4_tag   : std_logic := '0';
    type t_clip_linear is array(1 to 3) of integer range 0 to 1023;
    signal clip_linear : t_clip_linear;
-   
+
    signal pixel_5_x     : integer range 0 to 239;
    signal pixel_5_2x    : integer range 0 to 479;
    signal pixel_5_y     : integer range 0 to 159;
    signal pixel_5_addr  : integer range 0 to 38399;
    signal pixel_5_we    : std_logic := '0';
+   signal pixel_5_tag   : std_logic := '0';
    signal clip_linear_1 : t_clip_linear;
    type t_color_upper is array(1 to 3) of std_logic_vector(2 downto 0);
    signal color_upper : t_color_upper;
@@ -263,18 +276,20 @@ begin
       if rising_edge(clk) then
 
          -- clock 1 - lookup linear color
-         pixel_1_x    <= pixel_in_x;   
-         pixel_1_y    <= pixel_in_y;   
+         pixel_1_x    <= pixel_in_x;
+         pixel_1_y    <= pixel_in_y;
          pixel_1_we   <= pixel_in_we;
-         
+         pixel_1_tag  <= pixel_in_tag;
+
          color_linear_1 <= shade_lookup_linear(to_integer(unsigned(pixel_in_data(14 downto 10))));
          color_linear_2 <= shade_lookup_linear(to_integer(unsigned(pixel_in_data( 9 downto  5))));
          color_linear_3 <= shade_lookup_linear(to_integer(unsigned(pixel_in_data( 4 downto  0))));
-         
+
          -- clock 2 - precalc shades
-         pixel_2_x    <= pixel_1_x;   
-         pixel_2_y    <= pixel_1_y;   
+         pixel_2_x    <= pixel_1_x;
+         pixel_2_y    <= pixel_1_y;
          pixel_2_we   <= pixel_1_we;
+         pixel_2_tag  <= pixel_1_tag;
          
          --shade_linear(1) <=  (865 * color_linear_1 + 174 * color_linear_2 - 015 * color_linear_3) / 1024;
          --shade_linear(2) <=  ( 92 * color_linear_1 + 696 * color_linear_2 + 236 * color_linear_3) / 1024;
@@ -301,20 +316,22 @@ begin
          shade_precalc(3, 3) <= shade_mult(8) * color_linear_3;
          
          -- clock 3 - apply shading
-         pixel_3_x    <= pixel_2_x;   
-         pixel_3_2x   <= pixel_2_2x;   
-         pixel_3_y    <= pixel_2_y;   
+         pixel_3_x    <= pixel_2_x;
+         pixel_3_2x   <= pixel_2_2x;
+         pixel_3_y    <= pixel_2_y;
          pixel_3_addr <= pixel_2_addr;
          pixel_3_we   <= pixel_2_we;
+         pixel_3_tag  <= pixel_2_tag;
          
          shade_linear(1) <=  (shade_precalc(1, 1) + shade_precalc(1, 2) + shade_precalc(1, 3)) / 1024;
          shade_linear(2) <=  (shade_precalc(2, 1) + shade_precalc(2, 2) + shade_precalc(2, 3)) / 1024;
          shade_linear(3) <=  (shade_precalc(3, 1) + shade_precalc(3, 2) + shade_precalc(3, 3)) / 1024;
          
          -- clock 4 - clip
-         pixel_4_x    <= pixel_3_x;    
-         pixel_4_y    <= pixel_3_y;   
+         pixel_4_x    <= pixel_3_x;
+         pixel_4_y    <= pixel_3_y;
          pixel_4_we   <= pixel_3_we;
+         pixel_4_tag  <= pixel_3_tag;
          
          for c in 1 to 3 loop
             if (shade_linear(c) < 0) then 
@@ -327,9 +344,10 @@ begin
          end loop;
                    
          -- clock 5 - lookup upper 3 bits of color
-         pixel_5_x     <= pixel_4_x;    
-         pixel_5_y     <= pixel_4_y;   
-         pixel_5_we    <= pixel_4_we; 
+         pixel_5_x     <= pixel_4_x;
+         pixel_5_y     <= pixel_4_y;
+         pixel_5_we    <= pixel_4_we;
+         pixel_5_tag   <= pixel_4_tag;
          clip_linear_1 <= clip_linear;
 
          color_upper(1) <= (others => '0');
@@ -352,10 +370,11 @@ begin
          if (shade_on = '1') then
          
             -- clock 6 - lookup lower 3 bits of color
-            pixel_out_x    <= pixel_5_x;   
-            pixel_out_y    <= pixel_5_y;   
-            pixel_out_we   <= pixel_5_we; 
-         
+            pixel_out_x    <= pixel_5_x;
+            pixel_out_y    <= pixel_5_y;
+            pixel_out_we   <= pixel_5_we;
+            pixel_out_tag  <= pixel_5_tag;
+
             pixel_out_data(17 downto 12) <= color_upper(1) & "000";
             pixel_out_data(11 downto  6) <= color_upper(2) & "000";
             pixel_out_data( 5 downto  0) <= color_upper(3) & "000";
@@ -368,9 +387,10 @@ begin
             end loop;
             
          else
-            pixel_out_x    <= pixel_in_x;   
-            pixel_out_y    <= pixel_in_y;   
+            pixel_out_x    <= pixel_in_x;
+            pixel_out_y    <= pixel_in_y;
             pixel_out_we   <= pixel_in_we;
+            pixel_out_tag  <= pixel_in_tag;
             pixel_out_data <= pixel_in_data(14 downto 10) & pixel_in_data(14) & pixel_in_data(9 downto 5) & pixel_in_data(9) & pixel_in_data(4 downto 0) & pixel_in_data(4);
          end if;
          

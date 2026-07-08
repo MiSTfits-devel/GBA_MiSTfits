@@ -97,6 +97,10 @@ entity gba_wrap is
       RTC_timestampOut      : out    std_logic_vector(31 downto 0); -- timestamp to be saved
       RTC_savedtimeOut      : out    std_logic_vector(41 downto 0); -- time structure to be saved
       RTC_inuse             : out    std_logic := '0';              -- will indicate that RTC is in use and should be saved on next saving
+      -- manual DST correction for Main_MiSTer's DST-blind HPS TIMESTAMP feed
+      -- (see gba_gpioRTCSolarGyro.vhd's RTC_dstPlusHour comment); applies to
+      -- both cores' RTC devices since they share this same live feed.
+      RTC_dstPlusHour       : in     std_logic := '0';
       -- cheats
       cheat_clear           : in     std_logic;
       cheats_enabled        : in     std_logic;
@@ -414,6 +418,16 @@ architecture arch of gba_wrap is
    signal pixel_core_data        : std_logic_vector(14 downto 0);
    signal pixel_core_we          : std_logic := '0';
 
+   -- core 2's raw pixel stream (2P profile): declared here rather than
+   -- inside gSecondCore so the shared colorshade arbiter below -- which
+   -- must exist unconditionally, since core 1 always needs shading even in
+   -- the 1P build -- can see it. Driven from gba_top2 inside gSecondCore,
+   -- tied to '0' in gNoSecondCore.
+   signal c2_pixel_x             : integer range 0 to 239;
+   signal c2_pixel_y             : integer range 0 to 159;
+   signal c2_pixel_data          : std_logic_vector(14 downto 0);
+   signal c2_pixel_we            : std_logic := '0';
+
    signal shader_mode            : std_logic_vector(2 downto 0);
    signal pixel_shade_x          : integer range 0 to 239;
    signal pixel_shade_y          : integer range 0 to 159;
@@ -424,6 +438,31 @@ architecture arch of gba_wrap is
    signal pixel2_shade_y         : integer range 0 to 159;
    signal pixel2_shade_data      : std_logic_vector(17 downto 0);
    signal pixel2_shade_we        : std_logic := '0';
+
+   -- shared colorshade multiplexing (2P profile): both cores always run the
+   -- same OSD shade_mode (see shader_mode below), so one gba_gpu_colorshade
+   -- instance can serve both PPUs instead of duplicating its ~750 ALM LUT
+   -- pipeline per core. Core 1 has fixed priority into the shared pipeline
+   -- since it always exists and runs whether or not a second core does;
+   -- core 2's pixel is held one cycle on collision. Safe because each PPU's
+   -- dot clock only produces one pixel every 4 clk1x cycles, so sustained
+   -- same-cycle collisions that would overflow a 1-deep hold can't occur.
+   signal shade_arb_x            : integer range 0 to 239;
+   signal shade_arb_y            : integer range 0 to 159;
+   signal shade_arb_data         : std_logic_vector(14 downto 0);
+   signal shade_arb_we           : std_logic := '0';
+   signal shade_arb_src          : std_logic := '0'; -- 0 = core1, 1 = core2
+
+   signal shade_out_x            : integer range 0 to 239;
+   signal shade_out_y            : integer range 0 to 159;
+   signal shade_out_data         : std_logic_vector(17 downto 0);
+   signal shade_out_we           : std_logic := '0';
+   signal shade_out_src          : std_logic := '0';
+
+   signal c2_hold_we             : std_logic := '0';
+   signal c2_hold_x              : integer range 0 to 239;
+   signal c2_hold_y              : integer range 0 to 159;
+   signal c2_hold_data           : std_logic_vector(14 downto 0);
 
    signal c1_sound_left          : std_logic_vector(15 downto 0);
    signal c1_sound_right         : std_logic_vector(15 downto 0);
@@ -905,10 +944,8 @@ begin
    end generate gEwramBram;
 
    gSecondCore : if (second_core = '1') generate
-      signal c2_pixel_x       : integer range 0 to 239;
-      signal c2_pixel_y       : integer range 0 to 159;
-      signal c2_pixel_data    : std_logic_vector(14 downto 0);
-      signal c2_pixel_we      : std_logic;
+      -- c2_pixel_x/y/data/we now declared at the outer scope (see above)
+      -- so the shared colorshade arbiter can see them.
       signal c2_vblank        : std_logic;
       signal c2_sound_left    : std_logic_vector(15 downto 0);
       signal c2_sound_right   : std_logic_vector(15 downto 0);
@@ -1193,6 +1230,7 @@ begin
          RTC_timestampOut     => open,
          RTC_savedtimeOut     => open,
          RTC_inuse            => open,
+         RTC_dstPlusHour      => RTC_dstPlusHour,
 
          rumble               => open,
          AnalogX              => AnalogTiltX,
@@ -1227,24 +1265,11 @@ begin
       c2_link_sd_in  <= l2_sd;
 
       -- core 2 pixels get the same shading as core 1 and go to their own
-      -- framebuffer set at byte 0x8080000 via the second GPU write channel
-      igba_gpu_colorshade2 : entity work.gba_gpu_colorshade
-      port map
-      (
-         clk                  => clk1x,
-
-         shade_mode           => shader_mode,
-
-         pixel_in_x           => c2_pixel_x,
-         pixel_in_y           => c2_pixel_y,
-         pixel_in_data        => c2_pixel_data,
-         pixel_in_we          => c2_pixel_we,
-
-         pixel_out_x          => pixel2_shade_x,
-         pixel_out_y          => pixel2_shade_y,
-         pixel_out_data       => pixel2_shade_data,
-         pixel_out_we         => pixel2_shade_we
-      );
+      -- framebuffer set at byte 0x8080000 via the second GPU write channel.
+      -- The actual shading now happens in one shared gba_gpu_colorshade
+      -- instance below (outer scope, always present) that time-multiplexes
+      -- both cores' pixel streams -- pixel2_shade_x/y/data/we are driven by
+      -- that arbiter's output, not a dedicated per-core instance.
 
       -- pack 4 pixels into one fifo entry: the GPU rasters x = 0..239 in
       -- order, so pixels 0..2 of each word are collected and pixel 3 pushes
@@ -1324,12 +1349,16 @@ begin
       save_flash2   <= '0';
       save_sram2    <= '0';
 
-      pixel2_shade_x    <= 0;
-      pixel2_shade_y    <= 0;
-      pixel2_shade_data <= (others => '0');
-      pixel2_shade_we   <= '0';
-      gpufifo2_Din      <= (others => '0');
-      gpufifo2_Wr       <= '0';
+      -- pixel2_shade_x/y/data/we are driven unconditionally by the shared
+      -- colorshade arbiter below; with no second core, c2_pixel_we stays
+      -- '0' so that arbiter naturally never selects src=1 and pixel2_shade_we
+      -- stays '0' too -- no separate tie-off needed here.
+      c2_pixel_x    <= 0;
+      c2_pixel_y    <= 0;
+      c2_pixel_data <= (others => '0');
+      c2_pixel_we   <= '0';
+      gpufifo2_Din  <= (others => '0');
+      gpufifo2_Wr   <= '0';
 
       sound_out_left  <= c1_sound_left;
       sound_out_right <= c1_sound_right;
@@ -1360,9 +1389,10 @@ begin
       RTC_timestampSaved   => RTC_timestampSaved,
       RTC_savedtimeIn      => RTC_savedtimeIn,   
       RTC_saveLoaded       => RTC_saveLoaded,    
-      RTC_timestampOut     => RTC_timestampOut,  
-      RTC_savedtimeOut     => RTC_savedtimeOut,  
-      RTC_inuse            => RTC_inuse,         
+      RTC_timestampOut     => RTC_timestampOut,
+      RTC_savedtimeOut     => RTC_savedtimeOut,
+      RTC_inuse            => RTC_inuse,
+      RTC_dstPlusHour      => RTC_dstPlusHour,
 
       rumble               => Rumble,
       AnalogX              => AnalogTiltX,
@@ -1370,23 +1400,93 @@ begin
    );
    
    shader_mode <= shade_mode when (unsigned(shade_mode) < 5) else "000";
+
+   -- shared colorshade arbiter: core 1 always gets the shared pipeline
+   -- immediately (it never waits -- its own PPU never gets stalled by this).
+   -- Core 2's pixel, fresh or previously held, is fed only on a cycle core 1
+   -- has nothing; if core 2 still isn't fed this cycle its candidate pixel
+   -- (whichever it is) is (re-)latched into the 1-deep hold. See the
+   -- c2_hold_we declaration above for why 1 deep is enough.
+   process (clk1x)
+      variable c2_cand_we   : std_logic;
+      variable c2_cand_x    : integer range 0 to 239;
+      variable c2_cand_y    : integer range 0 to 159;
+      variable c2_cand_data : std_logic_vector(14 downto 0);
+   begin
+      if rising_edge(clk1x) then
+
+         shade_arb_we <= '0';
+
+         if (c2_hold_we = '1') then
+            c2_cand_we   := '1';
+            c2_cand_x    := c2_hold_x;
+            c2_cand_y    := c2_hold_y;
+            c2_cand_data := c2_hold_data;
+         else
+            c2_cand_we   := c2_pixel_we;
+            c2_cand_x    := c2_pixel_x;
+            c2_cand_y    := c2_pixel_y;
+            c2_cand_data := c2_pixel_data;
+         end if;
+
+         if (pixel_core_we = '1') then
+            shade_arb_we   <= '1';
+            shade_arb_src  <= '0';
+            shade_arb_x    <= pixel_core_x;
+            shade_arb_y    <= pixel_core_y;
+            shade_arb_data <= pixel_core_data;
+
+            c2_hold_we   <= c2_cand_we;
+            c2_hold_x    <= c2_cand_x;
+            c2_hold_y    <= c2_cand_y;
+            c2_hold_data <= c2_cand_data;
+
+         elsif (c2_cand_we = '1') then
+            shade_arb_we   <= '1';
+            shade_arb_src  <= '1';
+            shade_arb_x    <= c2_cand_x;
+            shade_arb_y    <= c2_cand_y;
+            shade_arb_data <= c2_cand_data;
+
+            c2_hold_we <= '0';
+
+         else
+            c2_hold_we <= '0';
+         end if;
+
+      end if;
+   end process;
+
    igba_gpu_colorshade : entity work.gba_gpu_colorshade
    port map
    (
       clk                  => clk1x,
-                           
+
       shade_mode           => shader_mode,
-                           
-      pixel_in_x           => pixel_core_x,   
-      pixel_in_y           => pixel_core_y,   
-      pixel_in_data        => pixel_core_data,
-      pixel_in_we          => pixel_core_we,
-                  
-      pixel_out_x          => pixel_shade_x,     
-      pixel_out_y          => pixel_shade_y,  
-      pixel_out_data       => pixel_shade_data,
-      pixel_out_we         => pixel_shade_we  
-   );   
+
+      pixel_in_x           => shade_arb_x,
+      pixel_in_y           => shade_arb_y,
+      pixel_in_data        => shade_arb_data,
+      pixel_in_we          => shade_arb_we,
+      pixel_in_tag         => shade_arb_src,
+
+      pixel_out_x          => shade_out_x,
+      pixel_out_y          => shade_out_y,
+      pixel_out_data       => shade_out_data,
+      pixel_out_we         => shade_out_we,
+      pixel_out_tag        => shade_out_src
+   );
+
+   -- route the shared pipeline's output back to whichever core it came from
+   pixel_shade_x     <= shade_out_x;
+   pixel_shade_y     <= shade_out_y;
+   pixel_shade_data  <= shade_out_data;
+   pixel_shade_we    <= shade_out_we when (shade_out_src = '0') else '0';
+
+   pixel2_shade_x    <= shade_out_x;
+   pixel2_shade_y    <= shade_out_y;
+   pixel2_shade_data <= shade_out_data;
+   pixel2_shade_we   <= shade_out_we when (shade_out_src = '1') else '0';
    
    inPause <= inPauseCore;
    
