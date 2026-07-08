@@ -302,6 +302,7 @@ parameter CONF_STR = {
    "P3-;",
 	"P3-,Only Romhacks or Crash!;",
 	"P3O[40],GPIO HACK(RTC+Rumble),Off,On;",
+	"P3O[47],RTC Daylight Saving,Off,+1 Hour;",
 
 	"P4,Credits;",
 	"P4-;",
@@ -790,6 +791,11 @@ gba
    .RTC_timestampOut(time_din[42 +: 32]),
    .RTC_savedtimeOut(time_din[0 +: 42]),
    .RTC_inuse(has_rtc),
+   // MiSTer's HPS clock feed is missing the DST hour whenever the user's
+   // locale is actually observing DST -- see gba_gpioRTCSolarGyro.vhd's
+   // RTC_dstPlusHour comment. No DST flag rides the wire to detect this
+   // automatically, so it's this manual seasonal toggle instead.
+   .RTC_dstPlusHour(status[47]),
 
    .cheat_clear(gg_reset),
    .cheats_enabled(~status[6]),

@@ -37,7 +37,18 @@ entity gba_gpioRTCSolarGyro is
       RTC_timestampOut     : out    std_logic_vector(31 downto 0); -- timestamp to be saved
       RTC_savedtimeOut     : out    std_logic_vector(41 downto 0); -- time structure to be saved
       RTC_inuse            : out    std_logic := '0';              -- will indicate that RTC is in use and should be saved on next saving
-   
+      -- MiSTer's HPS TIMESTAMP feed (RTC_timestampIn) is built by Main_MiSTer's
+      -- send_rtc() as t + (t - mktime(gmtime(t))): a "fake local epoch" trick
+      -- that only ever recovers the *standard*-time UTC offset, because
+      -- gmtime() always hands mktime() tm_isdst=0 and mktime() honors that
+      -- literally instead of checking the zone's actual DST rule for the
+      -- date. Whenever the user's locale is actually observing DST, the
+      -- result is short by exactly one hour -- confirmed against glibc-style
+      -- mktime/gmtime semantics, not specific to any one timezone. No DST
+      -- flag rides along on the wire to detect this on our end, so it's a
+      -- manual seasonal correction rather than something we can infer.
+      RTC_dstPlusHour      : in     std_logic := '0';
+
       rumble               : out    std_logic := '0';
       AnalogX              : in     signed(7 downto 0);
       solar_in             : in     std_logic_vector(2 downto 0)
@@ -106,8 +117,11 @@ architecture arch of gba_gpioRTCSolarGyro is
    -- timestamp, which would synthesize into a wide combinational divider and
    -- blow timing; this only needs to finish well within the ~1 second
    -- interval between real timestamp updates, so a few thousand cycles of
-   -- iteration is negligible.
+   -- iteration is negligible. RTC_dstPlusHour (see entity above) adds
+   -- DST_HOUR_SECONDS to the raw timestamp before this conversion, to
+   -- compensate for Main_MiSTer's DST-blind TIMESTAMP feed.
    constant UNIX_SECONDS_2000 : unsigned(31 downto 0) := to_unsigned(946684800, 32); -- Jan 1 2000 00:00:00 UTC
+   constant DST_HOUR_SECONDS  : unsigned(31 downto 0) := to_unsigned(3600, 32);
    type tBcdSeedState is (BCDSEED_IDLE, BCDSEED_DAYS, BCDSEED_HOURS, BCDSEED_MINS, BCDSEED_YEARS, BCDSEED_MONTHS, BCDSEED_PACK);
    signal bcdSeedState     : tBcdSeedState := BCDSEED_IDLE;
    signal RTC_timestampNew_bcd : std_logic := '0';
@@ -476,6 +490,7 @@ begin
    process (clk1x)
       variable is_leap      : std_logic;
       variable month_length : unsigned(4 downto 0);
+      variable bcd_seedsrc  : unsigned(31 downto 0);
    begin
       if rising_edge(clk1x) then
 
@@ -486,8 +501,13 @@ begin
             when BCDSEED_IDLE =>
                RTC_timestampNew_bcd <= RTC_timestampNew;
                if (RTC_timestampNew /= RTC_timestampNew_bcd) then
-                  if (unsigned(RTC_timestampIn) >= UNIX_SECONDS_2000) then
-                     bcd_remaining <= unsigned(RTC_timestampIn) - UNIX_SECONDS_2000;
+                  if (RTC_dstPlusHour = '1') then
+                     bcd_seedsrc := unsigned(RTC_timestampIn) + DST_HOUR_SECONDS;
+                  else
+                     bcd_seedsrc := unsigned(RTC_timestampIn);
+                  end if;
+                  if (bcd_seedsrc >= UNIX_SECONDS_2000) then
+                     bcd_remaining <= bcd_seedsrc - UNIX_SECONDS_2000;
                   else
                      bcd_remaining <= (others => '0');
                   end if;
