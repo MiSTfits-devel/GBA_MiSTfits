@@ -56,6 +56,8 @@ architecture sim of tb_link is
 
    constant ADR_SIOMULTI0 : integer := 16#120#;
    constant ADR_SIOMULTI1 : integer := 16#122#;
+   constant ADR_SIOMULTI2 : integer := 16#124#;
+   constant ADR_SIOMULTI3 : integer := 16#126#;
    constant ADR_SIOCNT    : integer := 16#128#;
    constant ADR_SIOSEND   : integer := 16#12A#; -- SIOMLT_SEND / SIODATA8
    constant MULTISPEED    : integer := 145;     -- 115200 baud, in ce ticks
@@ -101,6 +103,20 @@ architecture sim of tb_link is
       else
          dat := wired(15 downto 0);
       end if;
+   end procedure;
+
+   procedure buswrite32(signal b : out proc_bus_gb_type; adr : in integer; dat : in std_logic_vector(31 downto 0)) is
+   begin
+      wait until rising_edge(clk);
+      b.Adr  <= std_logic_vector(to_unsigned((adr / 4) * 4, proc_busadr));
+      b.rnw  <= '0';
+      b.ena  <= '1';
+      b.acc  <= "10";
+      b.Din  <= dat;
+      b.bEna <= "1111";
+      wait until rising_edge(clk);
+      b.ena  <= '0';
+      b.rnw  <= '1';
    end procedure;
 
 begin
@@ -379,6 +395,205 @@ begin
          assert r16(5 downto 4) = "01" report "child id /= 1" severity failure;
       end loop;
       report "test 5 passed";
+
+      ------------------------------------------------------------------
+      -- replay the exact register choreography of pret link.c (Pokemon
+      -- gen 3 Cable Club, src/link.c of pokeemerald): EnableSerial's
+      -- double SIOCNT write (0x2000 then 0x6003), the DoHandshake rounds
+      -- with their 64-bit SIOMULTI read + REG_SIOMLT_RECV=0 write-back,
+      -- then the data phase: 9 words per frame, each started by a blind
+      -- SIOCNT |= 0x80 read-modify-write with NO busy check, spaced
+      -- 12608 cycles apart by Timer3 (-197 @ /64) *measured from the
+      -- previous word's serial IRQ* (SendRecvDone enables the timer from
+      -- inside the ISR). LinkVSync declares a link error (LAG_MASTER) if
+      -- all 9 words don't complete within one frame -- so each exchange
+      -- MUST be over well inside the 12608-cycle gap; that budget is the
+      -- assert. SerialCB also reads SIOCNT bit6 (error) every word and
+      -- any 1 there is a hardware-error link abort, so bit6 is asserted
+      -- 0 throughout.
+      report "test 6: pret link.c cable club choreography";
+      irq_clear <= '1';
+      wait for 4 * CLK_PERIOD;
+      irq_clear <= '0';
+
+      -- EnableSerial on both ends (pret: RCNT=0; SIOCNT=0x2000; SIOCNT=0x6003; SIOMLT_SEND=0)
+      buswrite16(bus_a, ADR_SIOCNT,  x"2000");
+      buswrite16(bus_a, ADR_SIOCNT,  x"6003");
+      buswrite16(bus_a, ADR_SIOSEND, x"0000");
+      buswrite16(bus_b, ADR_SIOCNT,  x"2000");
+      buswrite16(bus_b, ADR_SIOCNT,  x"6003");
+      buswrite16(bus_b, ADR_SIOSEND, x"0000");
+
+      -- CheckMasterOrSlave gates: master needs SD=1,SI=0,id=0; slave sees SI=1
+      busread16(bus_a, wired_a, ADR_SIOCNT, r16);
+      assert (r16(3) = '1' and r16(2) = '0' and r16(5 downto 4) = "00")
+         report "pret: master pregate SD/SI/id wrong" severity failure;
+      busread16(bus_b, wired_b, ADR_SIOCNT, r16);
+      assert r16(2) = '1' report "pret: slave must read SI=1" severity failure;
+
+      -- handshake round 1: both still send 0x0000 (pret's first transfer
+      -- goes out before DoHandshake ever loaded a handshake word)
+      busread16(bus_a, wired_a, ADR_SIOCNT, r16);
+      buswrite16(bus_a, ADR_SIOCNT, r16 or x"0080");
+      wait until irq_a_seen = '1' and irq_b_seen = '1' for 3 ms;
+      assert irq_a_seen = '1' and irq_b_seen = '1' report "pret: hs1 IRQ missing" severity failure;
+      irq_clear <= '1'; wait for 4 * CLK_PERIOD; irq_clear <= '0';
+
+      -- ISR on both: read all four slots, then REG_SIOMLT_RECV = 0
+      busread16(bus_a, wired_a, ADR_SIOMULTI0, r16);
+      assert r16 = x"0000" report "pret: hs1 A slot0 /= 0000" severity failure;
+      busread16(bus_a, wired_a, ADR_SIOMULTI1, r16);
+      assert r16 = x"0000" report "pret: hs1 A slot1 /= 0000" severity failure;
+      buswrite32(bus_a, 16#120#, x"00000000");
+      buswrite32(bus_a, 16#124#, x"00000000");
+      buswrite32(bus_b, 16#120#, x"00000000");
+      buswrite32(bus_b, 16#124#, x"00000000");
+      -- both load SLAVE_HANDSHAKE (leader hasn't confirmed yet)
+      buswrite16(bus_a, ADR_SIOSEND, x"B9A0");
+      buswrite16(bus_b, ADR_SIOSEND, x"B9A0");
+
+      -- handshake round 2 (a VBlank later): expect B9A0/B9A0/FFFF/FFFF on both
+      wait for 20000 * 6 * CLK_PERIOD;
+      busread16(bus_a, wired_a, ADR_SIOCNT, r16);
+      assert r16(7) = '0' report "pret: hs2 master busy should be idle" severity failure;
+      buswrite16(bus_a, ADR_SIOCNT, r16 or x"0080");
+      wait until irq_a_seen = '1' and irq_b_seen = '1' for 3 ms;
+      assert irq_a_seen = '1' and irq_b_seen = '1' report "pret: hs2 IRQ missing" severity failure;
+      irq_clear <= '1'; wait for 4 * CLK_PERIOD; irq_clear <= '0';
+      busread16(bus_a, wired_a, ADR_SIOMULTI0, r16);
+      assert r16 = x"B9A0" report "pret: hs2 A slot0 /= B9A0 (self echo)" severity failure;
+      busread16(bus_a, wired_a, ADR_SIOMULTI1, r16);
+      assert r16 = x"B9A0" report "pret: hs2 A slot1 /= B9A0" severity failure;
+      busread16(bus_a, wired_a, ADR_SIOMULTI2, r16);
+      assert r16 = x"FFFF" report "pret: hs2 A slot2 /= FFFF" severity failure;
+      busread16(bus_a, wired_a, ADR_SIOMULTI3, r16);
+      assert r16 = x"FFFF" report "pret: hs2 A slot3 /= FFFF" severity failure;
+      busread16(bus_b, wired_b, ADR_SIOMULTI0, r16);
+      assert r16 = x"B9A0" report "pret: hs2 B slot0 /= B9A0" severity failure;
+      busread16(bus_b, wired_b, ADR_SIOMULTI1, r16);
+      assert r16 = x"B9A0" report "pret: hs2 B slot1 /= B9A0 (self echo)" severity failure;
+      buswrite32(bus_a, 16#120#, x"00000000");
+      buswrite32(bus_a, 16#124#, x"00000000");
+      buswrite32(bus_b, 16#120#, x"00000000");
+      buswrite32(bus_b, 16#124#, x"00000000");
+
+      -- leader confirmed: master loads MASTER_HANDSHAKE for one round
+      buswrite16(bus_a, ADR_SIOSEND, x"8FFF");
+      buswrite16(bus_b, ADR_SIOSEND, x"B9A0");
+      wait for 20000 * 6 * CLK_PERIOD;
+      busread16(bus_a, wired_a, ADR_SIOCNT, r16);
+      buswrite16(bus_a, ADR_SIOCNT, r16 or x"0080");
+      wait until irq_a_seen = '1' and irq_b_seen = '1' for 3 ms;
+      assert irq_a_seen = '1' and irq_b_seen = '1' report "pret: hs3 IRQ missing" severity failure;
+      irq_clear <= '1'; wait for 4 * CLK_PERIOD; irq_clear <= '0';
+      busread16(bus_a, wired_a, ADR_SIOMULTI0, r16);
+      assert r16 = x"8FFF" report "pret: hs3 A slot0 /= 8FFF (handshake-complete view)" severity failure;
+      busread16(bus_b, wired_b, ADR_SIOMULTI0, r16);
+      assert r16 = x"8FFF" report "pret: hs3 B slot0 /= 8FFF" severity failure;
+      busread16(bus_b, wired_b, ADR_SIOMULTI1, r16);
+      assert r16 = x"B9A0" report "pret: hs3 B slot1 /= B9A0" severity failure;
+
+      -- data phase: one full 9-word packet, Timer3-paced. Every word:
+      -- load sends in the "ISR", wait the 12608-cycle timer gap, then a
+      -- blind RMW start. The busy assert directly encodes the LAG_MASTER
+      -- budget: the previous exchange must be long over when Timer3 fires.
+      buswrite16(bus_a, ADR_SIOSEND, x"A001");
+      buswrite16(bus_b, ADR_SIOSEND, x"B001");
+      for word in 1 to 9 loop
+         wait for 12608 * 6 * CLK_PERIOD;
+         busread16(bus_a, wired_a, ADR_SIOCNT, r16);
+         assert r16(7) = '0' report "pret: word " & integer'image(word) & " master still busy at Timer3 fire (LAG_MASTER)" severity failure;
+         busread16(bus_b, wired_b, ADR_SIOCNT, r16);
+         assert r16(7) = '0' report "pret: word " & integer'image(word) & " slave still busy at Timer3 fire" severity failure;
+         busread16(bus_a, wired_a, ADR_SIOCNT, r16);
+         buswrite16(bus_a, ADR_SIOCNT, r16 or x"0080");
+         wait until irq_a_seen = '1' and irq_b_seen = '1' for 3 ms;
+         assert irq_a_seen = '1' report "pret: word " & integer'image(word) & " master IRQ missing" severity failure;
+         assert irq_b_seen = '1' report "pret: word " & integer'image(word) & " slave IRQ missing" severity failure;
+         irq_clear <= '1'; wait for 4 * CLK_PERIOD; irq_clear <= '0';
+
+         -- SerialCB view on both ends: own echo + peer data + FFFF slots + no error bit
+         busread16(bus_a, wired_a, ADR_SIOMULTI0, r16);
+         assert r16 = std_logic_vector(to_unsigned(16#A000# + word, 16)) report "pret: word " & integer'image(word) & " A slot0 (self echo) wrong" severity failure;
+         busread16(bus_a, wired_a, ADR_SIOMULTI1, r16);
+         assert r16 = std_logic_vector(to_unsigned(16#B000# + word, 16)) report "pret: word " & integer'image(word) & " A slot1 wrong" severity failure;
+         busread16(bus_a, wired_a, ADR_SIOMULTI2, r16);
+         assert r16 = x"FFFF" report "pret: word " & integer'image(word) & " A slot2 /= FFFF" severity failure;
+         busread16(bus_a, wired_a, ADR_SIOMULTI3, r16);
+         assert r16 = x"FFFF" report "pret: word " & integer'image(word) & " A slot3 /= FFFF" severity failure;
+         busread16(bus_b, wired_b, ADR_SIOMULTI0, r16);
+         assert r16 = std_logic_vector(to_unsigned(16#A000# + word, 16)) report "pret: word " & integer'image(word) & " B slot0 wrong" severity failure;
+         busread16(bus_b, wired_b, ADR_SIOMULTI1, r16);
+         assert r16 = std_logic_vector(to_unsigned(16#B000# + word, 16)) report "pret: word " & integer'image(word) & " B slot1 (self echo) wrong" severity failure;
+         busread16(bus_a, wired_a, ADR_SIOCNT, r16);
+         assert r16(6) = '0' report "pret: word " & integer'image(word) & " A error bit set" severity failure;
+         assert r16(5 downto 4) = "00" report "pret: word " & integer'image(word) & " A id /= 0" severity failure;
+         busread16(bus_b, wired_b, ADR_SIOCNT, r16);
+         assert r16(6) = '0' report "pret: word " & integer'image(word) & " B error bit set" severity failure;
+         assert r16(5 downto 4) = "01" report "pret: word " & integer'image(word) & " B id /= 1" severity failure;
+
+         -- ISR loads the next word
+         buswrite16(bus_a, ADR_SIOSEND, std_logic_vector(to_unsigned(16#A001# + word, 16)));
+         buswrite16(bus_b, ADR_SIOSEND, std_logic_vector(to_unsigned(16#B001# + word, 16)));
+      end loop;
+      report "test 6 passed";
+
+      ------------------------------------------------------------------
+      -- a SIOCNT rewrite (bit7=0, e.g. pret re-running EnableSerial or a
+      -- standby callback) landing on the CHILD while the master is mid-
+      -- frame must not abort the wire-driven reception: the child's d07
+      -- is read-only status. Before the fix this cancelled the exchange
+      -- and the master timed out into FFFF.
+      report "test 7: child SIOCNT rewrite mid-exchange is ignored";
+      irq_clear <= '1'; wait for 4 * CLK_PERIOD; irq_clear <= '0';
+      buswrite16(bus_a, ADR_SIOSEND, x"CA5E");
+      buswrite16(bus_b, ADR_SIOSEND, x"5EED");
+      busread16(bus_a, wired_a, ADR_SIOCNT, r16);
+      buswrite16(bus_a, ADR_SIOCNT, r16 or x"0080");
+      wait for 6 * 145 * 6 * CLK_PERIOD;  -- ~6 bit periods: master mid-frame
+      buswrite16(bus_b, ADR_SIOCNT, x"6003");
+      wait until irq_a_seen = '1' and irq_b_seen = '1' for 3 ms;
+      assert irq_a_seen = '1' and irq_b_seen = '1' report "rewrite: IRQ missing" severity failure;
+      busread16(bus_a, wired_a, ADR_SIOMULTI1, r16);
+      assert r16 = x"5EED" report "rewrite: A slot1 lost the child's answer" severity failure;
+      busread16(bus_b, wired_b, ADR_SIOMULTI0, r16);
+      assert r16 = x"CA5E" report "rewrite: B slot0 lost the master's frame" severity failure;
+      report "test 7 passed";
+
+      ------------------------------------------------------------------
+      -- DisableSerial mid-session then a fresh OpenLink (the retry-after-
+      -- error path every Cable Club player actually hits): stale exchange
+      -- state must not leak into the next linkup.
+      report "test 8: DisableSerial / re-enable clean restart";
+      irq_clear <= '1'; wait for 4 * CLK_PERIOD; irq_clear <= '0';
+      -- DisableSerial on both: SIOCNT=0x2000, SIOMLT_SEND=0, SIOMULTI=0
+      buswrite16(bus_a, ADR_SIOCNT,  x"2000");
+      buswrite16(bus_a, ADR_SIOSEND, x"0000");
+      buswrite32(bus_a, 16#120#, x"00000000");
+      buswrite32(bus_a, 16#124#, x"00000000");
+      buswrite16(bus_b, ADR_SIOCNT,  x"2000");
+      buswrite16(bus_b, ADR_SIOSEND, x"0000");
+      buswrite32(bus_b, 16#120#, x"00000000");
+      buswrite32(bus_b, 16#124#, x"00000000");
+      wait for 1000 * CLK_PERIOD;
+      -- re-EnableSerial + one exchange
+      buswrite16(bus_a, ADR_SIOCNT,  x"2000");
+      buswrite16(bus_a, ADR_SIOCNT,  x"6003");
+      buswrite16(bus_b, ADR_SIOCNT,  x"2000");
+      buswrite16(bus_b, ADR_SIOCNT,  x"6003");
+      buswrite16(bus_a, ADR_SIOSEND, x"0D15");
+      buswrite16(bus_b, ADR_SIOSEND, x"0DA7");
+      busread16(bus_a, wired_a, ADR_SIOCNT, r16);
+      buswrite16(bus_a, ADR_SIOCNT, r16 or x"0080");
+      wait until irq_a_seen = '1' and irq_b_seen = '1' for 3 ms;
+      assert irq_a_seen = '1' and irq_b_seen = '1' report "restart: IRQ missing" severity failure;
+      busread16(bus_a, wired_a, ADR_SIOMULTI0, r16);
+      assert r16 = x"0D15" report "restart: A slot0 wrong" severity failure;
+      busread16(bus_a, wired_a, ADR_SIOMULTI1, r16);
+      assert r16 = x"0DA7" report "restart: A slot1 wrong" severity failure;
+      busread16(bus_b, wired_b, ADR_SIOMULTI0, r16);
+      assert r16 = x"0D15" report "restart: B slot0 wrong" severity failure;
+      report "test 8 passed";
 
       report "ALL LINK TESTS PASSED";
       done <= true;

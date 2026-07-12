@@ -179,14 +179,40 @@ architecture arch of gba_serial is
    signal startbitreceived : std_logic := '0';
    signal waitchild        : unsigned(16 downto 0) := (others => '0');
 
-   -- Per AGBProgrammingManual p.113-114: a real exchange always sequentially
-   -- polls up to 3 slave slots (transmission only ends after a stop bit is
-   -- received from the 2nd slave, or a start bit fails to arrive, for the
-   -- 2nd slot) even when fewer real units are connected -- slave_slot tracks
-   -- which of the (up to 3) slave slots the parent is currently waiting on
-   -- or has just finished, so a 2-unit cable still burns through the same
-   -- extra timeout windows real hardware would.
+   -- slave_slot tracks which of the (up to 3) slave slots the parent is
+   -- currently waiting on or has just finished -- it indexes where a
+   -- received frame lands (SIOMULTI1/2/3) and ends the exchange
+   -- immediately after the 3rd slave's frame (all slots used).
    signal slave_slot       : unsigned(1 downto 0) := (others => '0');
+
+   -- How long the master waits for a further start bit before concluding
+   -- the exchange. Real hardware ends an exchange a FIXED ~520 cycles of
+   -- bus silence after the last frame's stop bit -- NOT a per-slot,
+   -- baud-scaled timeout. Ground truth: mGBA's hardware-derived
+   -- GBASIOCyclesPerTransfer table (sio.c) -- for every baud, the total
+   -- exchange time is n_frames * 18 bittimes + ~513..535 cycles, and the
+   -- all-4-connected case has no trailing window at all. (An earlier
+   -- revision waited 64 bit periods per remaining phantom slot -- ~1.1ms
+   -- extra at 115200, ~13ms at 9600 -- which starves Timer3-paced engines
+   -- like pret link.c's: Pokemon expects a 2-unit exchange to be over in
+   -- ~343us and schedules the next transfer accordingly.) The manual's
+   -- "a 'Start bit' is not input after a certain period of time"
+   -- (p.113-114) is this window; a silent slot also implies every later
+   -- slot stays silent, because the SO->SI daisy chain never advances past
+   -- a missing unit -- so one expired window ends the whole exchange.
+   -- waitchild is armed at our stop-bit fire (the stop bit still occupies
+   -- the wire for a bit period) and a real child's answer lands at the
+   -- previous frame's stop END -- the 2-bit-period allowance covers both
+   -- without cutting off a real 9600-baud child (520 cycles < 1 bit there).
+   constant QUIET_WINDOW_TICKS : integer := 520;
+
+   -- what actually went on the wire in our own frame: latched at frame
+   -- load, echoed into SIOMULTI0 at frame end. Echoing REG_SIODATA8 at
+   -- frame END instead would misreport when software rewrites SIOMLT_SEND
+   -- mid-exchange (a VBlank ISR landing inside a Timer3-started transfer)
+   -- -- the other units received the value loaded at start, and real
+   -- hardware self-receives its own transmission off the shared SD bus.
+   signal own_payload      : std_logic_vector(15 downto 0) := (others => '0');
 
    -- The child<->child wired-AND link (gba_wrap.vhd) synchronizes link_sd_in
    -- through one registered stage, so the cycle right after the child stops
@@ -527,8 +553,12 @@ begin
                            so_drive_low  <= '1'; -- the next unit's go-ahead
                            if (role_master = '1') then
                               -- the master's own frame lands in SIOMULTI0
-                              -- on every unit, including itself
-                              SIODATA32_RB(15 downto 0) <= REG_SIODATA8;
+                              -- on every unit, including itself -- the value
+                              -- that actually went on the wire (latched at
+                              -- frame load), not REG_SIODATA8 as of now: a
+                              -- software write mid-frame must not make our
+                              -- own echo diverge from what the peers got
+                              SIODATA32_RB(15 downto 0) <= own_payload;
                               waitchild <= (others => '0');   -- now wait for the answers
                            else
                               justsent_guard <= '1';
@@ -573,25 +603,25 @@ begin
                               SIOMULTI2_link <= (others => '1');
                               SIOMULTI3_link <= (others => '1');
                            end if;
-                        elsif (role_master = '1' and SIO_start = '1' and waitchild >= to_unsigned(multispeed, 12) * 64) then
-                           -- This slot's wait expired with no start bit. Per
-                           -- AGBProgrammingManual p.113-114 the master always
-                           -- sequentially polls up to 3 slave slots -- even
-                           -- on a 2-unit cable it must still time out on the
-                           -- phantom 2nd (and 3rd) slot before the exchange
-                           -- is really over, not just after slot 1. Absent
-                           -- units simply keep the FFFF written at start.
-                           waitchild <= (others => '0');
-                           if (slave_slot = 2) then
-                              slave_slot   <= (others => '0');
-                              SIO_start    <= '0';
-                              so_drive_low <= '0';
-                              multi_id     <= "00";
-                              if (REG_SIOCNT(14) = '1') then
-                                 IRP_Serial <= '1';
-                              end if;
-                           else
-                              slave_slot <= slave_slot + 1;
+                        elsif (role_master = '1' and SIO_start = '1' and waitchild >= QUIET_WINDOW_TICKS + 2 * to_unsigned(multispeed, 12)) then
+                           -- No start bit within the real quiet window: the
+                           -- whole exchange is over (see QUIET_WINDOW_TICKS
+                           -- above -- a silent slot implies every later slot
+                           -- is silent too, the SO->SI daisy chain never
+                           -- advances past a missing unit). Absent units
+                           -- simply keep the FFFF written at start. Timing
+                           -- matters here: pret link.c (Pokemon) paces 9
+                           -- Timer3-driven words per frame and declares a
+                           -- link error if they don't all complete -- the
+                           -- old per-slot 64-bit-period waits made that
+                           -- structurally impossible.
+                           waitchild    <= (others => '0');
+                           slave_slot   <= (others => '0');
+                           SIO_start    <= '0';
+                           so_drive_low <= '0';
+                           multi_id     <= "00";
+                           if (REG_SIOCNT(14) = '1') then
+                              IRP_Serial <= '1';
                            end if;
                         elsif (role_master = '1') then
                            if (SIO_start = '1') then
@@ -602,9 +632,18 @@ begin
                               -- our turn: the unit before us pulled our SI
                               -- low. Our slot index (and Multi-Player ID) is
                               -- the number of frames that came before us.
+                              -- cycles is preloaded half a bit period: our
+                              -- completion sample sits mid-stop-bit, so this
+                              -- puts our start bit right at the previous
+                              -- frame's stop END -- real children answer
+                              -- back-to-back (mGBA: the all-4-connected
+                              -- exchange has no trailing gap at all), and a
+                              -- real master's fixed ~520-cycle quiet window
+                              -- would expire before a full-bit-late answer
+                              -- at 9600 baud.
                               multisendmode <= '1';
                               multidataout  <= '0' & bitswap16(REG_SIODATA8) & '1';
-                              cycles        <= (others => '0');
+                              cycles        <= to_unsigned(multispeed / 2, cycles'length);
                               bitcount      <= 0;
                               sent_this_ex  <= '1';
                               multi_id      <= std_logic_vector(frames_rx);
@@ -723,8 +762,14 @@ begin
                   -- only the cable-designated master can start an exchange;
                   -- a slave's d07 write is ignored (its d07 is a read-only
                   -- busy status, manual p.117) -- crucially it must NOT
-                  -- reset an in-flight reception.
-                  if (link_si_in = '0') then
+                  -- reset an in-flight reception. A start-bit write while an
+                  -- exchange is already running is a no-op too: the bit is
+                  -- already 1, there is no fresh edge to trigger on -- pret
+                  -- link.c's StartTransfer is a blind SIOCNT |= 0x80 with no
+                  -- busy check, and restarting here would clobber a live
+                  -- exchange's received data.
+                  if (link_si_in = '0' and SIO_start = '0' and multisendmode = '0' and
+                      startbitreceived = '0' and engaged = '0') then
                      role_master      <= '1';
                      SIO_start        <= '1';
                      bitcount         <= 0;
@@ -737,6 +782,7 @@ begin
                      comm_error       <= '0';
                      multisendmode    <= '1';
                      multidataout     <= '0' & bitswap16(REG_SIODATA8) & '1';
+                     own_payload      <= REG_SIODATA8;
                      -- all data registers initialize to FFFF at exchange
                      -- start (manual p.113); own/received frames overwrite
                      -- their slots as the exchange progresses
@@ -755,8 +801,14 @@ begin
                   justsent_guard   <= '0';
                   multisendmode    <= '0';
                end if;
-            elsif (engineMode /= ENGINE_STUB) then
-               -- clearing the start bit cancels a running transfer
+            elsif (engineMode = ENGINE_NORMAL or (engineMode = ENGINE_MULTI and role_master = '1')) then
+               -- clearing the start bit cancels a running transfer. In
+               -- multiplayer mode that is a master-only action: a slave's
+               -- d07 is read-only status (manual p.117), and its exchange
+               -- state is wire-driven -- software rewriting SIOCNT (pret's
+               -- EnableSerial does two bit7=0 writes back to back, and
+               -- DisableSerial another mid-session) must not abort an
+               -- in-flight reception the master is still clocking.
                SIO_start          <= '0';
                multisendmode      <= '0';
                startbitreceived   <= '0';
@@ -768,6 +820,24 @@ begin
                so_drive_low       <= '0';
                comm_error         <= '0';
             end if;
+         end if;
+
+         -- leaving multiplayer mode (a mode-bits rewrite or RCNT(15) set,
+         -- e.g. pret's CloseLink/DisableSerial path between two linkup
+         -- attempts) discards any in-flight multiplayer exchange state, so
+         -- a later re-entry starts from a clean idle instead of a stale
+         -- half-exchange. SIO_start is deliberately not touched here (it
+         -- belongs to whichever engine is now active).
+         if (engineMode /= ENGINE_MULTI) then
+            multisendmode    <= '0';
+            startbitreceived <= '0';
+            engaged          <= '0';
+            sent_this_ex     <= '0';
+            frames_rx        <= (others => '0');
+            slave_slot       <= (others => '0');
+            justsent_guard   <= '0';
+            so_drive_low     <= '0';
+            eng_timeout      <= (others => '0');
          end if;
 
          -- CPU writes always land in the readback values too. SIODATA32's
