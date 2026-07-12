@@ -89,6 +89,16 @@ Titles restored in 1P or 2P:
   - solved memory issues
     - 1P and 2P consoles both load cart(s) from SDRAM if possible
   - *WIP: support for SNAC GB EXT adapter to trade with real hardware*
+    - Choose **Multiplayer → SNAC Link Port** for either a physical GBA link
+      cable or a physical AGB-015 Wireless Adapter. Plug position determines
+      cable master/slave role; no software role selector exists on real GBA.
+    - **Wireless (Emulated)** selects the core's internal AGB-015 emulation and
+      intentionally releases SNAC pins. Do not select it for a real adapter.
+    - Set the DE10-Nano `SW[1]` switch low when using SNAC. The MiSTer
+      framework otherwise assigns HDMI I2S/LRCLK to USER_IO pins 2 and 5,
+      which are the adapter's SI and SD signals.
+    - SNAC GB EXT wiring: SC=USER_IO[0], SD=USER_IO[5], SI=USER_IO[2],
+      SO=USER_IO[1].
   - *WIP: GBA Wireless Adapter emulation and ARM-hosted networking for RetroArch online crossplay*
 - **GBA1P(+2P) core** reorganization and **accuracy fixes**
   - **RTC/Clock fixes**

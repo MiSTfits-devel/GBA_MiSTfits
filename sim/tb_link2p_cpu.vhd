@@ -4,6 +4,7 @@ library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
 use STD.textio.all;
+use STD.env.all;
 use IEEE.std_logic_textio.all;
 
 use work.pProc_bus_gba.all;
@@ -120,6 +121,7 @@ architecture sim of tb_link2p_cpu is
    -- armed one-shot) and printed via `report` for a human-readable trace.
    -- ------------------------------------------------------------------
    signal sio_frame_count : integer := 0;
+   signal c1_exchange_count, c2_exchange_count : unsigned(3 downto 0);
 
    -- ------------------------------------------------------------------
    -- framebuffer dump: core1's rendered frames written as ASCII PGM so the
@@ -229,12 +231,15 @@ begin
    c2_link_si_in  <= l_si_c2;
    c2_link_sd_in  <= l_sd;
 
-   -- both ends actively driving SD low at once is a protocol violation,
-   -- exactly the standing assertion sim/tb_link.vhd carries
+   -- During a multiplayer exchange (SC held low), exactly one unit owns SD.
+   -- Before multiplayer mode, two external-clock normal-mode receivers may
+   -- both legally output LO on SD (AGB Programming Manual p.108/111), so a
+   -- global collision assertion produces a false failure during BIOS reset.
    process (clk)
    begin
       if rising_edge(clk) then
-         assert not (c1_link_sd_oe = '1' and c1_link_sd_out = '0' and
+         assert not (GBA_on = '1' and l_sc = '0' and
+                     c1_link_sd_oe = '1' and c1_link_sd_out = '0' and
                      c2_link_sd_oe = '1' and c2_link_sd_out = '0')
             report "SD driven low by both cores simultaneously" severity failure;
       end if;
@@ -514,6 +519,8 @@ begin
    begin
       c1_export <= << signal .tb_link2p_cpu.icore1.cpu_export : work.pexport.cpu_export_type >>;
       c2_export <= << signal .tb_link2p_cpu.icore2.cpu_export : work.pexport.cpu_export_type >>;
+      c1_exchange_count <= << signal .tb_link2p_cpu.icore1.igba_serial.debug_exchange_count : unsigned(3 downto 0) >>;
+      c2_exchange_count <= << signal .tb_link2p_cpu.icore2.igba_serial.debug_exchange_count : unsigned(3 downto 0) >>;
    end block;
 
    -- ==================================================================
@@ -541,6 +548,40 @@ begin
                 " @ " & time'image(now) & " : 0x" &
                 to_hstring(bits);
       end loop;
+   end process;
+
+   -- Actual pass/fail contract. Previous versions relied only on nvc's
+   -- --stop-time, so a run that never reached cart code (or transmitted one
+   -- useful word) exited zero and was incorrectly reported as CPU-proven.
+   -- Require repeated serial IRQ completion on both real cores plus decoded
+   -- master+slave wire frames. One early BIOS/Normal-mode SD transition may
+   -- be counted by the generic wire decoder, hence the seven-frame floor.
+   link_result : process
+   begin
+      wait until GBA_on = '1';
+      loop
+         wait until rising_edge(clk);
+         if (c1_exchange_count >= 3 and c2_exchange_count >= 3 and
+             sio_frame_count >= 7) then
+            report "CPU LINK TEST PASSED: both cores completed 3+ exchanges, frames=" &
+                   integer'image(sio_frame_count);
+            done <= true;
+            stop;
+            wait;
+         end if;
+      end loop;
+   end process;
+
+   link_watchdog : process
+   begin
+      wait until GBA_on = '1';
+      wait for 40 ms;
+      assert false
+         report "CPU LINK TEST FAILED: no repeated bidirectional multiplayer exchange within 40 ms; c1=" &
+                integer'image(to_integer(c1_exchange_count)) & " c2=" &
+                integer'image(to_integer(c2_exchange_count)) & " frames=" &
+                integer'image(sio_frame_count) severity failure;
+      wait;
    end process;
 
    -- ==================================================================

@@ -1,5 +1,26 @@
 # Changelog
 
+## 2026-07-11
+
+### Real link timing and physical AGB-015 path
+
+- Multiplayer starts SD with SIOCNT d07 instead of one baud-scaled bit later.
+  Missing-unit timeout is now 18 bit periods per transmitted frame plus the
+  fixed ~520-clock hardware quiet window at every baud.
+- First-frame detection accepts simultaneous SC/SYNC and SD/start assertion;
+  synchronizers no longer hide a real transfer's only falling edge.
+- Normal internal-clock masters release SD per the AGB manual. This unblocks
+  physical AGB-015 reset/login; external-clock receivers still output LO.
+- Wireless regression now traverses the exact SNAC USER_IO mapping
+  (SC=0, SD=5, SI=2, SO=1), including GPIO reset, 256 kHz login, 2 MHz STWI,
+  reversal, notification, and clock handback.
+- Link timing regression covers all four multiplayer bauds and 9600-baud 2P.
+  Full dual-CPU Afska demo test now has a real pass/fail gate and passes after
+  both cores complete three exchanges; simulator stop-time alone is no longer
+  considered success.
+- OSD names physical mode **SNAC Link Port**. Real cable and real AGB-015 use
+  this mode; **Wireless (Emulated)** keeps SNAC released.
+
 ## 2026-07-06
 
 ### Link engine: roles come from the cable now (like a real GBA)
@@ -30,10 +51,11 @@ interop:
   corrupt an in-flight reception); busy holds and the IRQ fires when the
   master releases SC -- a level check with a bounded safety timeout, so
   the old waitmasterend-style freeze cannot recur.
-- **SD low outside multiplayer mode** (manual p.108/111/113): the real
-  "this unit is not in multiplayer mode yet" announcement, which is what
-  the other side's allReady/SD-status checks actually gate on. Replaces
-  the reversed sd_ready_pulse/sd_wait_rendezvous experiments.
+- **SD direction follows Normal-mode clock role** (manual p.108/111/113): an
+  external-clock receiver outputs LO; an internal-clock sender leaves SD in
+  pull-up input status. Multiplayer mode also leaves SD pulled up while idle,
+  which is what the other side's allReady/SD-status checks gate on. Forcing
+  every Normal-mode unit low prevented a physical AGB-015 from operating.
 
 Sim-proven at two levels: `sim/run_link_tb.sh` (5 unit scenarios incl. the
 LinkCable.hpp register choreography, IDs asserted) and the full dual-CPU
@@ -55,9 +77,11 @@ the GBA as master, so most of what it needs is correctness we now have:
 - **SO shows d03 between Normal-mode transfers for the master too**: the
   login sequence wiggles it as a handshake.
 
-Untested against a real dongle so far.
+For a physical dongle choose **Multiplayer → SNAC Link Port**. The separate
+**Wireless (Emulated)** option routes the core to its internal adapter model
+and releases SNAC pins. Hardware validation against a real dongle remains.
 
-### Wireless Adapter emulation (new: Multiplayer = "Wireless Adapter")
+### Wireless Adapter emulation (Multiplayer = "Wireless (Emulated)")
 
 A full AGB-015 transport now lives in the core (`rtl/gba_wireless.vhd`,
 protocol spec in `docs/agb015_protocol.md`, derived from LinkRawWireless,

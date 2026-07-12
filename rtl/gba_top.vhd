@@ -1199,8 +1199,9 @@ begin
       variable last_cpu_irq    : std_logic := 'U';
    begin
       if rising_edge(clk1x) then
-         if (IRP_Timer(1) /= last_irp_timer1 or REG_IME(0) /= last_ime or
-             REG_IRP_IE(4) /= last_ie4 or cpu_irq /= last_cpu_irq) then
+         if (simu_export_trace = '1' and
+             (IRP_Timer(1) /= last_irp_timer1 or REG_IME(0) /= last_ime or
+              REG_IRP_IE(4) /= last_ie4 or cpu_irq /= last_cpu_irq)) then
             report clk1x'instance_name &
                    " IRP_Timer1=" & std_logic'image(IRP_Timer(1)) &
                    " IME=" & std_logic'image(REG_IME(0)) &
@@ -1249,7 +1250,6 @@ begin
 
 
 end architecture;
-
 
 
 

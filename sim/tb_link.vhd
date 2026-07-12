@@ -248,6 +248,12 @@ begin
 
    process
       variable r16 : std_logic_vector(15 downto 0);
+      type tCycleTable is array(0 to 3) of integer;
+      -- mGBA GBASIOCyclesPerTransfer[][0]: no responding slaves.
+      constant SOLO_CYCLES : tCycleTable := (31976, 8378, 5750, 3140);
+      variable t_start     : time;
+      variable elapsed     : time;
+      variable expected    : time;
    begin
       wait for 20 * CLK_PERIOD;
 
@@ -594,6 +600,45 @@ begin
       busread16(bus_b, wired_b, ADR_SIOMULTI0, r16);
       assert r16 = x"0D15" report "restart: B slot0 wrong" severity failure;
       report "test 8 passed";
+
+      ------------------------------------------------------------------
+      -- Hardware-derived transfer duration must be 18 bit periods per
+      -- transmitted frame plus a fixed ~520-cycle quiet tail. This catches
+      -- baud-scaled phantom-slot delays and a delayed first start bit. Afska
+      -- deliberately allows every baud and any GBA timer, so 115200-only
+      -- choreography is insufficient coverage.
+      report "test 9: all-baud hardware transfer timing";
+      b_connected <= '0';
+      buswrite16(bus_b, ADR_SIOCNT, x"0000");
+      for speed in 0 to 3 loop
+         irq_clear <= '1'; wait for 4 * CLK_PERIOD; irq_clear <= '0';
+         buswrite16(bus_a, ADR_SIOSEND, std_logic_vector(to_unsigned(16#7100# + speed, 16)));
+         buswrite16(bus_a, ADR_SIOCNT, std_logic_vector(to_unsigned(16#6080# + speed, 16)));
+         t_start := now;
+         wait until irq_a_seen = '1' for 3 ms;
+         assert irq_a_seen = '1' report "timing: solo IRQ missing at baud index " & integer'image(speed) severity failure;
+         elapsed  := now - t_start;
+         expected := SOLO_CYCLES(speed) * 6 * CLK_PERIOD;
+         assert elapsed >= expected - 10 us and elapsed <= expected + 10 us
+            report "timing: baud index " & integer'image(speed) &
+                   " elapsed " & time'image(elapsed) &
+                   " expected " & time'image(expected) severity failure;
+      end loop;
+
+      -- Slowest baud discriminates correct back-to-back slave start from a
+      -- 520-cycle timeout: one 9600-baud bit is ~1747 clocks, so any design
+      -- waiting for a fresh start only after the quiet window loses player 2.
+      b_connected <= '1';
+      irq_clear <= '1'; wait for 4 * CLK_PERIOD; irq_clear <= '0';
+      buswrite16(bus_b, ADR_SIOCNT,  x"6000");
+      buswrite16(bus_b, ADR_SIOSEND, x"9A02");
+      buswrite16(bus_a, ADR_SIOSEND, x"9A01");
+      buswrite16(bus_a, ADR_SIOCNT,  x"6080");
+      wait until irq_a_seen = '1' and irq_b_seen = '1' for 5 ms;
+      assert irq_a_seen = '1' and irq_b_seen = '1' report "timing: 9600-baud pair IRQ missing" severity failure;
+      busread16(bus_a, wired_a, ADR_SIOMULTI1, r16);
+      assert r16 = x"9A02" report "timing: 9600-baud child response lost" severity failure;
+      report "test 9 passed";
 
       report "ALL LINK TESTS PASSED";
       done <= true;

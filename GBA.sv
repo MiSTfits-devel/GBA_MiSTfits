@@ -278,9 +278,9 @@ parameter CONF_STR = {
 	"H6P2O[31:29],Solar Sensor,0%,15%,30%,42%,55%,70%,85%,100%;",
 	"P2-;",
 `ifdef GBA2P_LITE
-	"P2O[46:44],Multiplayer,2P Link (Internal),Link Cable (GPIO),Off,Wireless Adapter;",
+	"P2O[46:44],Multiplayer,2P Link (Internal),SNAC Link Port,Off,Wireless (Emulated);",
 `else
-	"P2O[46:44],Multiplayer,Off,Link Cable (GPIO),Wireless Adapter;",
+	"P2O[46:44],Multiplayer,Off,SNAC Link Port,Wireless (Emulated);",
 `endif
    "P2-;",
 `ifdef GBA2P_LITE

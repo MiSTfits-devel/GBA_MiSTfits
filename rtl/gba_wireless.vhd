@@ -234,9 +234,15 @@ begin
          end if;
 
          ----------------------------------------------------------------
-         -- ping detection (any state): SD high >= 0.5 ms then falling
+         -- Ping detection: SD high >= 0.5 ms then falling. Ignore SD while
+         -- clock direction is reversed: the GBA becomes an external-clock
+         -- receiver there, which legitimately drives SD low (Programming
+         -- Manual p.111). Treating that role change as a reset destroys every
+         -- adapter-initiated notification on real SIO electrical behavior.
          ----------------------------------------------------------------
-         if (link_sd_in = '1') then
+         if (state = REV_IDLE or state = REV_SEND or state = REV_HSHAKE) then
+            sd_high_cnt <= 0;
+         elsif (link_sd_in = '1') then
             if (sd_high_cnt /= 262143) then
                sd_high_cnt <= sd_high_cnt + 1;
             end if;

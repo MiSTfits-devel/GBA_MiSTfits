@@ -44,6 +44,8 @@ architecture sim of tb_wireless is
    signal a_sc_out, a_sc_oe, a_so_out, a_so_oe : std_logic;
 
    signal sc_line, sd_line, gba_si, adp_si : std_logic;
+   signal lp_clk_in, lp_si_in, lp_sd_in     : std_logic;
+   signal user_in, user_out                 : std_logic_vector(6 downto 0);
 
    -- adapter <-> daemon byte stream
    signal d_tx_data  : std_logic_vector(7 downto 0);
@@ -139,13 +141,41 @@ begin
       end if;
    end process;
 
-   -- wiring: adapter plugs straight into the port (no cable cross games:
-   -- GBA SO -> adapter SI, adapter SO -> GBA SI, SC and SD shared)
-   sc_line <= '0' when (g_clk_oe = '1' and g_clk_out = '0') or
+   -- Exact real SNAC path. gba_linkport maps creator-confirmed pins
+   -- SC=USER_IO[0], SD=[5], SI=[2], SO=[1], drives open drain, and adds the
+   -- same two-stage input synchronizers used in hardware. External adapter:
+   -- GBA SO -> adapter SI, adapter SO -> GBA SI, SC and SD shared.
+   sc_line <= '0' when user_out(0) = '0' or
                        (a_sc_oe = '1' and a_sc_out = '0') else '1';
-   sd_line <= '0' when (g_sd_oe = '1' and g_sd_out = '0') else '1';
+   sd_line <= '0' when user_out(5) = '0' else '1';
    gba_si  <= '0' when (a_so_oe = '1' and a_so_out = '0') else '1';
-   adp_si  <= '0' when (g_so_oe = '1' and g_so_out = '0') else '1';
+   adp_si  <= user_out(1);
+
+   user_in(0) <= sc_line;
+   user_in(1) <= user_out(1);
+   user_in(2) <= gba_si;
+   user_in(3) <= '1';
+   user_in(4) <= '1';
+   user_in(5) <= sd_line;
+   user_in(6) <= '1';
+
+   ilinkport : entity work.gba_linkport
+   port map
+   (
+      clk          => clk,
+      port_enable  => '1',
+      user_in      => user_in,
+      user_out     => user_out,
+      link_clk_out => g_clk_out,
+      link_clk_oe  => g_clk_oe,
+      link_clk_in  => lp_clk_in,
+      link_so_out  => g_so_out,
+      link_so_oe   => g_so_oe,
+      link_si_in   => lp_si_in,
+      link_sd_out  => g_sd_out,
+      link_sd_oe   => g_sd_oe,
+      link_sd_in   => lp_sd_in
+   );
 
    igba : entity work.gba_serial
    port map
@@ -158,13 +188,13 @@ begin
       link_enable      => '1',
       link_clk_out     => g_clk_out,
       link_clk_oe      => g_clk_oe,
-      link_clk_in      => sc_line,
+      link_clk_in      => lp_clk_in,
       link_so_out      => g_so_out,
       link_so_oe       => g_so_oe,
-      link_si_in       => gba_si,
+      link_si_in       => lp_si_in,
       link_sd_out      => g_sd_out,
       link_sd_oe       => g_sd_oe,
-      link_sd_in       => sd_line,
+      link_sd_in       => lp_sd_in,
       IRP_Serial       => irq_g
    );
 
@@ -284,6 +314,9 @@ begin
          wait for 4 * CLK_PERIOD;
          irq_clr <= '0';
          buswrite16(bus_g, ADR_SIOCNT, cnt);
+         wait for 4 * CLK_PERIOD;
+         assert user_out(5) = '1'
+            report "SNAC SD pin must be released for Normal internal-clock master" severity failure;
          wait until irq_seen = '1' for 2 ms;
          assert irq_seen = '1' report "transfer never completed" severity failure;
          busread32(bus_g, wired_g, ADR_SIODATA32, res);
@@ -328,7 +361,13 @@ begin
       -- pingAdapter(): GPIO mode, SD+SO outputs, SD high ~1.1ms, then low
       buswrite16(bus_g, ADR_RCNT, x"8000");
       buswrite16(bus_g, ADR_RCNT, x"80A0"); -- SD/SO outputs, low
+      wait for 4 * CLK_PERIOD;
+      assert user_out(5) = '0' and user_out(1) = '0'
+         report "SNAC GPIO low mapping wrong (SD=5, SO=1)" severity failure;
       buswrite16(bus_g, ADR_RCNT, x"80A2"); -- SD high
+      wait for 4 * CLK_PERIOD;
+      assert user_out(5) = '1' and user_out(1) = '0'
+         report "SNAC GPIO SD-high mapping wrong" severity failure;
       wait for 1.2 ms;
       buswrite16(bus_g, ADR_RCNT, x"80A0"); -- SD low
       wait for 50 us;

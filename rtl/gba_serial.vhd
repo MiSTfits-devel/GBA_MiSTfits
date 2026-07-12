@@ -22,6 +22,10 @@ use work.pReg_gba_serial.all;
 -- mode fall back to the standalone model so games never hang on them.
 
 entity gba_serial is
+   generic
+   (
+      SIM_DEBUG : boolean := false
+   );
    port
    (
       clk100            : in    std_logic;
@@ -200,10 +204,12 @@ architecture arch of gba_serial is
    -- (p.113-114) is this window; a silent slot also implies every later
    -- slot stays silent, because the SO->SI daisy chain never advances past
    -- a missing unit -- so one expired window ends the whole exchange.
-   -- waitchild is armed at our stop-bit fire (the stop bit still occupies
-   -- the wire for a bit period) and a real child's answer lands at the
-   -- previous frame's stop END -- the 2-bit-period allowance covers both
-   -- without cutting off a real 9600-baud child (520 cycles < 1 bit there).
+   -- waitchild is armed when our stop bit begins. One bit period therefore
+   -- remains before the quiet window starts. After a received child frame we
+   -- finish sampling halfway through its stop bit and preload half a period,
+   -- keeping the same stop-end origin. Do not add another baud-scaled delay:
+   -- mGBA's table is approximately N*18 bit periods + 520 clocks at every
+   -- baud, including 9600 bps.
    constant QUIET_WINDOW_TICKS : integer := 520;
 
    -- what actually went on the wire in our own frame: latched at frame
@@ -393,13 +399,19 @@ begin
 
             when ENGINE_NORMAL =>
 
-               -- Normal mode outputs LO from the SD terminal, master and
-               -- slave alike (manual p.108/111). This doubles as the real
-               -- "not in multiplayer mode yet" announcement: a peer already
-               -- in multiplayer mode reads SD (SIOCNT d03) LO until we
-               -- switch modes too -- the rendezvous real software gates on.
-               link_sd_oe  <= '1';
-               link_sd_out <= '0';
+               -- Normal mode SD direction depends on clock role (manual
+               -- p.108/111): an external-clock receiver outputs LO, while an
+               -- internal-clock sender leaves SD in pull-up input status.
+               -- Forcing SD low for an internal-clock sender also holds the
+               -- AGB-015 Wireless Adapter's reset/chip-select line asserted
+               -- through every 32-bit transfer, so real adapter login cannot
+               -- work even when SC/SO/SI timing is otherwise correct.
+               if (REG_SIOCNT(0) = '0') then
+                  link_sd_oe  <= '1';
+                  link_sd_out <= '0';
+               else
+                  link_sd_out <= '1';
+               end if;
 
                -- SO is always an output; between transfers it shows the
                -- "Transfer Enable Flag Send" bit d03 (manual p.111: "output
@@ -585,7 +597,14 @@ begin
                         -- just a level check rejects the case where SD was
                         -- already low continuously -- see sd_in_prev's
                         -- declaration above for why that happens.
-                        if (link_sd_in = '0' and sd_in_prev = '1' and link_clk_in = '0') then
+                        -- First frame starts with SC/SYNC and SD/start asserted
+                        -- together. Independent synchronizers may present both
+                        -- low in one cycle, so requiring SD's falling edge only
+                        -- after SC is already low misses real starts. Once an
+                        -- exchange is engaged, retain edge qualification to
+                        -- reject a previous frame's low tail as a new slot.
+                        if (link_sd_in = '0' and link_clk_in = '0' and
+                            (sd_in_prev = '1' or (role_master = '0' and engaged = '0'))) then
                            cycles           <= to_unsigned(multispeed / 2, cycles'length);
                            bitcount         <= 1;
                            startbitreceived <= '1';
@@ -603,7 +622,7 @@ begin
                               SIOMULTI2_link <= (others => '1');
                               SIOMULTI3_link <= (others => '1');
                            end if;
-                        elsif (role_master = '1' and SIO_start = '1' and waitchild >= QUIET_WINDOW_TICKS + 2 * to_unsigned(multispeed, 12)) then
+                        elsif (role_master = '1' and SIO_start = '1' and waitchild >= QUIET_WINDOW_TICKS + to_unsigned(multispeed, 12)) then
                            -- No start bit within the real quiet window: the
                            -- whole exchange is over (see QUIET_WINDOW_TICKS
                            -- above -- a silent slot implies every later slot
@@ -716,7 +735,10 @@ begin
                               when "01"   => SIOMULTI2_link <= bitswap16(multidatain(15 downto 0));
                               when others => SIOMULTI3_link <= bitswap16(multidatain(15 downto 0));
                            end case;
-                           waitchild    <= (others => '0');
+                           -- Reception completes at the middle of the stop
+                           -- bit. Preload half a bit so timeout remains based
+                           -- on stop END, matching the master's own-frame path.
+                           waitchild    <= to_unsigned(multispeed / 2, waitchild'length);
                            if (slave_slot = 2) then
                               slave_slot   <= (others => '0');
                               SIO_start    <= '0';
@@ -772,7 +794,13 @@ begin
                       startbitreceived = '0' and engaged = '0') then
                      role_master      <= '1';
                      SIO_start        <= '1';
-                     bitcount         <= 0;
+                     -- Start bit begins with the SIOCNT start write, like
+                     -- hardware. The timed shifter therefore starts at data
+                     -- bit 0 one bit later; bitcount=1 accounts for the start
+                     -- bit already on SD. Waiting one whole bit before first
+                     -- driving SD made every exchange one baud-scaled bit too
+                     -- long and contradicted GBASIOCyclesPerTransfer.
+                     bitcount         <= 1;
                      cycles           <= (others => '0');
                      waitchild        <= (others => '0');
                      startbitreceived <= '0';
@@ -781,7 +809,8 @@ begin
                      so_drive_low     <= '0';
                      comm_error       <= '0';
                      multisendmode    <= '1';
-                     multidataout     <= '0' & bitswap16(REG_SIODATA8) & '1';
+                     link_sd_out      <= '0';
+                     multidataout     <= bitswap16(REG_SIODATA8) & "11";
                      own_payload      <= REG_SIODATA8;
                      -- all data registers initialize to FFFF at exchange
                      -- start (manual p.113); own/received frames overwrite
@@ -907,6 +936,8 @@ begin
    debug_link_state <= SIOMULTI3_RB & SIOMULTI2_RB & REG_SIODATA8 & SIOMULTI1_RB & SIO_start & multisendmode & startbitreceived & std_logic_vector(debug_exchange_count);
 
    -- synthesis translate_off
+   gSimDebug : if SIM_DEBUG generate
+   begin
    -- Temporary diagnostic: trace every CPU READ of the SIO data/control
    -- registers with the exact merged wired-or value returned -- this is
    -- precisely what software (e.g. LinkCable's _onSerial) observes, so a
@@ -975,6 +1006,7 @@ begin
          end if;
       end if;
    end process;
+   end generate gSimDebug;
    -- synthesis translate_on
 
 end architecture;

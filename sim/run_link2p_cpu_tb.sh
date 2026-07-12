@@ -23,16 +23,24 @@ GBA_BIOS="${GBA_BIOS:-embedded}"
 # BIOS and cart ROM as one-word-per-line hex for the testbench's textio
 # loader (both derivatives are untracked build artifacts, cheap to redo)
 if [ "$GBA_BIOS" = embedded ]; then
-   python3 - rtl/gba_bios.vhd sim/tests/bios_words.hex "${SKIP_EWRAM_CLEAR:-0}" <<'PYEOF'
+   python3 - rtl/gba_bios.vhd sim/tests/bios_words.hex "${SKIP_EWRAM_CLEAR:-0}" "${FAST_BOOT:-1}" <<'PYEOF'
 import re, sys
-src, dst, skipclear = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+src, dst = sys.argv[1], sys.argv[2]
+skipclear, fastboot = sys.argv[3] == "1", sys.argv[4] == "1"
 words = [int(m, 16) for m in re.findall(r'x"([0-9A-Fa-f]{8})"', open(src).read())][:4096]
 assert len(words) == 4096, f"{src}: expected 4096 init words, got {len(words)}"
 # 0x228: mov r1, #0x77 -- the boot logo stays up for 120 frames; make it 1
 assert words[0x228 // 4] == 0xE3A01077, "intro wait-loop opcode moved, repatch"
 words[0x228 // 4] = 0xE3A01000
 patched = "intro wait patched to 1 frame"
-if skipclear:
+if fastboot:
+    # Reset setup loads this pointer then BXes to the intro routine at 0x1B8.
+    # Redirect it to the BIOS's existing cart-exit routine at 0x1804: stack/
+    # mode setup still runs, but logo drawing and frame waits are skipped.
+    assert words[0x160 // 4] == 0x000001B8, "intro entry pointer moved, repatch"
+    words[0x160 // 4] = 0x00001804
+    patched += ", intro skipped"
+elif skipclear:
     # same patch as run_gba2p_sdram_tb.sh: skip the boot RegisterRamReset
     # EWRAM wipe (~60ms of sim time) to reach cart code fast
     assert words[0x780 // 4] == 0xE2444008, "EWRAM clear opcode moved, repatch"
@@ -56,15 +64,20 @@ print(f"{dst}: {len(data)//4} words from {src}")
 PYEOF
 fi
 
-python3 - sim/tests/LinkCable_basic.gba sim/tests/rom_words.hex <<'PYEOF'
+python3 - sim/tests/LinkCable_basic.gba sim/tests/rom_words.hex "${FAST_ROM_BOOT:-1}" <<'PYEOF'
 import struct, sys
-src, dst = sys.argv[1], sys.argv[2]
-data = open(src, "rb").read()
+src, dst, fastboot = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+data = bytearray(open(src, "rb").read())
+if fastboot:
+    # gba-link-connection demo CRT clears all 256 KiB EWRAM before main.
+    # Generated simulation image can skip that unrelated multi-ms loop.
+    assert struct.unpack_from("<H", data, 0x126)[0] == 0x2140, "EWRAM clear length opcode moved, repatch"
+    struct.pack_into("<H", data, 0x126, 0x2100)  # movs r1,#0x40 -> movs r1,#0
 data += b"\xff" * (-len(data) % 4)
 with open(dst, "w") as f:
     for (wd,) in struct.iter_unpack("<I", data):
         f.write(f"{wd:08x}\n")
-print(f"{dst}: {len(data)//4} words from {src}")
+print(f"{dst}: {len(data)//4} words from {src}" + (", EWRAM clear skipped" if fastboot else ""))
 PYEOF
 
 LIBS=sim/nvc_libs
@@ -135,4 +148,4 @@ nvc -L "$LIBS" --work=work:"$LIBS"/WORK -a --relaxed \
 nvc -L "$LIBS" --work=work:"$LIBS"/WORK -e tb_link2p_cpu
 
 nvc -L "$LIBS" --work=work:"$LIBS"/WORK -r tb_link2p_cpu \
-   --ieee-warnings=off --stop-time="${STOP_TIME:-40ms}" --exit-severity=failure
+   --ieee-warnings=off --stop-time="${STOP_TIME:-45ms}" --exit-severity=failure
