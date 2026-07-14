@@ -1,0 +1,16 @@
+# Authors & Credits
+
+Robert Peip (FPGAzumSpass)
+    Core creator. The GBA core, in all its glory, is his work.
+
+The MiSTer-FPGA project
+    The awesome hackers of MiSTer-FPGA — the framework, the sys/
+    infrastructure, and years of shoulders to stand on.
+
+Sarah Aronson <v@pingas.org>
+    Multiplayer extensions, bugfixes (2P link cable, SIO engine,
+    bus-decode fixes, 2P build profile). Questions, bug reports, and
+    link-cable war stories welcome by email.
+
+See the SPDX headers in individual files for per-file copyright.
+License: GPL-3.0-or-later (see LICENSE or COPYING).
