@@ -126,6 +126,15 @@ architecture arch of gba_sound is
 
    signal pwm_cnt     : integer range 0 to 511 := 0;
 
+   constant GBA_CLOCK_RATE      : integer := 16_777_216;
+   constant AUDIO_RESAMPLE_RATE : integer := 96_000;
+   signal resample_phase : integer range 0 to GBA_CLOCK_RATE - 1 := 0;
+   signal resample_count : integer range 0 to 175 := 0;
+   signal resample_sum_l : integer range -131_072 to 131_071 := 0;
+   signal resample_sum_r : integer range -131_072 to 131_071 := 0;
+   signal resampled_l    : signed(15 downto 0) := (others => '0');
+   signal resampled_r    : signed(15 downto 0) := (others => '0');
+
    signal soundmix8_l : signed(15 downto 0) := (others => '0');
    signal soundmix8_r : signed(15 downto 0) := (others => '0');
    
@@ -394,6 +403,8 @@ begin
       variable samp_l     : unsigned(9 downto 0);
       variable samp_r     : unsigned(9 downto 0);
       variable pwm_period : integer range 64 to 512;
+      variable sum_l      : integer;
+      variable sum_r      : integer;
    begin
       if rising_edge(clk1x) then
 
@@ -527,21 +538,32 @@ begin
             else
                pwm_cnt <= pwm_cnt + 1;
             end if;
+
+            sum_l := resample_sum_l + to_integer(soundmix8_l);
+            sum_r := resample_sum_r + to_integer(soundmix8_r);
+            if (resample_phase + AUDIO_RESAMPLE_RATE >= GBA_CLOCK_RATE) then
+               resample_phase <= resample_phase + AUDIO_RESAMPLE_RATE - GBA_CLOCK_RATE;
+               resampled_l    <= to_signed(sum_l / (resample_count + 1), resampled_l'length);
+               resampled_r    <= to_signed(sum_r / (resample_count + 1), resampled_r'length);
+               resample_sum_l <= 0;
+               resample_sum_r <= 0;
+               resample_count <= 0;
+            else
+               resample_phase <= resample_phase + AUDIO_RESAMPLE_RATE;
+               resample_sum_l <= sum_l;
+               resample_sum_r <= sum_r;
+               resample_count <= resample_count + 1;
+            end if;
          end if;
 
       end if;
    end process;
-   
-   sound_out_left  <= std_logic_vector(resize(soundmix8_l * 16, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '1' else 
-                      std_logic_vector(resize(soundmix8_l * 4, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '0' else 
+
+   sound_out_left  <= std_logic_vector(resize(resampled_l * 16, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '1' else
+                      std_logic_vector(resize(resampled_l * 4, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '0' else
                       (others => '0');
-   sound_out_right <= std_logic_vector(resize(soundmix8_r * 16, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '1' else 
-                      std_logic_vector(resize(soundmix8_r * 4, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '0' else 
+   sound_out_right <= std_logic_vector(resize(resampled_r * 16, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '1' else
+                      std_logic_vector(resize(resampled_r * 4, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '0' else
                       (others => '0');
-   
-    
+
 end architecture;
-
-
- 
- 
