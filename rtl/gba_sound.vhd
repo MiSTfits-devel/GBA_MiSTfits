@@ -530,7 +530,17 @@ begin
             when others => pwm_period :=  64; samp_l(3 downto 0) := "0000"; samp_r(3 downto 0) := "0000"; -- 6bit / 262.144kHz
          end case;
 
-         if (ce = '1') then
+         if (reset = '1' or loading_savestate = '1') then
+            pwm_cnt        <= 0;
+            soundmix8_l    <= (others => '0');
+            soundmix8_r    <= (others => '0');
+            resample_phase <= 0;
+            resample_count <= 0;
+            resample_sum_l <= 0;
+            resample_sum_r <= 0;
+            resampled_l    <= (others => '0');
+            resampled_r    <= (others => '0');
+         elsif (ce = '1') then
             if (pwm_cnt + 1 >= pwm_period) then
                pwm_cnt     <= 0;
                soundmix8_l <= to_signed(to_integer(samp_l) - 16#200#, 16);
@@ -543,8 +553,13 @@ begin
             sum_r := resample_sum_r + to_integer(soundmix8_r);
             if (resample_phase + AUDIO_RESAMPLE_RATE >= GBA_CLOCK_RATE) then
                resample_phase <= resample_phase + AUDIO_RESAMPLE_RATE - GBA_CLOCK_RATE;
-               resampled_l    <= to_signed(sum_l / (resample_count + 1), resampled_l'length);
-               resampled_r    <= to_signed(sum_r / (resample_count + 1), resampled_r'length);
+               if (resample_count = 173) then
+                  resampled_l <= to_signed(sum_l / 174, resampled_l'length);
+                  resampled_r <= to_signed(sum_r / 174, resampled_r'length);
+               else
+                  resampled_l <= to_signed(sum_l / 175, resampled_l'length);
+                  resampled_r <= to_signed(sum_r / 175, resampled_r'length);
+               end if;
                resample_sum_l <= 0;
                resample_sum_r <= 0;
                resample_count <= 0;

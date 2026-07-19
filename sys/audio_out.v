@@ -49,6 +49,7 @@ localparam CE_RATE = AUDIO_RATE*AUDIO_DW*8;
 localparam FILTER_DIV = (CE_RATE/(AUDIO_RATE*32))-1;
 
 wire [31:0] real_ce = sample_rate ? {CE_RATE[30:0],1'b0} : CE_RATE[31:0];
+wire [15:0] al, ar, audio_l_pre, audio_r_pre;
 
 reg mclk_ce;
 always @(posedge clk) begin
@@ -152,6 +153,19 @@ always @(posedge clk) begin
 	if(cr2 == cr1) cr <= cr2;
 end
 
+reg [7:0] core_div = 0;
+reg core_96k_ce;
+always @(posedge clk, posedge reset) begin
+	if(reset) begin
+		core_div <= 0;
+		core_96k_ce <= 0;
+	end
+	else begin
+		core_div <= core_div + 1'd1;
+		core_96k_ce <= !core_div;
+	end
+end
+
 reg a_en1 = 0, a_en2 = 0;
 always @(posedge clk, posedge reset) begin
 	reg  [1:0] dly1 = 0;
@@ -183,7 +197,7 @@ IIR_filter #(.use_params(0)) IIR_filter
 	.reset(reset),
 
 	.ce(flt_ce & a_en1),
-	.sample_ce(sample_ce),
+	.sample_ce(core_96k_ce),
 
 	.cx(cx),
 	.cx0(cx0),
@@ -199,6 +213,28 @@ IIR_filter #(.use_params(0)) IIR_filter
 	.output_r(acr)
 );
 
+wire [15:0] cl_48, cr_48;
+audio_fir_96k_48k audio_fir_l
+(
+	.clk(clk),
+	.reset(reset),
+	.ce(core_96k_ce),
+	.din(acl),
+	.dout(cl_48)
+);
+
+audio_fir_96k_48k audio_fir_r
+(
+	.clk(clk),
+	.reset(reset),
+	.ce(core_96k_ce),
+	.din(acr),
+	.dout(cr_48)
+);
+
+wire [15:0] core_l_aa = sample_rate ? acl : cl_48;
+wire [15:0] core_r_aa = sample_rate ? acr : cr_48;
+
 wire [15:0] adl;
 DC_blocker dcb_l
 (
@@ -206,7 +242,7 @@ DC_blocker dcb_l
 	.ce(sample_ce),
 	.sample_rate(sample_rate),
 	.mute(~a_en2),
-	.din(acl),
+	.din(core_l_aa),
 	.dout(adl)
 );
 
@@ -217,11 +253,10 @@ DC_blocker dcb_r
 	.ce(sample_ce),
 	.sample_rate(sample_rate),
 	.mute(~a_en2),
-	.din(acr),
+	.din(core_r_aa),
 	.dout(adr)
 );
 
-wire [15:0] al, audio_l_pre;
 aud_mix_top audmix_l
 (
 	.clk(clk),
@@ -237,7 +272,6 @@ aud_mix_top audmix_l
 	.out(al)
 );
 
-wire [15:0] ar, audio_r_pre;
 aud_mix_top audmix_r
 (
 	.clk(clk),
@@ -252,6 +286,85 @@ aud_mix_top audmix_r
 	.pre_out(audio_r_pre),
 	.out(ar)
 );
+
+endmodule
+
+module audio_fir_96k_48k
+(
+	input             clk,
+	input             reset,
+	input             ce,
+	input      [15:0] din,
+	output reg [15:0] dout
+);
+
+reg signed [15:0] delay[0:46];
+reg signed [16:0] pair;
+reg signed [15:0] coeff;
+reg signed [35:0] sum;
+reg [3:0] tap;
+reg busy;
+
+always @(*) begin
+	pair = 0;
+	coeff = 0;
+	case(tap)
+		0:  begin pair = {delay[0][15],delay[0]}   + {delay[46][15],delay[46]}; coeff = -16'sd7; end
+		1:  begin pair = {delay[2][15],delay[2]}   + {delay[44][15],delay[44]}; coeff =  16'sd23; end
+		2:  begin pair = {delay[4][15],delay[4]}   + {delay[42][15],delay[42]}; coeff = -16'sd55; end
+		3:  begin pair = {delay[6][15],delay[6]}   + {delay[40][15],delay[40]}; coeff =  16'sd107; end
+		4:  begin pair = {delay[8][15],delay[8]}   + {delay[38][15],delay[38]}; coeff = -16'sd189; end
+		5:  begin pair = {delay[10][15],delay[10]} + {delay[36][15],delay[36]}; coeff =  16'sd311; end
+		6:  begin pair = {delay[12][15],delay[12]} + {delay[34][15],delay[34]}; coeff = -16'sd489; end
+		7:  begin pair = {delay[14][15],delay[14]} + {delay[32][15],delay[32]}; coeff =  16'sd750; end
+		8:  begin pair = {delay[16][15],delay[16]} + {delay[30][15],delay[30]}; coeff = -16'sd1150; end
+		9:  begin pair = {delay[18][15],delay[18]} + {delay[28][15],delay[28]}; coeff =  16'sd1830; end
+		10: begin pair = {delay[20][15],delay[20]} + {delay[26][15],delay[26]}; coeff = -16'sd3318; end
+		11: begin pair = {delay[22][15],delay[22]} + {delay[24][15],delay[24]}; coeff =  16'sd10377; end
+		12: begin pair = {delay[23][15],delay[23]};                                  coeff =  16'sd16388; end
+	endcase
+end
+
+wire signed [32:0] product = pair * coeff;
+
+function [15:0] clamp_q15;
+	input signed [35:0] value;
+	reg signed [35:0] scaled;
+	begin
+		scaled = value >>> 15;
+		if(scaled > 32767) clamp_q15 = 16'h7FFF;
+		else if(scaled < -32768) clamp_q15 = 16'h8000;
+		else clamp_q15 = scaled[15:0];
+	end
+endfunction
+
+integer i;
+always @(posedge clk, posedge reset) begin
+	if(reset) begin
+		for(i = 0; i < 47; i = i + 1) delay[i] <= 0;
+		dout <= 0;
+		sum <= 0;
+		tap <= 0;
+		busy <= 0;
+	end
+	else if(ce) begin
+		for(i = 46; i > 0; i = i - 1) delay[i] <= delay[i-1];
+		delay[0] <= din;
+		sum <= 0;
+		tap <= 0;
+		busy <= 1;
+	end
+	else if(busy) begin
+		if(tap == 12) begin
+			dout <= clamp_q15(sum + product);
+			busy <= 0;
+		end
+		else begin
+			sum <= sum + product;
+			tap <= tap + 1'd1;
+		end
+	end
+end
 
 endmodule
 

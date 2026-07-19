@@ -33,6 +33,7 @@ architecture sim of tb_soundpwm is
    -- checker control
    signal chk_ena   : std_logic := '0';
    signal chk_seen  : integer := 0;
+   signal cadence_ena : std_logic := '0';
 
    constant ADR_SOUND4CNT_L : integer := 16#78#;
    constant ADR_SOUND4CNT_H : integer := 16#7C#;
@@ -90,19 +91,40 @@ begin
 
    process (clk)
       variable last_val    : std_logic_vector(15 downto 0) := (others => '0');
+      variable phase       : integer range 0 to 16_777_215 := 0;
+      variable boundary    : boolean := false;
    begin
       if rising_edge(clk) then
+         if (reset = '1') then
+            phase    := 0;
+            boundary := false;
+         elsif (ce = '1') then
+            if (cadence_ena = '1' and snd_l /= last_val) then
+               assert boundary report "96kHz output changed between resample boundaries" severity failure;
+            end if;
+            if (phase + 96_000 >= 16_777_216) then
+               phase := phase + 96_000 - 16_777_216;
+               boundary := true;
+            else
+               phase := phase + 96_000;
+               boundary := false;
+            end if;
+         elsif (cadence_ena = '1' and snd_l /= last_val) then
+            assert boundary report "paused output changed without a pending resample boundary" severity failure;
+            boundary := false;
+         end if;
+
          if (chk_ena = '0') then
-            last_val    := snd_l;
             chk_seen    <= 0;
          elsif (snd_l /= last_val) then
-            last_val    := snd_l;
             chk_seen    <= chk_seen + 1;
          end if;
+         last_val := snd_l;
       end if;
    end process;
 
    process
+      variable held : std_logic_vector(15 downto 0);
    begin
       gb_bus.rst <= '1';
       ss_bus.rst <= '1';
@@ -112,8 +134,23 @@ begin
       ss_bus.rst <= '0';
       reset      <= '0';
 
-      -- master on, ch4 left+right at full volume, fastest noise, no envelope
       buswrite16(gb_bus, ADR_SOUNDCNT_X,  x"0080");
+      buswrite16(gb_bus, ADR_SOUNDBIAS,   x"0301");
+      wait for 1200 * CLK_PERIOD;
+      assert signed(snd_l) = 4096 report "9-bit PWM/resampler positive DC gain is not unity" severity failure;
+
+      reset <= '1';
+      wait for 2 * CLK_PERIOD;
+      assert signed(snd_l) = 0 report "resampler output was not cleared by reset" severity failure;
+      reset <= '0';
+      wait for 1200 * CLK_PERIOD;
+      assert signed(snd_l) = 4096 report "resampler did not recover after reset" severity failure;
+
+      buswrite16(gb_bus, ADR_SOUNDBIAS, x"0101");
+      wait for 1200 * CLK_PERIOD;
+      assert signed(snd_l) = -4096 report "9-bit PWM/resampler negative DC gain is not unity" severity failure;
+
+      -- master on, ch4 left+right at full volume, fastest noise, no envelope
       buswrite16(gb_bus, ADR_SOUNDCNT_L,  x"8877");
       buswrite16(gb_bus, ADR_SOUNDCNT_H,  x"0002");
       buswrite16(gb_bus, ADR_SOUNDBIAS,   x"0200");
@@ -121,11 +158,21 @@ begin
       buswrite16(gb_bus, ADR_SOUND4CNT_H, x"8000");
 
       wait for 100 * CLK_PERIOD;
+      cadence_ena <= '1';
       chk_ena   <= '1';
       wait for 24000 * CLK_PERIOD;       -- ~46 PWM periods
       assert chk_seen >= 5 report "phase 1: noise never changed the held output (" & integer'image(chk_seen) & " changes)" severity failure;
       chk_ena   <= '0';
       report "phase 1 ok: 32.768kHz PWM reconstructed at 96kHz, " & integer'image(chk_seen) & " changes";
+
+      held := snd_l;
+      ce <= '0';
+      wait for 500 * CLK_PERIOD;
+      assert snd_l = held report "audio output changed while the GBA clock enable was paused" severity failure;
+      ce <= '1';
+      wait for 10 * CLK_PERIOD;
+      buswrite16(gb_bus, ADR_SOUND4CNT_L, x"F000");
+      buswrite16(gb_bus, ADR_SOUND4CNT_H, x"8000");
 
       buswrite16(gb_bus, ADR_SOUNDBIAS, x"C200");
       wait for 2400 * CLK_PERIOD;       -- let the new setting take a few periods
@@ -133,6 +180,7 @@ begin
       wait for 24000 * CLK_PERIOD;      -- ~375 PWM periods
       assert chk_seen >= 20 report "phase 2: noise never changed the held output (" & integer'image(chk_seen) & " changes)" severity failure;
       chk_ena   <= '0';
+      cadence_ena <= '0';
       report "phase 2 ok: 262.144kHz PWM reconstructed at 96kHz, " & integer'image(chk_seen) & " changes";
 
       report "tb_soundpwm all checks passed";
