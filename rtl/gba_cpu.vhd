@@ -761,8 +761,15 @@ begin
             
             if (execute_now = '1' and decode_shift_regbased = '1') then
                decode_Rn_op1 <= decode_Rn_op1_save;
-               if (decode_shift_mode = "11" and unsigned(execute_op1) > 32) then
-                  decode_shift_amount <= to_integer(unsigned(execute_op1(4 downto 0)));
+               -- only Rs[7:0] participates; ROR by a nonzero multiple of 32
+               -- must behave as ROR #32 (result unchanged, C := Rm[31]), not
+               -- as ROR #0 (everything unchanged)
+               if (decode_shift_mode = "11" and unsigned(execute_op1(7 downto 0)) > 32) then
+                  if (unsigned(execute_op1(4 downto 0)) = 0) then
+                     decode_shift_amount <= 32;
+                  else
+                     decode_shift_amount <= to_integer(unsigned(execute_op1(4 downto 0)));
+                  end if;
                else
                   decode_shift_amount <= to_integer(unsigned(execute_op1(7 downto 0)));
                end if;
