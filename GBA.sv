@@ -758,8 +758,16 @@ gba
 	.tilt(tilt_quirk),
 	.overlay_error_on(status[50]),
 	.overlay_link_on(status[14]),
-   .rewind_on(status[27]),
-   .rewind_active(status[27] & joy_unmod[12]),
+   // Rewind Capture force-disabled regardless of the OSD/saved setting: it
+   // hangs the shared DDR3 arbiter on real hardware (crashes in the BIOS,
+   // confirmed 2026-07-20) -- root cause not yet found (prime suspects are
+   // the new DDR3Mux WRITEBURST state and/or the reordered debug-bus
+   // arbitration in gba_top.vhd, both only exercised by rewind capture).
+   // Forcing here (not just flipping the OSD default) also protects users
+   // whose saved per-core config already has status[27] set from a prior
+   // build.
+   .rewind_on(1'b0),
+   .rewind_active(1'b0),
    .savestate_number(ss_slot),
 
    .RTC_timestampNew(RTC_time[32]),
