@@ -60,7 +60,11 @@ entity gba_savestates_stub is
       bus_out_ena            : out    std_logic := '0';
       bus_out_active         : out    std_logic := '0';
       bus_out_be             : out    std_logic_vector(7 downto 0) := (others => '0');
-      bus_out_done           : in     std_logic
+      bus_out_done           : in     std_logic;
+      bus_out_burstcnt       : out    std_logic_vector(7 downto 0) := x"01";
+      fifo_Din               : out    std_logic_vector(63 downto 0) := (others => '0');
+      fifo_Wr                : out    std_logic := '0';
+      fifo_NearFull          : in     std_logic := '0'
    );
 end entity;
 
@@ -87,6 +91,10 @@ begin
    SAVE_BusRnW       <= '1';
    SAVE_BusACC       <= "00";
    SAVE_BusWriteData <= (others => '0');
+
+   bus_out_burstcnt  <= x"01";
+   fifo_Din          <= (others => '0');
+   fifo_Wr           <= '0';
 
    internal_bus_out.Din  <= (others => '0');
    internal_bus_out.Adr  <= (others => '0');

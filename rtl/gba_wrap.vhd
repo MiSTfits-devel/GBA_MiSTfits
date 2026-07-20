@@ -47,6 +47,7 @@ entity gba_wrap is
       big_rom_active        : in     std_logic := '0'; -- 1 = core 1's cart is a >32MB Matrix-mapper cart (GBA Video/Shrek); 1P build only
       GBA_lockspeed         : in     std_logic;  -- 1 = 100% speed, 0 = max speed
       GBA_cputurbo          : in     std_logic;  -- 1 = cpu free running, all other 16 mhz
+      xq_audio_on           : in     std_logic := '0'; -- "XQ Audio" OSD toggle, see gba_sound.vhd's port comment
       GBA_flash_1m          : in     std_logic;  -- 1 when string "FLASH1M_V" is anywhere in gamepak
       Underclock            : in     std_logic_vector(1 downto 0);
       MaxPakAddr            : in     std_logic_vector(24 downto 0); -- max byte address that will contain data, required for buggy games that read behind their own memory, e.g. zelda minish cap
@@ -373,7 +374,16 @@ architecture arch of gba_wrap is
    signal SAVE_out_rnw      : std_logic;                    
    signal SAVE_out_ena      : std_logic;                                
    signal SAVE_out_be       : std_logic_vector(7 downto 0);
-   signal SAVE_out_done     : std_logic;                    
+   signal SAVE_out_done     : std_logic;
+   signal SAVE_out_burstcnt : std_logic_vector(7 downto 0);
+
+   -- savestate burst-write FIFO: gba_savestates pushes save-body qwords,
+   -- DDR3Mux streams them out as write-burst beats
+   signal SAVE_fifo_Din      : std_logic_vector(63 downto 0);
+   signal SAVE_fifo_Wr       : std_logic;
+   signal SAVE_fifo_NearFull : std_logic;
+   signal sswfifo_Dout       : std_logic_vector(63 downto 0);
+   signal sswfifo_Rd         : std_logic;
    
    signal GPIO_done         : std_logic;
    signal GPIO_readEna      : std_logic;
@@ -590,6 +600,7 @@ begin
       inPause               => inPauseCore          ,
       GBA_lockspeed         => GBA_lockspeed        ,
       GBA_cputurbo          => GBA_cputurbo         ,
+      xq_audio_on           => xq_audio_on          ,
       GBA_flash_1m          => GBA_flash_1m         ,
       Underclock            => Underclock           ,
       CyclesMissing         => CyclesMissing        ,
@@ -644,6 +655,10 @@ begin
       SAVE_out_active       => open      ,
       SAVE_out_be           => SAVE_out_be          ,
       SAVE_out_done         => SAVE_out_done        ,
+      SAVE_out_burstcnt     => SAVE_out_burstcnt    ,
+      SAVE_fifo_Din         => SAVE_fifo_Din        ,
+      SAVE_fifo_Wr          => SAVE_fifo_Wr         ,
+      SAVE_fifo_NearFull    => SAVE_fifo_NearFull   ,
       
       savestate_bus_ext     => savestate_bus_ext    ,
       ss_wired_out_ext      => ss_wired_out_ext     , 
@@ -997,6 +1012,7 @@ begin
          inPause               => open                 ,
          GBA_lockspeed         => GBA_lockspeed        ,
          GBA_cputurbo          => GBA_cputurbo         ,
+         xq_audio_on           => xq_audio_on          ,
          GBA_flash_1m          => GBA_flash_1m         ,
          Underclock            => Underclock           ,
          CyclesMissing         => open                 ,
@@ -1049,6 +1065,10 @@ begin
          SAVE_out_active       => open,
          SAVE_out_be           => open,
          SAVE_out_done         => '0',
+         SAVE_out_burstcnt     => open,
+         SAVE_fifo_Din         => open,
+         SAVE_fifo_Wr          => open,
+         SAVE_fifo_NearFull    => '0',
          savestate_bus_ext     => open,
          ss_wired_out_ext      => zero_pbus,
          ss_wired_done_ext     => '0',
@@ -1797,11 +1817,34 @@ begin
    rdram_request(DDR3MUX_SS)    <= SAVE_out_ena;
    rdram_rnw(DDR3MUX_SS)        <= SAVE_out_rnw;
    rdram_address(DDR3MUX_SS)    <= unsigned(SAVE_out_Adr) & "00";
-   rdram_burstcount(DDR3MUX_SS) <= 10x"01";
+   rdram_burstcount(DDR3MUX_SS) <= unsigned(std_logic_vector'("00" & SAVE_out_burstcnt));
    rdram_writeMask(DDR3MUX_SS)  <= SAVE_out_be;
    rdram_dataWrite(DDR3MUX_SS)  <= SAVE_out_Din;
    SAVE_out_done                <= rdram_ready(DDR3MUX_SS) when (SAVE_out_rnw = '1') else rdram_done(DDR3MUX_SS);
    SAVE_out_Dout                <= ddr3_DOUT;
+
+   -- burst-write staging between gba_savestates and DDR3Mux; never reset:
+   -- the drain protocol always runs it empty (every push is covered by a
+   -- burst before the capture ends)
+   isswfifo : entity mem.SyncFifoFallThrough
+   generic map
+   (
+      SIZE             => 64,
+      DATAWIDTH        => 64,
+      NEARFULLDISTANCE => 40
+   )
+   port map
+   (
+      clk      => clk1x,
+      reset    => '0',
+      Din      => SAVE_fifo_Din,
+      Wr       => SAVE_fifo_Wr,
+      Full     => open,
+      NearFull => SAVE_fifo_NearFull,
+      Dout     => sswfifo_Dout,
+      Rd       => sswfifo_Rd,
+      Empty    => open
+   );
    
    gpufifo_reset  <= '0';
    gpufifo_Din    <= gpufifo_Frame & std_logic_vector(to_unsigned(pixel_out_y,8)) & std_logic_vector(to_unsigned(pixel_out_x,8)) & '0' & pixel_out_data;
@@ -1848,7 +1891,10 @@ begin
 
       gpufifo2_Din     => gpufifo2_Din,
       gpufifo2_Wr      => gpufifo2_Wr,
-      gpufifo2_empty   => open
+      gpufifo2_empty   => open,
+
+      ssw_fifo_Dout    => sswfifo_Dout,
+      ssw_fifo_Rd      => sswfifo_Rd
    );
    
    rdram_rnw(DDR3MUX_ROMCOPY)        <= '1';

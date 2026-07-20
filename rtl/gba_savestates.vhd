@@ -53,9 +53,18 @@ entity gba_savestates is
       bus_out_Adr            : buffer std_logic_vector(25 downto 0) := (others => '0');
       bus_out_rnw            : out    std_logic := '0';
       bus_out_ena            : out    std_logic := '0';
-      bus_out_active         : out    std_logic := '0'; 
+      bus_out_active         : out    std_logic := '0';
       bus_out_be             : out    std_logic_vector(7 downto 0) := (others => '0');
-      bus_out_done           : in     std_logic
+      bus_out_done           : in     std_logic;
+      -- save-body writes go out as bursts: the qwords are pushed into a
+      -- FIFO next to the DDR3 mux (fifo_*) and each bus_out write request
+      -- with burstcnt > 1 makes the mux stream that many beats straight
+      -- from the FIFO (bus_out_Din is ignored for those). Keeps the read
+      -- side streaming instead of paying a DDR3 round trip per qword.
+      bus_out_burstcnt       : out    std_logic_vector(7 downto 0) := x"01";
+      fifo_Din               : out    std_logic_vector(63 downto 0) := (others => '0');
+      fifo_Wr                : out    std_logic := '0';
+      fifo_NearFull          : in     std_logic := '0'
    );
 end entity;
 
@@ -112,13 +121,11 @@ architecture arch of gba_savestates is
       SAVE_WAITPAUSE,
       SAVE_WAITSETTLE,
       SAVEINTERNALS_WAIT,
-      SAVEINTERNALS_READ,
-      SAVEINTERNALS_WRITE,
       SAVEREGISTER_READ,
-      SAVEREGISTER_WRITE,
       SAVEMEMORY_NEXT,
       SAVEMEMORY_READ,
-      SAVEMEMORY_WRITE,
+      SAVEMEMORY_STREAM,
+      SAVE_FLUSH,
       SAVESIZEAMOUNT,
       LOAD_WAITSETTLE,
       LOAD_HEADERAMOUNTCHECK,
@@ -149,10 +156,26 @@ architecture arch of gba_savestates is
    signal registerram_readen    : std_logic;
    signal registerram_readvalid : std_logic;
    
-   signal internal_databuffer   : std_logic_vector(63 downto 0) := (others => '0');
    signal first_dword           : std_logic := '0';
-   
+
    signal header_amount         : unsigned(31 downto 0) := (others => '0');
+
+   -- burst drain bookkeeping: qwords pushed to the FIFO vs qwords covered
+   -- by issued bursts. bus_out_Adr doubles as the drain write pointer
+   -- during the save body (nothing else uses it there).
+   constant BURSTLEN : integer := 16;
+   signal pushed_qw       : integer range 0 to 65536 := 0;
+   signal sent_qw         : integer range 0 to 65536 := 0;
+   signal drain_active    : std_logic := '0';
+   signal drain_flush     : std_logic := '0';
+   signal drain_inflight  : std_logic := '0';
+   signal drain_burst_n   : integer range 0 to BURSTLEN := 0;
+
+   -- read streaming (memory regions except palette): the memorymux answers
+   -- savestate reads from IDLE with done on the next cycle, so reads can be
+   -- issued every cycle; dones arrive in order, 2 in flight at most
+   signal stream_issued   : integer range 0 to 131072 := 0;
+   signal stream_done     : integer range 0 to 131072 := 0;
 
 begin 
 
@@ -207,8 +230,17 @@ begin
          registerram_we       <= "0000";
          registerram_readen   <= '0';
          load_done            <= '0';
-         
-         bus_out_be    <= x"FF";
+         fifo_Wr              <= '0';
+
+         -- NOTE: bus_out_be is NOT defaulted per cycle: the DDR3 mux samples
+         -- it at request ACCEPT time, which can be cycles after the ena pulse
+         -- when the mux is busy, so it has to hold until the write completes
+
+         -- counted here (one place) instead of at every push site; the FIFO
+         -- also commits the word on this same edge, so pushed_qw is exact
+         if (fifo_Wr = '1') then
+            pushed_qw <= pushed_qw + 1;
+         end if;
 
          gb_on_1 <= gb_on;
          
@@ -222,6 +254,10 @@ begin
          
             when IDLE =>
                savetype_counter <= 0;
+               bus_out_burstcnt <= x"01";
+               drain_active     <= '0';
+               drain_inflight   <= '0';
+               drain_flush      <= '0';
                if (gb_on = '0' and gb_on_1 = '1') then
                   state                <= RESET_CLEAR;
                elsif (gb_bus.ena = '1' and gb_bus.rnw = '0') then
@@ -289,8 +325,14 @@ begin
                   internal_bus_out.ena <= '1';
                   count                <= 2;
                   saving_savestate     <= '1';
-               end if;            
-            
+                  bus_out_be           <= x"FF";
+                  drain_active         <= '1';
+                  drain_flush          <= '0';
+                  drain_inflight       <= '0';
+                  pushed_qw            <= 0;
+                  sent_qw              <= 0;
+               end if;
+
             when SAVEINTERNALS_WAIT =>
                if (wired_done = '1') then
                   if (first_dword = '1') then
@@ -298,131 +340,148 @@ begin
                      internal_bus_out.adr <= std_logic_vector(unsigned(internal_bus_out.adr) + 1);
                      internal_bus_out.ena <= '1';
                      if (is_simu = '0') then
-                        internal_databuffer(31 downto 0) <= wired_out;
+                        fifo_Din(31 downto 0) <= wired_out;
                      else
                         for i in 0 to 31 loop
-                           if (wired_out(i) = '0') then internal_databuffer(i) <= '0'; else internal_databuffer(i) <= '1'; end if;
+                           if (wired_out(i) = '0') then fifo_Din(i) <= '0'; else fifo_Din(i) <= '1'; end if;
                         end loop;
                      end if;
                   else
                      if (is_simu = '0') then
-                        internal_databuffer(63 downto 32) <= wired_out;
+                        fifo_Din(63 downto 32) <= wired_out;
                      else
                         for i in 0 to 31 loop
-                           if (wired_out(i) = '0') then internal_databuffer(32 + i) <= '0'; else internal_databuffer(32 + i) <= '1'; end if;
+                           if (wired_out(i) = '0') then fifo_Din(32 + i) <= '0'; else fifo_Din(32 + i) <= '1'; end if;
                         end loop;
                      end if;
-                     state       <= SAVEINTERNALS_READ;
+                     fifo_Wr <= '1';
+                     if (count < INTERNALSCOUNT) then
+                        first_dword          <= '1';
+                        count                <= count + 2;
+                        internal_bus_out.adr <= std_logic_vector(unsigned(internal_bus_out.adr) + 1);
+                        internal_bus_out.ena <= '1';
+                     else
+                        state              <= SAVEREGISTER_READ;
+                        first_dword        <= '1';
+                        registerram_addr_r <= 0;
+                        registerram_readen <= '1';
+                        count              <= 2;
+                     end if;
                   end if;
                end if;
-              
-            when SAVEINTERNALS_READ =>
-               if (wired_done = '1') then
-                  state          <= SAVEINTERNALS_WRITE;
-                  bus_out_Din    <= internal_databuffer;
-                  bus_out_ena    <= '1';
-                  bus_out_active <= '1';
-               end if;
-            
-            when SAVEINTERNALS_WRITE => 
-               if (bus_out_done = '1') then
-                  bus_out_active <= '0';
-                  bus_out_Adr <= std_logic_vector(unsigned(bus_out_Adr) + 2);
-                  if (count < INTERNALSCOUNT) then
-                     state                <= SAVEINTERNALS_WAIT;
-                     first_dword          <= '1';
-                     count                <= count + 2;
-                     internal_bus_out.adr <= std_logic_vector(unsigned(internal_bus_out.adr) + 1);
-                     internal_bus_out.ena <= '1';
-                  else 
-                     state              <= SAVEREGISTER_READ;
-                     first_dword        <= '1';
-                     registerram_addr_r <= 0;
-                     registerram_readen <= '1';
-                     count              <= 2;
-                  end if;
-               end if;
-            
-             when SAVEREGISTER_READ =>
+
+            when SAVEREGISTER_READ =>
                if (registerram_readvalid = '1') then
                   if (first_dword = '1') then
                      first_dword              <= '0';
                      registerram_addr_r       <= registerram_addr_r + 1;
                      registerram_readen       <= '1';
-                     bus_out_Din(31 downto 0) <= registerram_DataOut;
+                     fifo_Din(31 downto 0)    <= registerram_DataOut;
                   else
-                     state                     <= SAVEREGISTER_WRITE;
-                     bus_out_Din(63 downto 32) <= registerram_DataOut;
-                     bus_out_ena               <= '1';
-                     bus_out_active            <= '1';
+                     fifo_Din(63 downto 32)   <= registerram_DataOut;
+                     fifo_Wr                  <= '1';
+                     if (count < REGISTERCOUNT) then
+                        first_dword          <= '1';
+                        count                <= count + 2;
+                        registerram_addr_r   <= registerram_addr_r + 1;
+                        registerram_readen   <= '1';
+                     else
+                        state <= SAVEMEMORY_NEXT;
+                     end if;
                   end if;
                end if;
-            
-            when SAVEREGISTER_WRITE => 
-               if (bus_out_done = '1') then
-                  bus_out_active <= '0';
-                  bus_out_Adr <= std_logic_vector(unsigned(bus_out_Adr) + 2);
-                  if (count < REGISTERCOUNT) then
-                     state                <= SAVEREGISTER_READ;
-                     first_dword          <= '1';
-                     count                <= count + 2;
-                     registerram_addr_r   <= registerram_addr_r + 1;
-                     registerram_readen   <= '1';
-                  else 
-                     state <= SAVEMEMORY_NEXT;
-                  end if;
-               end if;
-            
+
             when SAVEMEMORY_NEXT =>
                if (savetype_counter < SAVETYPESCOUNT) then
-                  state        <= SAVEMEMORY_READ;
-                  first_dword  <= '1';
-                  count        <= 2;
                   maxcount     <= savetypes(savetype_counter).count;
                   SAVE_BusAddr <= savetypes(savetype_counter).addr;
-                  SAVE_Bus_ena <= '1';
-               else
-                  state          <= SAVESIZEAMOUNT;
-                  bus_out_Adr    <= std_logic_vector(to_unsigned(savestate_address, 26));
-                  bus_out_Din    <= std_logic_vector(to_unsigned(STATESIZE, 32)) & std_logic_vector(header_amount);
-                  bus_out_ena    <= '1';
-                  bus_out_active <= '1';
-                  if (increaseSSHeaderCount = '0') then
-                     bus_out_be  <= x"F0";
+                  if (savetypes(savetype_counter).addr(27 downto 24) = x"5") then
+                     -- palette: 32bit reads leave the memorymux IDLE state
+                     -- (ALLWAIT) even while asleep, so no streaming here
+                     state        <= SAVEMEMORY_READ;
+                     first_dword  <= '1';
+                     count        <= 2;
+                     SAVE_Bus_ena <= '1';
+                  else
+                     -- EWRAM/IWRAM/VRAM/OAM answer savestate reads from
+                     -- IDLE with done the next cycle: stream 1 read/cycle
+                     state         <= SAVEMEMORY_STREAM;
+                     first_dword   <= '1';
+                     stream_issued <= 0;
+                     stream_done   <= 0;
                   end if;
+               else
+                  state       <= SAVE_FLUSH;
+                  drain_flush <= '1';
                end if;
-            
+
             when SAVEMEMORY_READ =>
                if (SAVE_BusReadDone = '1') then
                   if (first_dword = '1') then
                      first_dword               <= '0';
-                     bus_out_Din(31 downto 0)  <= SAVE_BusReadData;
+                     fifo_Din(31 downto 0)     <= SAVE_BusReadData;
                      SAVE_BusAddr              <= std_logic_vector(unsigned(SAVE_BusAddr) + 4);
                      SAVE_Bus_ena              <= '1';
                   else
-                     state                      <= SAVEMEMORY_WRITE;
-                     bus_out_Din(63 downto 32)  <= SAVE_BusReadData;
-                     bus_out_ena                <= '1';
-                     bus_out_active             <= '1';
+                     fifo_Din(63 downto 32)    <= SAVE_BusReadData;
+                     fifo_Wr                   <= '1';
+                     if (count < maxcount) then
+                        first_dword  <= '1';
+                        count        <= count + 2;
+                        SAVE_BusAddr <= std_logic_vector(unsigned(SAVE_BusAddr) + 4);
+                        SAVE_Bus_ena <= '1';
+                     else
+                        savetype_counter <= savetype_counter + 1;
+                        state            <= SAVEMEMORY_NEXT;
+                     end if;
                   end if;
                end if;
-               
-            when SAVEMEMORY_WRITE =>
-               if (bus_out_done = '1') then
-                  bus_out_active <= '0';
-                  bus_out_Adr <= std_logic_vector(unsigned(bus_out_Adr) + 2);
-                  if (count < maxcount) then
-                     state        <= SAVEMEMORY_READ;
-                     first_dword  <= '1';
-                     count        <= count + 2;
+
+            when SAVEMEMORY_STREAM =>
+               -- issue side: one read per cycle unless the FIFO backs up;
+               -- SAVE_BusAddr holds the address of the read issued this
+               -- cycle (region base was preloaded in SAVEMEMORY_NEXT)
+               if (stream_issued < maxcount and fifo_NearFull = '0') then
+                  SAVE_Bus_ena <= '1';
+                  if (stream_issued > 0) then
                      SAVE_BusAddr <= std_logic_vector(unsigned(SAVE_BusAddr) + 4);
-                     SAVE_Bus_ena <= '1';
-                  else 
+                  end if;
+                  stream_issued <= stream_issued + 1;
+               end if;
+               -- capture side: dones arrive in issue order, one per cycle
+               if (SAVE_BusReadDone = '1') then
+                  stream_done <= stream_done + 1;
+                  if (first_dword = '1') then
+                     first_dword           <= '0';
+                     fifo_Din(31 downto 0) <= SAVE_BusReadData;
+                  else
+                     first_dword            <= '1';
+                     fifo_Din(63 downto 32) <= SAVE_BusReadData;
+                     fifo_Wr                <= '1';
+                  end if;
+                  if (stream_done = maxcount - 1) then
                      savetype_counter <= savetype_counter + 1;
                      state            <= SAVEMEMORY_NEXT;
                   end if;
                end if;
-            
+
+            when SAVE_FLUSH =>
+               if (pushed_qw = sent_qw and drain_inflight = '0') then
+                  drain_active     <= '0';
+                  drain_flush      <= '0';
+                  state            <= SAVESIZEAMOUNT;
+                  bus_out_burstcnt <= x"01";
+                  bus_out_Adr      <= std_logic_vector(to_unsigned(savestate_address, 26));
+                  bus_out_Din      <= std_logic_vector(to_unsigned(STATESIZE, 32)) & std_logic_vector(header_amount);
+                  bus_out_ena      <= '1';
+                  bus_out_active   <= '1';
+                  if (increaseSSHeaderCount = '0') then
+                     bus_out_be  <= x"F0";
+                  else
+                     bus_out_be  <= x"FF";
+                  end if;
+               end if;
+
             when SAVESIZEAMOUNT =>
                if (bus_out_done = '1') then
                   state            <= IDLE;
@@ -586,7 +645,36 @@ begin
          
          
          end case;
-         
+
+         -- #################
+         -- burst drain: FIFO -> DDR3, runs alongside the save phases above.
+         -- One burst in flight at a time; bus_out_Adr advances on completion
+         -- so it holds the burst's start address for the whole request.
+         -- #################
+         if (drain_active = '1') then
+            if (drain_inflight = '1') then
+               if (bus_out_done = '1') then
+                  drain_inflight <= '0';
+                  bus_out_active <= '0';
+                  bus_out_Adr    <= std_logic_vector(unsigned(bus_out_Adr) + 2 * drain_burst_n);
+               end if;
+            elsif (pushed_qw - sent_qw >= BURSTLEN or (drain_flush = '1' and pushed_qw > sent_qw)) then
+               if (pushed_qw - sent_qw >= BURSTLEN) then
+                  drain_burst_n    <= BURSTLEN;
+                  bus_out_burstcnt <= std_logic_vector(to_unsigned(BURSTLEN, 8));
+                  sent_qw          <= sent_qw + BURSTLEN;
+               else
+                  drain_burst_n    <= pushed_qw - sent_qw;
+                  bus_out_burstcnt <= std_logic_vector(to_unsigned(pushed_qw - sent_qw, 8));
+                  sent_qw          <= pushed_qw;
+               end if;
+               bus_out_rnw    <= '0';
+               bus_out_ena    <= '1';
+               bus_out_active <= '1';
+               drain_inflight <= '1';
+            end if;
+         end if;
+
       end if;
    end process;
    

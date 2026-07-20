@@ -6,11 +6,17 @@ entity gba_statemanager is
    generic
    (
       Softmap_SaveState_ADDR   : integer; -- count:  524288    -- 512 Kbyte Data for Savestate
-      Softmap_Rewind_ADDR      : integer  -- count:  524288*64 -- 64*512 Kbyte Data for Savestates
+      Softmap_Rewind_ADDR      : integer; -- count:  524288*64 -- 64*512 Kbyte Data for Savestates
+      -- Pacing in clk1x ticks. The accuracy core clocks this at the literal GBA
+      -- rate (16.777216 MHz), NOT the pre-accuracy 100 MHz the old hardcoded
+      -- constants assumed (which stretched capture to ~6 s / rewind step to ~3 s).
+      -- Generics so testbenches can shrink them.
+      TIME_CAPTURE             : integer := 16777216; -- 1 s: rewind snapshot interval
+      TIME_REWIND              : integer := 8388608   -- 500 ms per rewind step while held
    );
-   port 
+   port
    (
-      clk100              : in    std_logic; 
+      clk1x               : in    std_logic;
       gb_on               : in    std_logic;
 
       rewind_on           : in    std_logic;
@@ -34,8 +40,6 @@ architecture arch of gba_statemanager is
 
    constant SAVESTATESIZE : integer := 16#20000#; -- 131072 Dwords = 512kbyte
    constant REWIND_COUNT  : integer := 64;
-   constant TIME_CAPTURE  : integer := 100000000; -- 1 second    sim 1000000;
-   constant TIME_REWIND   : integer := 50000000;  -- 500ms       sim 1200000;
 
    signal save_1         : std_logic := '0';
    signal load_1         : std_logic := '0';
@@ -54,9 +58,9 @@ architecture arch of gba_statemanager is
 
 begin 
    
-   process (clk100)
+   process (clk1x)
    begin
-      if rising_edge(clk100) then
+      if rising_edge(clk1x) then
       
          request_savestate <= '0';
          request_loadstate <= '0';

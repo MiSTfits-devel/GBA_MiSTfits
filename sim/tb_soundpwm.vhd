@@ -30,11 +30,16 @@ architecture sim of tb_soundpwm is
    signal snd_l     : std_logic_vector(15 downto 0);
    signal snd_r     : std_logic_vector(15 downto 0);
 
+   signal xq_audio_on : std_logic := '0';
+
    -- checker control
    signal chk_ena   : std_logic := '0';
    signal chk_seen  : integer := 0;
    signal cadence_ena : std_logic := '0';
 
+   constant ADR_SOUND1CNT_L : integer := 16#60#;
+   constant ADR_SOUND1CNT_H : integer := 16#62#;
+   constant ADR_SOUND1CNT_X : integer := 16#64#;
    constant ADR_SOUND4CNT_L : integer := 16#78#;
    constant ADR_SOUND4CNT_H : integer := 16#7C#;
    constant ADR_SOUNDCNT_L  : integer := 16#80#;
@@ -81,6 +86,7 @@ begin
       wired_out         => wired,
       wired_done        => open,
       lockspeed         => '1',
+      xq_audio_on       => xq_audio_on,
       timer0_tick       => '0',
       timer1_tick       => '0',
       sound_dma_req     => open,
@@ -182,6 +188,48 @@ begin
       chk_ena   <= '0';
       cadence_ena <= '0';
       report "phase 2 ok: 262.144kHz PWM reconstructed at 96kHz, " & integer'image(chk_seen) & " changes";
+
+      -- phase 3: channels 1-3 must NOT be held/quantized to the PWM rate
+      -- (Robert/MiSTer-devel's ask: "keep the other channels as they are").
+      -- ch4 off, ch1 running fast (131072Hz) against the *coarsest* PWM
+      -- setting (32.768kHz, 512-cycle hold). If ch1 were still forced
+      -- through the same sample&hold as ch4, the output could change at
+      -- most once per 512-cycle PWM period -- about 24000/512 = 46 times in
+      -- this window, the same ballpark as phase 1's ch4-driven count. If
+      -- ch1 bypasses that hold as intended, changes should track the full
+      -- ~96kHz resample rate instead (up to ~24000*96000/16777216 = 137).
+      buswrite16(gb_bus, ADR_SOUNDCNT_L,  x"1177");  -- ch1 L+R only, master vol max, ch2-4 off
+      buswrite16(gb_bus, ADR_SOUNDBIAS,   x"0200");  -- 9bit / 32.768kHz -- coarsest hold
+      buswrite16(gb_bus, ADR_SOUND1CNT_L, x"0000");  -- no sweep
+      buswrite16(gb_bus, ADR_SOUND1CNT_H, x"F080");  -- 50%-ish duty, no envelope, max volume
+      -- load the frequency divider before triggering: freq_cnt is seeded
+      -- from freq_divider on the SAME edge Initial is written, using its
+      -- pre-write (stale) value if both are written together
+      buswrite16(gb_bus, ADR_SOUND1CNT_X, x"07FF");  -- max frequency (131072Hz), not yet triggered
+      buswrite16(gb_bus, ADR_SOUND1CNT_X, x"87FF");  -- trigger, frequency already loaded
+
+      xq_audio_on <= '1';
+      wait for 2400 * CLK_PERIOD;       -- let ch1 start up and settle
+      cadence_ena <= '1';               -- still must only change on a resample boundary
+      chk_ena     <= '1';
+      wait for 24000 * CLK_PERIOD;
+      chk_ena     <= '0';
+      cadence_ena <= '0';
+      assert chk_seen > 80 report "phase 3: ch1 output only changed " & integer'image(chk_seen) & " times -- looks quantized to the PWM rate instead of running at full native resolution" severity failure;
+      report "phase 3 ok: xq_audio_on='1', ch1 (unquantized) changed " & integer'image(chk_seen) & " times in a window where PWM-held ch4 changed under 50";
+
+      -- phase 4: xq_audio_on='0' (the default) must reproduce the original,
+      -- strictly hardware-accurate behavior -- the same ch1 setup, still
+      -- held down to the coarse PWM rate along with everything else
+      xq_audio_on <= '0';
+      wait for 2400 * CLK_PERIOD;
+      cadence_ena <= '1';
+      chk_ena     <= '1';
+      wait for 24000 * CLK_PERIOD;
+      chk_ena     <= '0';
+      cadence_ena <= '0';
+      assert chk_seen <= 80 report "phase 4: xq_audio_on='0' should reproduce the original PWM-held behavior, but ch1 changed " & integer'image(chk_seen) & " times -- looks unquantized" severity failure;
+      report "phase 4 ok: xq_audio_on='0', ch1 correctly held down to the PWM rate, " & integer'image(chk_seen) & " changes";
 
       report "tb_soundpwm all checks passed";
       done <= true;

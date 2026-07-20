@@ -30,7 +30,20 @@ entity gba_sound is
       wired_done          : out   std_logic;
       
       lockspeed           : in    std_logic;
-      
+
+      -- "XQ Audio" OSD toggle. Off (default) = strict AGB Programming Manual
+      -- "10.8 Sound PWM Control" behavior (issue #143): the whole mix (ch1-4
+      -- + DMA A/B) is decimated together through the SOUNDBIAS bias/clip/
+      -- bit-depth/sample&hold circuit at the selected rate (32.768kHz..
+      -- 262.144kHz, Table 22), same as real hardware. On = only channel 4
+      -- (noise) goes through that PWM circuit; channels 1-3 + DMA stay at
+      -- full native rate and bit depth (see the comment above soundmix_ch4_l
+      -- below). This is a deliberate, non-hardware-accurate deviation
+      -- requested by Robert (MiSTer-devel): the noise LFSR needs the coarse
+      -- PWM rate to sound authentic, but decimating the tonal channels down
+      -- to the same rate throws away quality nobody asked to lose.
+      xq_audio_on         : in    std_logic := '0';
+
       timer0_tick         : in    std_logic;
       timer1_tick         : in    std_logic;
       sound_dma_req       : out   std_logic_vector(1 downto 0);
@@ -107,20 +120,36 @@ architecture arch of gba_sound is
    signal soundmix1_r  : signed(15 downto 0) := (others => '0'); 
    signal soundmix2_l  : signed(15 downto 0) := (others => '0'); 
    signal soundmix2_r  : signed(15 downto 0) := (others => '0'); 
-   signal soundmix3_l  : signed(15 downto 0) := (others => '0'); 
-   signal soundmix3_r  : signed(15 downto 0) := (others => '0'); 
-   signal soundmix4_l  : signed(15 downto 0) := (others => '0'); 
-   signal soundmix4_r  : signed(15 downto 0) := (others => '0'); 
-   signal soundmix14_l : signed(15 downto 0) := (others => '0'); 
-   signal soundmix14_r : signed(15 downto 0) := (others => '0'); 
-   
-   signal soundmix5_l : signed(15 downto 0) := (others => '0'); 
-   signal soundmix5_r : signed(15 downto 0) := (others => '0'); 
-   signal soundmix6_l : signed(15 downto 0) := (others => '0'); 
-   signal soundmix6_r : signed(15 downto 0) := (others => '0'); 
-   signal soundmix7_l : signed(15 downto 0) := (others => '0'); 
-   signal soundmix7_r : signed(15 downto 0) := (others => '0'); 
-   
+   signal soundmix3_l  : signed(15 downto 0) := (others => '0');
+   signal soundmix3_r  : signed(15 downto 0) := (others => '0');
+
+   -- channel 4 (noise) is kept isolated from channels 1-3 all the way to the
+   -- final mix: only its own contribution goes through the PWM bias/clip/
+   -- bit-depth/sample&hold stage below (soundmix_ch4_* -> soundmix8), while
+   -- channels 1-3 + DMA (soundmix_o*, "the other channels") bypass it and
+   -- stay at full native rate and bit depth. Per Robert (MiSTer-devel):
+   -- decimating the *whole* mix down to the SOUNDBIAS-selected PWM rate for
+   -- the noise channel's sake (issue #143) also drags 1-3 down to that same
+   -- coarse rate, when only the noise channel actually needs it to sound
+   -- authentic.
+   signal soundmix_ch4_l    : signed(15 downto 0) := (others => '0');
+   signal soundmix_ch4_r    : signed(15 downto 0) := (others => '0');
+   signal soundmix_ch4_14_l : signed(15 downto 0) := (others => '0');
+   signal soundmix_ch4_14_r : signed(15 downto 0) := (others => '0');
+   signal soundmix_ch4_5_l  : signed(15 downto 0) := (others => '0');
+   signal soundmix_ch4_5_r  : signed(15 downto 0) := (others => '0');
+
+   signal soundmix_o14_l    : signed(15 downto 0) := (others => '0');
+   signal soundmix_o14_r    : signed(15 downto 0) := (others => '0');
+   signal soundmix_o5_l     : signed(15 downto 0) := (others => '0');
+   signal soundmix_o5_r     : signed(15 downto 0) := (others => '0');
+   signal soundmix_o6_l     : signed(15 downto 0) := (others => '0');
+   signal soundmix_o6_r     : signed(15 downto 0) := (others => '0');
+   signal soundmix_o7_l     : signed(15 downto 0) := (others => '0');
+   signal soundmix_o7_r     : signed(15 downto 0) := (others => '0');
+   signal soundmix_o_clip_l : signed(15 downto 0) := (others => '0');
+   signal soundmix_o_clip_r : signed(15 downto 0) := (others => '0');
+
    signal soundclip_l : unsigned(9 downto 0) := to_unsigned(16#200#, 10);
    signal soundclip_r : unsigned(9 downto 0) := to_unsigned(16#200#, 10);
 
@@ -130,8 +159,10 @@ architecture arch of gba_sound is
    constant AUDIO_RESAMPLE_RATE : integer := 96_000;
    signal resample_phase : integer range 0 to GBA_CLOCK_RATE - 1 := 0;
    signal resample_count : integer range 0 to 175 := 0;
-   signal resample_sum_l : integer range -131_072 to 131_071 := 0;
-   signal resample_sum_r : integer range -131_072 to 131_071 := 0;
+   -- +-512 (PWM/ch4) plus +-512 (clipped "others") per native sample, times
+   -- up to 175 samples per 96kHz output: +-179,200 worst case
+   signal resample_sum_l : integer range -200_000 to 200_000 := 0;
+   signal resample_sum_r : integer range -200_000 to 200_000 := 0;
    signal resampled_l    : signed(15 downto 0) := (others => '0');
    signal resampled_r    : signed(15 downto 0) := (others => '0');
 
@@ -461,52 +492,85 @@ begin
             soundmix3_r <= soundmix2_r;
          end if;
          
-         -- channel 4
+         -- channel 4, kept isolated from channels 1-3 (see declaration comment)
          if (sound_on_ch4 = '1' and Sound_4_Enable_Flags_LEFT = "1") then
-            soundmix4_l <= soundmix3_l + sound_out_ch4;
+            soundmix_ch4_l <= sound_out_ch4;
          else
-            soundmix4_l <= soundmix3_l;
+            soundmix_ch4_l <= (others => '0');
          end if;
          if (sound_on_ch4 = '1' and Sound_4_Enable_Flags_RIGHT = "1") then
-            soundmix4_r <= soundmix3_r + sound_out_ch4;
+            soundmix_ch4_r <= sound_out_ch4;
          else
-            soundmix4_r <= soundmix3_r;
+            soundmix_ch4_r <= (others => '0');
          end if;
-         
-         -- sound1-4 volume control
-         soundmix14_l <= resize(soundmix4_l * to_integer(unsigned(Sound_1_4_Master_Volume_LEFT)), 16);
-         soundmix14_r <= resize(soundmix4_r * to_integer(unsigned(Sound_1_4_Master_Volume_RIGHT)), 16);
-         
+
+         -- ch4 alone: same master/Sound_1_4_Volume scaling as ch1-3 below,
+         -- feeds the PWM stage (bit-depth + sample rate reduction) further down
+         soundmix_ch4_14_l <= resize(soundmix_ch4_l * to_integer(unsigned(Sound_1_4_Master_Volume_LEFT)), 16);
+         soundmix_ch4_14_r <= resize(soundmix_ch4_r * to_integer(unsigned(Sound_1_4_Master_Volume_RIGHT)), 16);
          case (to_integer(unsigned(Sound_1_4_Volume))) is
-             when 0     => soundmix5_l <= soundmix14_l / 4;   soundmix5_r <= soundmix14_r / 4;
-             when 1     => soundmix5_l <= soundmix14_l / 2;   soundmix5_r <= soundmix14_r / 2;
-             when 2     => soundmix5_l <= soundmix14_l;       soundmix5_r <= soundmix14_r;
-             when 3     => soundmix5_l <= (others => '0');    soundmix5_r <= (others => '0');  -- 3 is not allowed
+             when 0     => soundmix_ch4_5_l <= soundmix_ch4_14_l / 4;   soundmix_ch4_5_r <= soundmix_ch4_14_r / 4;
+             when 1     => soundmix_ch4_5_l <= soundmix_ch4_14_l / 2;   soundmix_ch4_5_r <= soundmix_ch4_14_r / 2;
+             when 2     => soundmix_ch4_5_l <= soundmix_ch4_14_l;       soundmix_ch4_5_r <= soundmix_ch4_14_r;
+             when 3     => soundmix_ch4_5_l <= (others => '0');         soundmix_ch4_5_r <= (others => '0');  -- 3 is not allowed
              when others => null;
          end case;
 
-         -- mix in dma sound
+         -- ch1-3 + DMA ("the other channels"): same master/Sound_1_4_Volume
+         -- scaling and DMA mixing as before, but no PWM stage afterward --
+         -- these stay at full native rate and bit depth
+         soundmix_o14_l <= resize(soundmix3_l * to_integer(unsigned(Sound_1_4_Master_Volume_LEFT)), 16);
+         soundmix_o14_r <= resize(soundmix3_r * to_integer(unsigned(Sound_1_4_Master_Volume_RIGHT)), 16);
+         case (to_integer(unsigned(Sound_1_4_Volume))) is
+             when 0     => soundmix_o5_l <= soundmix_o14_l / 4;   soundmix_o5_r <= soundmix_o14_r / 4;
+             when 1     => soundmix_o5_l <= soundmix_o14_l / 2;   soundmix_o5_r <= soundmix_o14_r / 2;
+             when 2     => soundmix_o5_l <= soundmix_o14_l;       soundmix_o5_r <= soundmix_o14_r;
+             when 3     => soundmix_o5_l <= (others => '0');      soundmix_o5_r <= (others => '0');  -- 3 is not allowed
+             when others => null;
+         end case;
+
          if (sound_on_dmaA = '1') then
-            soundmix6_l <= soundmix5_l - sound_out_dmaA_l;
-            soundmix6_r <= soundmix5_r - sound_out_dmaA_r;
+            soundmix_o6_l <= soundmix_o5_l - sound_out_dmaA_l;
+            soundmix_o6_r <= soundmix_o5_r - sound_out_dmaA_r;
          else
-            soundmix6_l <= soundmix5_l;
-            soundmix6_r <= soundmix5_r;
+            soundmix_o6_l <= soundmix_o5_l;
+            soundmix_o6_r <= soundmix_o5_r;
          end if;
-         
+
          if (sound_on_dmaB = '1') then
-            soundmix7_l <= soundmix6_l - sound_out_dmaB_l;
-            soundmix7_r <= soundmix6_r - sound_out_dmaB_r;
+            soundmix_o7_l <= soundmix_o6_l - sound_out_dmaB_l;
+            soundmix_o7_r <= soundmix_o6_r - sound_out_dmaB_r;
          else
-            soundmix7_l <= soundmix6_l;
-            soundmix7_r <= soundmix6_r;
+            soundmix_o7_l <= soundmix_o6_l;
+            soundmix_o7_r <= soundmix_o6_r;
          end if;
-         
+
+         -- safety clip only (no bit-depth or rate reduction) to the same
+         -- +-512 headroom the PWM path below is limited to, so a worst-case
+         -- (everything maxed) mix can't wrap the resampler's accumulator
+         if    (soundmix_o7_l > 511)  then soundmix_o_clip_l <= to_signed(511, 16);
+         elsif (soundmix_o7_l < -512) then soundmix_o_clip_l <= to_signed(-512, 16);
+         else                              soundmix_o_clip_l <= soundmix_o7_l;
+         end if;
+         if    (soundmix_o7_r > 511)  then soundmix_o_clip_r <= to_signed(511, 16);
+         elsif (soundmix_o7_r < -512) then soundmix_o_clip_r <= to_signed(-512, 16);
+         else                              soundmix_o_clip_r <= soundmix_o7_r;
+         end if;
+
          -- PWM output stage (AGB Programming Manual "10.8 Sound PWM Control"):
-         -- the bias level is added and the result clipped to the 10bit range the
-         -- PWM circuit accepts, just like real hardware does before modulation
-         biased_l := to_integer(soundmix7_l) + to_integer(unsigned(REG_SOUNDBIAS(9 downto 0)));
-         biased_r := to_integer(soundmix7_r) + to_integer(unsigned(REG_SOUNDBIAS(9 downto 0)));
+         -- the bias level is added and the result clipped to the 10bit range
+         -- the PWM circuit accepts, just like real hardware does before
+         -- modulation. With xq_audio_on='0' this covers the whole mix (ch1-4
+         -- + DMA, real-hardware behavior); with xq_audio_on='1' it covers
+         -- channel 4 alone (see soundmix_ch4_l's declaration comment) and
+         -- channels 1-3 + DMA rejoin after this stage, unquantized.
+         if (xq_audio_on = '1') then
+            biased_l := to_integer(soundmix_ch4_5_l) + to_integer(unsigned(REG_SOUNDBIAS(9 downto 0)));
+            biased_r := to_integer(soundmix_ch4_5_r) + to_integer(unsigned(REG_SOUNDBIAS(9 downto 0)));
+         else
+            biased_l := to_integer(soundmix_ch4_5_l) + to_integer(soundmix_o7_l) + to_integer(unsigned(REG_SOUNDBIAS(9 downto 0)));
+            biased_r := to_integer(soundmix_ch4_5_r) + to_integer(soundmix_o7_r) + to_integer(unsigned(REG_SOUNDBIAS(9 downto 0)));
+         end if;
          if    (biased_l < 0)       then soundclip_l <= (others => '0');
          elsif (biased_l > 16#3FF#) then soundclip_l <= (others => '1');
          else                            soundclip_l <= to_unsigned(biased_l, 10);
@@ -549,8 +613,16 @@ begin
                pwm_cnt <= pwm_cnt + 1;
             end if;
 
-            sum_l := resample_sum_l + to_integer(soundmix8_l);
-            sum_r := resample_sum_r + to_integer(soundmix8_r);
+            -- with xq_audio_on='1', the other channels (full quality) rejoin
+            -- here, after ch4's own PWM decimation; with it '0' they were
+            -- already folded into soundmix8 above (see biased_l/r)
+            if (xq_audio_on = '1') then
+               sum_l := resample_sum_l + to_integer(soundmix8_l) + to_integer(soundmix_o_clip_l);
+               sum_r := resample_sum_r + to_integer(soundmix8_r) + to_integer(soundmix_o_clip_r);
+            else
+               sum_l := resample_sum_l + to_integer(soundmix8_l);
+               sum_r := resample_sum_r + to_integer(soundmix8_r);
+            end if;
             if (resample_phase + AUDIO_RESAMPLE_RATE >= GBA_CLOCK_RATE) then
                resample_phase <= resample_phase + AUDIO_RESAMPLE_RATE - GBA_CLOCK_RATE;
                if (resample_count = 173) then

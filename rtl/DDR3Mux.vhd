@@ -82,7 +82,15 @@ entity DDR3Mux is
       -- one entry per 2 clk1x is all the drain rate left over during blend
       gpufifo2_Din     : in  std_logic_vector(79 downto 0) := (others => '0'); -- 16 bit word address + 64bit data
       gpufifo2_Wr      : in  std_logic := '0';
-      gpufifo2_empty   : out std_logic
+      gpufifo2_empty   : out std_logic;
+
+      -- savestate burst-write stream: a DDR3MUX_SS write request with
+      -- burstcount > 1 takes ALL its beats from this FIFO read port at
+      -- 1 beat/cycle (rdram_dataWrite is ignored for such requests). The
+      -- requester must have the whole burst in the FIFO before raising
+      -- the request; rdram_done pulses when the last beat is accepted.
+      ssw_fifo_Dout    : in  std_logic_vector(63 downto 0) := (others => '0');
+      ssw_fifo_Rd      : out std_logic
    );
 end entity;
 
@@ -92,11 +100,14 @@ architecture arch of DDR3Mux is
    (
       IDLE,
       WAITREAD,
-      READAGAIN
+      READAGAIN,
+      WRITEBURST
    );
    signal ddr3State     : tddr3State := IDLE;
-   
+
    signal readCount     : unsigned(7 downto 0);
+   signal writeBeats    : unsigned(7 downto 0) := (others => '0');
+   signal ddr3_DIN_reg  : std_logic_vector(63 downto 0) := (others => '0');
    signal timeoutCount  : unsigned(12 downto 0);
    
    signal req_latched   : tDDDR3Single := (others => '0');
@@ -113,10 +124,16 @@ architecture arch of DDR3Mux is
    signal gpufifo2_Dout    : std_logic_vector(79 downto 0) := (others => '0');
    signal gpufifo2_Rd      : std_logic := '0';
 
-begin 
+begin
 
    ddr3_ADDR(28 downto 25) <= "0011";
-   
+
+   -- burst-write beats stream straight off the FIFO's registered read port:
+   -- it is stable within a cycle (a valid Avalon beat) and advances exactly
+   -- once per accepted beat via the combinational ssw_fifo_Rd below
+   ddr3_DIN   <= ssw_fifo_Dout when (ddr3State = WRITEBURST) else ddr3_DIN_reg;
+   ssw_fifo_Rd <= '1' when (ddr3State = WRITEBURST and ddr3_BUSY = '0') else '0';
+
    process (all)
    begin
       rdram_ready <= (others => '0');
@@ -139,7 +156,9 @@ begin
          rdram_granted <= (others => '0');
          rdram_done    <= (others => '0');
       
-         if (ddr3_BUSY = '0') then
+         -- a write burst holds WE high across all beats; WRITEBURST below
+         -- drops it itself on the last accepted beat
+         if (ddr3_BUSY = '0' and ddr3State /= WRITEBURST) then
             ddr3_WE <= '0';
             ddr3_RD <= '0';
          end if;
@@ -173,7 +192,7 @@ begin
                   if (activeRequest = '1') then
                   
                      req_latched(activeIndex) <= '0';
-                     ddr3_DIN                 <= rdram_dataWrite(activeIndex);
+                     ddr3_DIN_reg             <= rdram_dataWrite(activeIndex);
                      ddr3_BE                  <= rdram_writeMask(activeIndex);
                      ddr3_ADDR(24 downto 0)   <= std_logic_vector(rdram_address(activeIndex)(27 downto 3));
                      
@@ -192,21 +211,25 @@ begin
                      if (rdram_rnw(activeIndex) = '1') then
                         ddr3State                     <= WAITREAD;
                         ddr3_RD                       <= '1';
-                        rdram_granted(activeIndex)    <= '1'; 
+                        rdram_granted(activeIndex)    <= '1';
+                     elsif (rdram_burstcount(activeIndex) > 1) then
+                        ddr3_WE                       <= '1';
+                        writeBeats                    <= rdram_burstcount(activeIndex)(7 downto 0);
+                        ddr3State                     <= WRITEBURST;
                      else
                         ddr3_WE                       <= '1';
-                        rdram_done(activeIndex)       <= '1'; 
+                        rdram_done(activeIndex)       <= '1';
                      end if;
                    
                   elsif (gpufifo_empty = '0' and gpufifo_Rd = '0') then
-                  
-                     if (gpufifo_Dout(17 downto 16) = "00") then gpufifo_Next(15 downto  0) <= gpufifo_Dout(15 downto 0); end if;     
-                     if (gpufifo_Dout(17 downto 16) = "01") then gpufifo_Next(31 downto 16) <= gpufifo_Dout(15 downto 0); end if;     
-                     if (gpufifo_Dout(17 downto 16) = "10") then gpufifo_Next(47 downto 32) <= gpufifo_Dout(15 downto 0); end if;     
-                     if (gpufifo_Dout(17 downto 16) = "11") then 
-                        ddr3_DIN <= gpufifo_Dout(15 downto 0) & gpufifo_Next; 
-                        ddr3_WE <= '1'; 
-                     end if;     
+
+                     if (gpufifo_Dout(17 downto 16) = "00") then gpufifo_Next(15 downto  0) <= gpufifo_Dout(15 downto 0); end if;
+                     if (gpufifo_Dout(17 downto 16) = "01") then gpufifo_Next(31 downto 16) <= gpufifo_Dout(15 downto 0); end if;
+                     if (gpufifo_Dout(17 downto 16) = "10") then gpufifo_Next(47 downto 32) <= gpufifo_Dout(15 downto 0); end if;
+                     if (gpufifo_Dout(17 downto 16) = "11") then
+                        ddr3_DIN_reg <= gpufifo_Dout(15 downto 0) & gpufifo_Next;
+                        ddr3_WE <= '1';
+                     end if;
                   
                      gpufifo_Rd <= '1';
                      ddr3_BE    <= x"FF";
@@ -215,7 +238,7 @@ begin
 
                   elsif (gpufifo2_en = '1' and gpufifo2_empty = '0' and gpufifo2_Rd = '0') then
 
-                     ddr3_DIN      <= gpufifo2_Dout(63 downto 0);
+                     ddr3_DIN_reg  <= gpufifo2_Dout(63 downto 0);
                      ddr3_WE       <= '1';
 
                      gpufifo2_Rd   <= '1';
@@ -246,6 +269,20 @@ begin
                   end if;
                end if;
                
+            when WRITEBURST =>
+               -- one beat is accepted every cycle ddr3_BUSY is low: the FIFO
+               -- head is the presented beat (see ddr3_DIN mux above) and the
+               -- combinational ssw_fifo_Rd pops it on acceptance, so the next
+               -- beat sits on ssw_fifo_Dout in the following cycle
+               if (ddr3_BUSY = '0') then
+                  writeBeats <= writeBeats - 1;
+                  if (writeBeats = 1) then
+                     ddr3_WE               <= '0';
+                     rdram_done(lastIndex) <= '1';
+                     ddr3State             <= IDLE;
+                  end if;
+               end if;
+
             when READAGAIN =>
                ddr3_ADDR(20 downto 0)   <= std_logic_vector(unsigned(ddr3_ADDR(20 downto 0)) + 16#FF#);
                   

@@ -32,6 +32,7 @@ entity gba_top is
       inPause               : out    std_logic;
       GBA_lockspeed         : in     std_logic;  -- 1 = 100% speed, 0 = max speed
       GBA_cputurbo          : in     std_logic;  -- 1 = cpu free running, all other 16 mhz
+      xq_audio_on           : in     std_logic := '0'; -- "XQ Audio" OSD toggle, see gba_sound.vhd's port comment
       GBA_flash_1m          : in     std_logic;  -- 1 when string "FLASH1M_V" is anywhere in gamepak
       Underclock            : in     std_logic_vector(1 downto 0);
       CyclesMissing         : buffer std_logic_vector(31 downto 0); -- debug only for speed measurement, keep open
@@ -86,6 +87,10 @@ entity gba_top is
       SAVE_out_active       : out    std_logic;                     -- is high when access goes to savestate
       SAVE_out_be           : out    std_logic_vector(7 downto 0);
       SAVE_out_done         : in     std_logic;                     -- should be one cycle high when write is done or read value is valid
+      SAVE_out_burstcnt     : out    std_logic_vector(7 downto 0);  -- write burst length; beats stream from the SAVE_fifo when > 1
+      SAVE_fifo_Din         : out    std_logic_vector(63 downto 0); -- save-body qword stream into the DDR3-side burst FIFO
+      SAVE_fifo_Wr          : out    std_logic;
+      SAVE_fifo_NearFull    : in     std_logic := '0';
       savestate_bus_ext     : out    proc_bus_gb_type;
       ss_wired_out_ext      : in     std_logic_vector(proc_buswidth-1 downto 0) := (others => '0');
       ss_wired_done_ext     : in     std_logic;
@@ -475,6 +480,16 @@ begin
       if rising_edge(clk1x) then
    
          debug_bus_ena    <= '0';
+
+         if (debug_bus_active = '1' and mem_bus_done = '1') then
+            GBA_BusReadData  <= mem_bus_din;
+            debug_bus_active <= '0';
+            mem_bus_isCPU    <= '1';
+         end if;
+
+         -- re-arm AFTER the done-clear above so a new request landing on the
+         -- same edge as a completion keeps the bus: the savestate capture
+         -- streams one read per cycle through here (done pulses every cycle)
          if (GBA_Bus_written = '1') then
             debug_bus_active <= '1';
             debug_bus_Adr    <= GBA_BusAddr;
@@ -489,12 +504,6 @@ begin
             debug_bus_ena    <= '1';
             debug_bus_acc    <= SAVE_BusACC;
             debug_bus_dout   <= SAVE_BusWriteData;
-         end if;
-         
-         if (debug_bus_active = '1' and mem_bus_done = '1') then
-            GBA_BusReadData  <= mem_bus_din;
-            debug_bus_active <= '0';
-            mem_bus_isCPU    <= '1';
          end if;
          
          if (debug_bus_ena = '1') then
@@ -593,7 +602,11 @@ begin
       bus_out_ena           => SAVE_out_ena,
       bus_out_active        => SAVE_out_active,
       bus_out_be            => SAVE_out_be,
-      bus_out_done          => SAVE_out_done
+      bus_out_done          => SAVE_out_done,
+      bus_out_burstcnt      => SAVE_out_burstcnt,
+      fifo_Din              => SAVE_fifo_Din,
+      fifo_Wr               => SAVE_fifo_Wr,
+      fifo_NearFull         => SAVE_fifo_NearFull
    );
    end generate gSavestates;
 
@@ -648,7 +661,11 @@ begin
       bus_out_ena           => SAVE_out_ena,
       bus_out_active        => SAVE_out_active,
       bus_out_be            => SAVE_out_be,
-      bus_out_done          => SAVE_out_done
+      bus_out_done          => SAVE_out_done,
+      bus_out_burstcnt      => SAVE_out_burstcnt,
+      fifo_Din              => SAVE_fifo_Din,
+      fifo_Wr               => SAVE_fifo_Wr,
+      fifo_NearFull         => SAVE_fifo_NearFull
    );
    end generate gSavestatesStub;
 
@@ -673,7 +690,7 @@ begin
    )
    port map
    (
-      clk100              => clk1x,
+      clk1x               => clk1x,
       gb_on               => gbaon,
 
       rewind_on           => rewind_on,
@@ -930,7 +947,8 @@ begin
       wired_done           => reg_wired_done(11),
       
       lockspeed            => GBA_lockspeed,
-      
+      xq_audio_on          => xq_audio_on,
+
       timer0_tick          => timer0_tick,
       timer1_tick          => timer1_tick,
       sound_dma_req        => sound_dma_req,

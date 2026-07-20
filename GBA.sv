@@ -266,7 +266,7 @@ parameter CONF_STR = {
 	"P1O[10:9],Flickerblend,Off,Blend,30Hz;",
 	"P1-;",
 	"P1O[8:7],Stereo Mix,None,25%,50%,100%;",
-	"P1O[19],Fast Forward Sound,On,Off;",
+	"P1O[19],XQ Audio,Off,On;",
 `ifdef GBA2P_LITE
 	"P1O[49:48],2P Audio,Player 1,Player 2,Mix,Split P1-L P2-R;",
 	"P1O[21:20],2P Display,Both,Player 1,Player 2;",
@@ -292,7 +292,6 @@ parameter CONF_STR = {
 `endif
    "P2-,Save setting + reload Core;",
 	"P2O[28],Homebrew BIOS,Off,On;",
-	"P2O[16],Turbo,Off,On;",
 
 	"P3,Miscellaneous;",
 	"P3-;",
@@ -322,10 +321,16 @@ parameter CONF_STR = {
 
 	"- ;",
 	"R0,Reset;",
+	// No FastForward button: the accuracy core runs the whole design at the
+	// literal GBA crystal rate (clk_sys = 16.777216 MHz, one emulated cycle
+	// per FPGA clock), so there is no throttle to release -- speed-up would
+	// need dynamic PLL reconfig of the SDRAM/video clocks, not a button.
+	// Button bit map (J1 entries start at joystick bit 4):
+	//   bit 10 = Pause, bit 11 = Savestates (modifier), bit 12 = Rewind
 `ifdef GBA2P_LITE
-	"J1,A,B,L,R,Select,Start,FastForward,Pause;",
+	"J1,A,B,L,R,Select,Start,Pause;",
 `else
-	"J1,A,B,L,R,Select,Start,FastForward,Pause,Rewind;",
+	"J1,A,B,L,R,Select,Start,Pause,Savestates,Rewind;",
 `endif
 	"jn,A,B,L,R,Select,Start,X,X,X;",
 	"I,",
@@ -356,7 +361,7 @@ wire [15:0] status_menumask = {
 `endif
 	|status[21:20],                    // H8: hide 2P Separator Line unless 2P Display is Both
 	1'b1,                              // H7: unused (Link Role removed -- the cable's plug position picks the master, like real hardware)
-	~solar_quirk, status[27], cart_loaded, |cart_type, force_turbo, ~gg_active, ~bk_ena};
+	~solar_quirk, status[27], cart_loaded, |cart_type, 1'b0 /* was force_turbo, dead since the accuracy core */, ~gg_active, ~bk_ena};
 wire        forced_scandoubler;
 reg  [31:0] sd_lba;
 reg         sd_rd = 0;
@@ -439,7 +444,9 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
    .joystick_l_analog_0(joystick_analog_0)
 );
 
-assign joy = joy_unmod[12] ? 16'b0 : joy_unmod;
+// While the Savestates modifier (bit 11) is held, the game sees no input --
+// the d-pad is repurposed by savestate_ui for slot select / save / load.
+assign joy = joy_unmod[11] ? 16'b0 : joy_unmod;
 
 //////////////////////////  ROM DETECT  /////////////////////////////////
 
@@ -483,8 +490,6 @@ always @(posedge clk_sys) begin
 	end
 end
 
-wire force_turbo = |cart_type;
-
 reg [11:0] bios_wraddr;
 reg [31:0] bios_wrdata;
 reg        bios_wr;
@@ -512,13 +517,13 @@ savestate_ui savestate_ui
 	.clk            (clk_sys       ),
 	.ps2_key        (ps2_key[10:0] ),
 	.allow_ss       (cart_loaded   ),
-	.joySS          (joy_unmod[12] ),
+	.joySS          (joy_unmod[11] ),
 	.joyRight       (joy_unmod[0]  ),
 	.joyLeft        (joy_unmod[1]  ),
 	.joyDown        (joy_unmod[2]  ),
 	.joyUp          (joy_unmod[3]  ),
 	.joyStart       (joy_unmod[9]  ),
-	.joyRewind      (joy_unmod[13] ),
+	.joyRewind      (joy_unmod[12] ),
 	.rewindEnable   (status[27]    ),
 	.status_slot    (status[38:37] ),
 	.autoincslot    (status[43]    ),
@@ -530,7 +535,9 @@ savestate_ui savestate_ui
 	.statusUpdate   (statusUpdate  ),
 	.selected_slot  (ss_slot       )
 );
-defparam savestate_ui.INFO_TIMEOUT_BITS = 27;
+// 2^25 / 16.777216 MHz = 2.0 s OSD info message. Was 27, a leftover from the
+// pre-accuracy 100 MHz clk_sys where that meant 1.3 s -- at 16 MHz it was 8 s.
+defparam savestate_ui.INFO_TIMEOUT_BITS = 25;
 
 ////////////////////////////  SYSTEM  ///////////////////////////////////
 
@@ -590,45 +597,12 @@ wire [15:0] GBA_AUDIO_R;
 
 reg gba_on = 1'b0;
 reg pause = 1'b0;
-reg fast_forward, cpu_turbo;
-reg ff_latch;
 wire inPause;
-
-// FastForward button: a quick tap latches fast-forward on (tap again to
-// release); holding it past the threshold is a plain momentary speed boost
-// and does not touch the latch.
-always @(posedge clk_sys) begin : ffwd
-	reg last_ffw;
-	reg ff_was_held;
-	longint ff_count;
-
-	last_ffw <= joy_unmod[10];
-
-	if (joy_unmod[10])
-		ff_count <= ff_count + 1;
-
-	if (~last_ffw & joy_unmod[10]) begin
-		ff_latch <= 0;
-		ff_count <= 0;
-	end
-
-	if (last_ffw & ~joy_unmod[10]) begin // 100mhz clock, 0.1 seconds
-		ff_was_held <= 0;
-
-		if (ff_count < 10000000 && ~ff_was_held) begin
-			ff_was_held <= 1;
-			ff_latch <= 1;
-		end
-	end
-
-	fast_forward <= (joy_unmod[10] | ff_latch) & ~force_turbo;
-end
 
 always @(posedge clk_sys) begin
 	gba_on <= (~reset);
    pause <= (status[5] & OSD_STATUS & ~status[27]); // pause "pause in osd", but not while rewind capture is on
    if (bram_tx_start & ~bram_tx_finish & ~bk_loading) pause <= 1'b1;
-   cpu_turbo <= ((status[16] & ~fast_forward) | force_turbo) & ~pause;
 end
 
 wire sdram_refresh;
@@ -729,8 +703,13 @@ gba
 	.GBA_on(gba_on),  // switching from off to on = reset
    .pause(pause),
    .inPause(inPause),
-	.GBA_lockspeed(~fast_forward),       // 1 = 100% speed, 0 = max speed
-	.GBA_cputurbo(cpu_turbo),
+	// Both speed controls are vestigial since the accuracy rewrite: the core is
+	// hard-locked to real speed by clk_sys = 16.777216 MHz (one emulated cycle
+	// per clock). GBA_cputurbo dangles inside gba_top; GBA_lockspeed's only
+	// live consumer is gba_sound, where 0 would quarter the output volume.
+	.GBA_lockspeed(1'b1),
+	.GBA_cputurbo(1'b0),
+	.xq_audio_on(status[19]),
 	.GBA_flash_1m(flash_1m),          // 1 when string "FLASH1M_V" is anywhere in gamepak
 	.Underclock(status[42:41]),
    .MaxPakAddr(last_addr[26:2]),     // max byte address that will contain data, required for buggy games that read behind their own memory, e.g. zelda minish cap
@@ -780,7 +759,7 @@ gba
 	.overlay_error_on(status[50]),
 	.overlay_link_on(status[14]),
    .rewind_on(status[27]),
-   .rewind_active(status[27] & joy_unmod[13]),
+   .rewind_active(status[27] & joy_unmod[12]),
    .savestate_number(ss_slot),
 
    .RTC_timestampNew(RTC_time[32]),
@@ -858,7 +837,7 @@ gba
 	.AnalogTiltX(joystick_analog_0[7:0]),
 	.AnalogTiltY(joystick_analog_0[15:8]),
 	.Rumble(cart_rumble),
-   .KeyPause(joy[11]),
+   .KeyPause(joy[10]),
 
    .link_enable     (link_enable     ),
    .link_wireless   (link_wireless   ),
