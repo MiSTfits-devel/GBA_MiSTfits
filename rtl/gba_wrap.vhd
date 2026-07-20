@@ -48,6 +48,7 @@ entity gba_wrap is
       GBA_lockspeed         : in     std_logic;  -- 1 = 100% speed, 0 = max speed
       GBA_cputurbo          : in     std_logic;  -- 1 = cpu free running, all other 16 mhz
       xq_audio_on           : in     std_logic := '0'; -- "XQ Audio" OSD toggle, see gba_sound.vhd's port comment
+      robby_mode            : in     std_logic := '0';
       GBA_flash_1m          : in     std_logic;  -- 1 when string "FLASH1M_V" is anywhere in gamepak
       Underclock            : in     std_logic_vector(1 downto 0);
       MaxPakAddr            : in     std_logic_vector(24 downto 0); -- max byte address that will contain data, required for buggy games that read behind their own memory, e.g. zelda minish cap
@@ -601,6 +602,7 @@ begin
       GBA_lockspeed         => GBA_lockspeed        ,
       GBA_cputurbo          => GBA_cputurbo         ,
       xq_audio_on           => xq_audio_on          ,
+      robby_mode            => robby_mode           ,
       GBA_flash_1m          => GBA_flash_1m         ,
       Underclock            => Underclock           ,
       CyclesMissing         => CyclesMissing        ,
@@ -1013,6 +1015,7 @@ begin
          GBA_lockspeed         => GBA_lockspeed        ,
          GBA_cputurbo          => GBA_cputurbo         ,
          xq_audio_on           => xq_audio_on          ,
+         robby_mode            => robby_mode           ,
          GBA_flash_1m          => GBA_flash_1m         ,
          Underclock            => Underclock           ,
          CyclesMissing         => open                 ,

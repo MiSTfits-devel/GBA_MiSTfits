@@ -31,6 +31,7 @@ architecture sim of tb_soundpwm is
    signal snd_r     : std_logic_vector(15 downto 0);
 
    signal xq_audio_on : std_logic := '0';
+   signal robby_mode  : std_logic := '0';
 
    -- checker control
    signal chk_ena   : std_logic := '0';
@@ -87,6 +88,7 @@ begin
       wired_done        => open,
       lockspeed         => '1',
       xq_audio_on       => xq_audio_on,
+      robby_mode        => robby_mode,
       timer0_tick       => '0',
       timer1_tick       => '0',
       sound_dma_req     => open,
@@ -230,6 +232,15 @@ begin
       cadence_ena <= '0';
       assert chk_seen <= 80 report "phase 4: xq_audio_on='0' should reproduce the original PWM-held behavior, but ch1 changed " & integer'image(chk_seen) & " times -- looks unquantized" severity failure;
       report "phase 4 ok: xq_audio_on='0', ch1 correctly held down to the PWM rate, " & integer'image(chk_seen) & " changes";
+
+      robby_mode  <= '1';
+      wait for 2400 * CLK_PERIOD;
+      chk_ena     <= '1';
+      wait for 150 * CLK_PERIOD;
+      chk_ena     <= '0';
+      assert chk_seen >= 2 report "phase 5: robby_mode='1' only changed " & integer'image(chk_seen) & " times in 150 native cycles (< one 174-cycle resample period) -- looks decimated, not raw native-rate" severity failure;
+      report "phase 5 ok: robby_mode='1', ch1 changed " & integer'image(chk_seen) & " times within a single resample period -- confirmed native-rate, undecimated";
+      robby_mode  <= '0';
 
       report "tb_soundpwm all checks passed";
       done <= true;

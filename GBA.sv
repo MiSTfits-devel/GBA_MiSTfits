@@ -267,6 +267,7 @@ parameter CONF_STR = {
 	"P1-;",
 	"P1O[8:7],Stereo Mix,None,25%,50%,100%;",
 	"P1O[19],XQ Audio,Off,On;",
+	"P1O[64],Robby Mode,Off,On;",
 `ifdef GBA2P_LITE
 	"P1O[49:48],2P Audio,Player 1,Player 2,Mix,Split P1-L P2-R;",
 	"P1O[21:20],2P Display,Both,Player 1,Player 2;",
@@ -352,7 +353,7 @@ parameter CONF_STR = {
 };
 
 wire  [1:0] buttons;
-wire [63:0] status;
+wire [127:0] status;
 wire [15:0] status_menumask = {
 `ifdef GBA2P_LITE
 	(status[46:44] == 3'd2),        // H9: hide Link Debug Overlay when Multiplayer is Off (2P profile: Off = 2)
@@ -710,6 +711,7 @@ gba
 	.GBA_lockspeed(1'b1),
 	.GBA_cputurbo(1'b0),
 	.xq_audio_on(status[19]),
+	.robby_mode(status[64]),
 	.GBA_flash_1m(flash_1m),          // 1 when string "FLASH1M_V" is anywhere in gamepak
 	.Underclock(status[42:41]),
    .MaxPakAddr(last_addr[26:2]),     // max byte address that will contain data, required for buggy games that read behind their own memory, e.g. zelda minish cap

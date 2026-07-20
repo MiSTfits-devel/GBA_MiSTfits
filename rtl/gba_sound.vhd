@@ -43,6 +43,7 @@ entity gba_sound is
       -- PWM rate to sound authentic, but decimating the tonal channels down
       -- to the same rate throws away quality nobody asked to lose.
       xq_audio_on         : in    std_logic := '0';
+      robby_mode          : in    std_logic := '0';
 
       timer0_tick         : in    std_logic;
       timer1_tick         : in    std_logic;
@@ -149,6 +150,9 @@ architecture arch of gba_sound is
    signal soundmix_o7_r     : signed(15 downto 0) := (others => '0');
    signal soundmix_o_clip_l : signed(15 downto 0) := (others => '0');
    signal soundmix_o_clip_r : signed(15 downto 0) := (others => '0');
+
+   signal soundmix_raw_l : signed(17 downto 0);
+   signal soundmix_raw_r : signed(17 downto 0);
 
    signal soundclip_l : unsigned(9 downto 0) := to_unsigned(16#200#, 10);
    signal soundclip_r : unsigned(9 downto 0) := to_unsigned(16#200#, 10);
@@ -646,10 +650,17 @@ begin
       end if;
    end process;
 
-   sound_out_left  <= std_logic_vector(resize(resampled_l * 16, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '1' else
+   soundmix_raw_l <= resize(soundmix_ch4_5_l, 18) + resize(soundmix_o7_l, 18);
+   soundmix_raw_r <= resize(soundmix_ch4_5_r, 18) + resize(soundmix_o7_r, 18);
+
+   sound_out_left  <= std_logic_vector(resize(soundmix_raw_l * 16, 16)) when PSG_FIFO_Master_Enable = "1" and robby_mode = '1' and lockspeed = '1' else
+                      std_logic_vector(resize(soundmix_raw_l * 4, 16))  when PSG_FIFO_Master_Enable = "1" and robby_mode = '1' and lockspeed = '0' else
+                      std_logic_vector(resize(resampled_l * 16, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '1' else
                       std_logic_vector(resize(resampled_l * 4, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '0' else
                       (others => '0');
-   sound_out_right <= std_logic_vector(resize(resampled_r * 16, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '1' else
+   sound_out_right <= std_logic_vector(resize(soundmix_raw_r * 16, 16)) when PSG_FIFO_Master_Enable = "1" and robby_mode = '1' and lockspeed = '1' else
+                      std_logic_vector(resize(soundmix_raw_r * 4, 16))  when PSG_FIFO_Master_Enable = "1" and robby_mode = '1' and lockspeed = '0' else
+                      std_logic_vector(resize(resampled_r * 16, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '1' else
                       std_logic_vector(resize(resampled_r * 4, 16)) when PSG_FIFO_Master_Enable = "1" and lockspeed = '0' else
                       (others => '0');
 
