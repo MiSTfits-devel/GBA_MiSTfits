@@ -13,6 +13,12 @@
 #define RFU_NET_MAX_PEERS 32
 #define RFU_NET_BCAST     -1
 
+// rfu_core addresses every peer by an index in [0, RFU_NET_MAX_PEERS). The top
+// slots are reserved for RetroArch netplay clients so a laptop running gpSP
+// and another MiSTer on UDP can share one room without colliding: UDP peers
+// are allocated from 0 upward and stop below this base.
+#define RFU_NET_NETPLAY_BASE 24
+
 // port, then zero or more "host[:port]" peers to talk to. lan_discovery
 // broadcasts a HELLO on the local segment so two MiSTers find each other
 // with no configuration.

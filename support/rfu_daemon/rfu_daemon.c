@@ -19,6 +19,8 @@
 // Command semantics per docs/agb015_protocol.md.
 #include "rfu_core.h"
 #include "rfu_net.h"
+#include "netplay_host.h"
+#include "netplay_proto.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -150,10 +152,12 @@ static void handle_event(uint8_t ev)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-        "usage: %s [-d /dev/ttyS1] [-p port] [-P host[:port]] [-L] [-v]\n"
+        "usage: %s [-d /dev/ttyS1] [-p port] [-P host[:port]] [-N port] [-L] [-v]\n"
         "  -d  UART device (default /dev/ttyS1)\n"
         "  -p  local UDP port (default %d)\n"
         "  -P  peer to talk to; repeatable. Needed only across the internet.\n"
+        "  -N  also host a RetroArch netplay session on this TCP port, so a\n"
+        "      RetroArch " NETPLAY_TARGET_VERSION " + gpSP client can join the room.\n"
         "  -L  disable LAN discovery (on by default)\n"
         "  -v  log adapter activity to stderr\n",
         argv0, RFU_UDP_PORT);
@@ -164,6 +168,7 @@ int main(int argc, char **argv)
     const char *dev  = "/dev/ttyS1";
     int         port = RFU_UDP_PORT;
     int         lan  = 1;
+    int         np_port = 0;
     const char *peers[16];
     int         npeers = 0;
 
@@ -177,6 +182,7 @@ int main(int argc, char **argv)
                 i++;
         }
         else if (!strcmp(argv[i], "-L")) lan = 0;
+        else if (!strcmp(argv[i], "-N") && i + 1 < argc) np_port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-v")) verbose = 1;
         else { usage(argv[0]); return 2; }
     }
@@ -204,6 +210,17 @@ int main(int argc, char **argv)
     fprintf(stderr, "rfu_daemon: %s <-> udp/%d%s\n",
             dev, port, lan ? " (LAN discovery on)" : "");
 
+    if (np_port > 0) {
+        int bound = netplay_host_open(np_port);
+        if (bound < 0)
+            fprintf(stderr, "rfu_daemon: cannot host netplay on tcp/%d (%d)\n",
+                    np_port, bound);
+        else
+            fprintf(stderr, "rfu_daemon: netplay host on tcp/%d "
+                            "(RetroArch %s + gpSP may join)\n",
+                    bound, NETPLAY_TARGET_VERSION);
+    }
+
     // Single loop over both the UART and the socket. The ~60 Hz housekeeping
     // tick drives session timeouts and, while the clock is reversed, decides
     // when to inject the adapter-initiated notify the GBA is parked waiting
@@ -216,13 +233,26 @@ int main(int argc, char **argv)
     uint32_t next_frame = rfu_now_ms();
 
     for (;;) {
-        struct pollfd fds[2];
+        struct pollfd fds[2 + NETPLAY_HOST_MAX_CLIENTS + 1];
         fds[0].fd = uart;          fds[0].events = POLLIN; fds[0].revents = 0;
         fds[1].fd = rfu_net_fd();  fds[1].events = POLLIN; fds[1].revents = 0;
+        int nfds = 2;
+
+        if (np_port > 0) {
+            int nplist[NETPLAY_HOST_MAX_CLIENTS + 1];
+            int nnp = netplay_host_pollfds(nplist,
+                          (int)(sizeof(nplist) / sizeof(nplist[0])));
+            for (int i = 0; i < nnp; i++) {
+                fds[nfds].fd = nplist[i];
+                fds[nfds].events = POLLIN;
+                fds[nfds].revents = 0;
+                nfds++;
+            }
+        }
 
         int timeout = (int)(int32_t)(next_frame - rfu_now_ms());
         if (timeout < 0) timeout = 0;
-        if (poll(fds, 2, timeout) < 0) {
+        if (poll(fds, nfds, timeout) < 0) {
             if (errno == EINTR) continue;
             perror("poll");
             return 1;
@@ -272,6 +302,9 @@ int main(int argc, char **argv)
 
         if (fds[1].revents & POLLIN)
             rfu_net_poll();
+
+        if (np_port > 0)
+            netplay_host_poll();
 
         if ((int32_t)(rfu_now_ms() - next_frame) >= 0) {
             next_frame += 16;                       // ~60 Hz

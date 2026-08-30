@@ -3,6 +3,7 @@
 #include "rfu_net.h"
 #include "rfu_core.h"
 #include "rfu_proto.h"
+#include "netplay_host.h"
 
 #include <arpa/inet.h>
 #include <netdb.h>
@@ -150,6 +151,20 @@ void rfu_net_add_peer(const char *hostport, int default_port)
 void rfu_net_send(int peer, const void *buf, size_t len)
 {
     int i;
+
+    // Peers at or above the netplay base live on a RetroArch netplay
+    // connection, not on our UDP socket.
+    if (peer >= RFU_NET_NETPLAY_BASE) {
+        netplay_host_send(peer - RFU_NET_NETPLAY_BASE, buf, len);
+        return;
+    }
+
+    if (peer < 0) {
+        // Broadcast reaches both transports: other MiSTers over UDP and every
+        // RetroArch client that has finished its handshake.
+        netplay_host_send(-1, buf, len);
+    }
+
     if (sock < 0)
         return;
     if (peer >= 0) {
