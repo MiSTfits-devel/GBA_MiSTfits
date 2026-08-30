@@ -279,9 +279,9 @@ parameter CONF_STR = {
 	"H6P2O[31:29],Solar Sensor,0%,15%,30%,42%,55%,70%,85%,100%;",
 	"P2-;",
 `ifdef GBA2P_LITE
-	"P2O[46:44],Multiplayer,2P Link (Internal),SNAC Link Port,Off,Wireless (Emulated);",
+	"P2O[46:44],Multiplayer,2P Link (Internal),SNAC Link Port,Off,Wireless (Emulated),Wireless (SNAC/Real);",
 `else
-	"P2O[46:44],Multiplayer,Off,SNAC Link Port,Wireless (Emulated);",
+	"P2O[46:44],Multiplayer,Off,SNAC Link Port,Wireless (Emulated),Wireless (SNAC/Real);",
 `endif
    "P2-;",
 `ifdef GBA2P_LITE
@@ -623,10 +623,18 @@ wire       link_internal    = 1'b0;
 `endif
 `ifdef GBA2P_LITE
 wire       link_wireless    = (multiplayer_mode == 3'd3);
+wire       link_wl_snac     = (multiplayer_mode == 3'd4);
 `else
 wire       link_wireless    = (multiplayer_mode == 3'd2);
+wire       link_wl_snac     = (multiplayer_mode == 3'd3);
 `endif
-wire       link_enable      = link_snac | link_internal | link_wireless;
+// A real AGB-015 dongle on the SNAC port. The core drives the port exactly as
+// in cable mode -- the difference is purely which SIO engine the game runs,
+// and the game picks that itself (the adapter is Normal-32 SPI plus the RCNT
+// GPIO reset ping, both already implemented in gba_serial). So this mode is
+// simply "SNAC pins live, wireless EMULATION held off".
+wire       link_port_live   = link_snac | link_wl_snac;
+wire       link_enable      = link_port_live | link_internal | link_wireless;
 
 wire [6:0] linkport_user_out;
 wire link_clk_out, link_clk_oe, link_clk_in;
@@ -636,7 +644,7 @@ wire link_sd_out,  link_sd_oe,  link_sd_in;
 gba_linkport linkport
 (
 	.clk(clk_sys),
-	.port_enable(link_snac),
+	.port_enable(link_port_live),
 	.user_in(USER_IN),
 	.user_out(linkport_user_out),
 
