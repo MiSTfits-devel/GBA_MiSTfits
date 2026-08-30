@@ -20,6 +20,9 @@ static int sock = -1;
 static int bcast_port;
 static int lan_disc;
 static int hello_ttl;
+// Identifies this instance in its own HELLO so it can ignore the copy the
+// kernel loops back from its own subnet broadcast (see rfu_net_poll).
+static uint32_t self_nonce;
 
 static struct {
     int                used;
@@ -93,6 +96,15 @@ int rfu_net_open(int port, int lan_discovery)
     bcast_port = port;
     lan_disc   = lan_discovery;
     hello_ttl  = HELLO_PERIOD_FR;   // announce ourselves right away
+
+    // Nonce must differ per instance, including two daemons started in the
+    // same second on different machines, so mix the clock with the pid and
+    // the bound port. 0 is reserved as "no nonce" for older peers.
+    self_nonce = (uint32_t)rfu_now_ms()
+               ^ ((uint32_t)getpid() << 16)
+               ^ ((uint32_t)port << 3);
+    if (self_nonce == 0)
+        self_nonce = 0xA5A5A5A5u;
     return 0;
 }
 
@@ -159,7 +171,7 @@ static void send_hello(void)
 
     be_put32(&pkt[0], MRFU_MAGIC);
     be_put32(&pkt[4], MRFU_HELLO);
-    be_put32(&pkt[8], 0);
+    be_put32(&pkt[8], self_nonce);
 
     memset(&to, 0, sizeof(to));
     to.sin_family      = AF_INET;
@@ -188,6 +200,18 @@ void rfu_net_poll(void)
         if (be_get32(buf) == MRFU_MAGIC) {
             // Discovery: learn the sender, and answer once so it learns us
             // too (broadcasts only travel one way through some switches).
+            //
+            // Ignore our own HELLO first. A subnet broadcast is delivered
+            // back to the sending socket, so without this a lone daemon
+            // interns ITSELF as a peer -- and then the game finds a phantom
+            // parent, joins a session with nobody on the other end, and
+            // populates Union Room slots that are backed by no real player.
+            // Comparing addresses is not enough (the source address of our
+            // own broadcast is a local interface we do not necessarily
+            // know), so each instance tags its HELLO with a random nonce.
+            if (n >= MRFU_LEN_HELLO && be_get32(&buf[8]) == self_nonce)
+                continue;
+
             int known = peer_find(&from) >= 0;
             int peer  = peer_intern(&from);
             if (peer >= 0) {
