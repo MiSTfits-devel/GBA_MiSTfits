@@ -624,25 +624,41 @@ begin
          ----------------------------------------------------------------
          -- HPS tx serializer
          ----------------------------------------------------------------
-         hps_tx_valid <= '0';
+         -- Byte-wise valid/ready to gba_wireless_uart.  The UART latches a
+         -- byte on an edge where tx_ready='1' AND tx_valid='1', and drops
+         -- tx_ready to '0' on that same edge; it stays low for the whole
+         -- byte, then returns high once the byte is fully shifted out.
+         -- Producer contract below:
+         --   * a byte is presented by setting valid and keeping data stable;
+         --   * valid is deasserted on the edge where the byte was accepted
+         --     (ready was high), so the UART never re-latches it;
+         --   * state advances only on that same acceptance edge, and the
+         --     next byte is presented only after the UART is idle again.
          case (htx_state) is
             when TXS_IDLE =>
-               if (htx_req = '1' and hps_tx_ready = '1') then
+               if (htx_req = '1' and hps_tx_valid = '0') then
                   htx_req      <= '0';
                   hps_tx_data  <= htx_type;
                   hps_tx_valid <= '1';
+               elsif (hps_tx_valid = '1' and hps_tx_ready = '1') then
+                  -- type byte accepted
+                  hps_tx_valid <= '0';
                   htx_state    <= TXS_B1;
                end if;
             when TXS_B1 =>
-               if (hps_tx_ready = '1') then
+               if (hps_tx_valid = '0' and hps_tx_ready = '1') then
                   hps_tx_data  <= htx_b1;
                   hps_tx_valid <= '1';
+               elsif (hps_tx_valid = '1' and hps_tx_ready = '1') then
+                  hps_tx_valid <= '0';
                   htx_state    <= TXS_B2;
                end if;
             when TXS_B2 =>
-               if (hps_tx_ready = '1') then
+               if (hps_tx_valid = '0' and hps_tx_ready = '1') then
                   hps_tx_data  <= htx_b2;
                   hps_tx_valid <= '1';
+               elsif (hps_tx_valid = '1' and hps_tx_ready = '1') then
+                  hps_tx_valid <= '0';
                   htx_widx     <= (others => '0');
                   htx_bidx     <= 0;
                   if (htx_words = 0) then
@@ -652,9 +668,11 @@ begin
                   end if;
                end if;
             when TXS_WORDS =>
-               if (hps_tx_ready = '1') then
+               if (hps_tx_valid = '0' and hps_tx_ready = '1') then
                   hps_tx_data  <= pktbuf(to_integer(htx_widx))(htx_bidx*8+7 downto htx_bidx*8);
                   hps_tx_valid <= '1';
+               elsif (hps_tx_valid = '1' and hps_tx_ready = '1') then
+                  hps_tx_valid <= '0';
                   if (htx_bidx = 3) then
                      htx_bidx <= 0;
                      if (htx_widx + 1 = htx_words) then
@@ -732,6 +750,7 @@ begin
             bitcnt      <= 0;
             htx_state   <= TXS_IDLE;
             htx_req     <= '0';
+            hps_tx_valid <= '0';
             hrx_state   <= RXS_TYPE;
             ack_pending <= '0';
             ntf_pending <= '0';
