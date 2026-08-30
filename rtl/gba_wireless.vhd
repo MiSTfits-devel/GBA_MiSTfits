@@ -109,13 +109,35 @@ architecture arch of gba_wireless is
    -- ping detect
    signal sd_high_cnt : integer range 0 to 262143 := 0;
 
-   -- login
-   type tKeystream is array(0 to 9) of std_logic_vector(15 downto 0);
-   constant P : tKeystream := (x"494E", x"494E", x"494E", x"544E", x"544E",
-                               x"4E45", x"4E45", x"4F44", x"4F44", x"8001");
-   signal login_j     : integer range 0 to 10 := 0;
-   signal sent_hi      : std_logic_vector(15 downto 0) := x"8000";
-   signal sent_hi_prev : std_logic_vector(15 downto 0) := x"8000";
+   -- login: the adapter runs Nintendo's own complement-echo ID protocol,
+   -- mirrored. This is Sio32IDIntr() (pret/pokeemerald librfu_sio32id.c)
+   -- with MS_mode = AGB_CLK_SLAVE, i.e. the adapter's half of the exchange:
+   --
+   --   slave halves:  received hi = peer's recv_id, received lo = peer's send_id
+   --                  transmitted  hi = our send_id, lo = our recv_id
+   --
+   --   if hi_rx = recv_id then                       -- peer echoed us correctly
+   --      if count < 4 then
+   --         if recv_id = not send_id and lo_rx = not recv_id then count++
+   --      else lastId := lo_rx
+   --   else count := 0                               -- resync
+   --   send_id := count < 4 ? NINTENDO(count) : RFU_ID
+   --   recv_id := not lo_rx                          -- sent NEXT exchange
+   --
+   -- Implementing the ALGORITHM rather than a captured transcript is what
+   -- makes both clients work: librfu advances `count` only on a fully
+   -- matching round, while afska's LinkRawWireless hardcodes the resulting
+   -- wire trace {494E,494E,494E,544E,544E,4E45,4E45,4F44,4F44,8001} -- which
+   -- is exactly this algorithm's output including its retry rounds. A fixed
+   -- table cannot serve librfu: it walks its own script and desynchronises
+   -- permanently the first time librfu advances, livelocking both sides.
+   type tNintendo is array(0 to 3) of std_logic_vector(15 downto 0);
+   constant NINTENDO : tNintendo := (x"494E", x"544E", x"4E45", x"4F44");
+   constant RFU_ID   : std_logic_vector(15 downto 0) := x"8001";
+   signal login_count : integer range 0 to 4 := 0;
+   signal send_id     : std_logic_vector(15 downto 0) := (others => '0');
+   signal recv_id     : std_logic_vector(15 downto 0) := (others => '0');
+   signal login_done  : std_logic := '0';
 
    -- command engine
    signal cmd_id      : std_logic_vector(7 downto 0)  := (others => '0');
@@ -177,7 +199,7 @@ begin
    link_so_oe  <= '1';
 
    debug_state <= std_logic_vector(to_unsigned(tState'pos(state), 4)) &
-                  std_logic_vector(to_unsigned(login_j, 4));
+                  std_logic_vector(to_unsigned(login_count, 4));
 
    process (clk)
       variable rx_now : std_logic_vector(31 downto 0);
@@ -212,8 +234,6 @@ begin
                if (bitcnt = 0) then
                   so_level    <= tx_next(31);
                   tx_shift    <= tx_next(30 downto 0) & '1';
-                  sent_hi_prev <= sent_hi;         -- login validation history
-                  sent_hi      <= tx_next(31 downto 16);
                else
                   so_level <= tx_shift(31);
                   tx_shift <= tx_shift(30 downto 0) & '1';
@@ -250,10 +270,16 @@ begin
             if (sd_high_cnt >= TICKS_1MS / 2) then
                -- hard reset out of power-save
                state       <= LOGIN;
-               login_j     <= 0;
-               sent_hi     <= x"8000";
-               sent_hi_prev<= x"8000";
-               tx_next     <= P(0) & x"0000"; -- ~0xFFFF = 0x0000
+               login_count <= 0;
+               login_done  <= '0';
+               -- The first word we transmit predates any exchange, exactly
+               -- like librfu's stale SIODATA32 before its first ISR runs.
+               -- Seeding send_id with NINTENDO(0) here instead would make us
+               -- accept one round EARLIER than a real dongle, which breaks
+               -- LinkRawWireless (it expects 494E three times, not twice).
+               send_id     <= (others => '0');
+               recv_id     <= (others => '0');
+               tx_next     <= (others => '0');
                bitcnt      <= 0;
                wd_armed    <= '0';
                so_level    <= '0';
@@ -299,32 +325,60 @@ begin
             when LOGIN =>
                if (word_done = '1') then
                   -- synthesis translate_off
-                  report "wireless login: j=" & integer'image(login_j) &
+                  report "wireless login: count=" & integer'image(login_count) &
                          " rx=" & to_hstring(rx_word) &
-                         " sent_hi_prev=" & to_hstring(sent_hi_prev) &
-                         " sent_hi=" & to_hstring(sent_hi) &
-                         " tx_next=" & to_hstring(tx_next);
+                         " send_id=" & to_hstring(send_id) &
+                         " recv_id=" & to_hstring(recv_id);
                   -- synthesis translate_on
-                  -- validate: their low half = P(j), their high half =
-                  -- the complement of the hi half we transmitted in the
-                  -- PREVIOUS exchange (full duplex, spec section 2)
-                  if (rx_word(15 downto 0) = P(login_j) and
-                      rx_word(31 downto 16) = not sent_hi_prev) then
-                     if (login_j = 9) then
-                        state    <= CMD_IDLE;
-                        wd_armed <= '0';
-                        tx_next  <= x"80000000";
-                        htx_req  <= '1';
-                        htx_type <= x"04"; htx_b1 <= x"01"; htx_b2 <= x"00";
-                        htx_words <= (others => '0');
+                  -- Sio32IDIntr(), MS_mode = AGB_CLK_SLAVE, transcribed
+                  -- literally. hi_rx is the peer's complement echo of us,
+                  -- lo_rx is the peer's NINTENDO word. Note send_id/recv_id
+                  -- are recomputed on EVERY exchange (as librfu does), not
+                  -- only when a round is accepted.
+                  if (rx_word(31 downto 16) = recv_id) then
+                     if (login_count < 4) then
+                        if (recv_id = not send_id and
+                            rx_word(15 downto 0) = not recv_id) then
+                           -- round accepted: advance to the next word
+                           login_count <= login_count + 1;
+                           if (login_count + 1 < 4) then
+                              send_id <= NINTENDO(login_count + 1);
+                              tx_next <= NINTENDO(login_count + 1) &
+                                         (not rx_word(15 downto 0));
+                           else
+                              send_id <= RFU_ID;
+                              tx_next <= RFU_ID & (not rx_word(15 downto 0));
+                           end if;
+                        else
+                           -- echo not valid yet: resend the same word
+                           send_id <= NINTENDO(login_count);
+                           tx_next <= NINTENDO(login_count) &
+                                      (not rx_word(15 downto 0));
+                        end if;
                      else
-                        login_j <= login_j + 1;
-                        tx_next <= P(login_j + 1) & (not rx_word(15 downto 0));
+                        -- count = 4: we transmitted RFU_ID this exchange and
+                        -- the peer echoed us correctly, so it has now latched
+                        -- our ID. Login is complete.
+                        send_id <= RFU_ID;
+                        if (login_done = '0') then
+                           login_done <= '1';
+                           state      <= CMD_IDLE;
+                           wd_armed   <= '0';
+                           tx_next    <= x"80000000";
+                           htx_req    <= '1';
+                           htx_type   <= x"04"; htx_b1 <= x"01"; htx_b2 <= x"00";
+                           htx_words  <= (others => '0');
+                        else
+                           tx_next <= RFU_ID & (not rx_word(15 downto 0));
+                        end if;
                      end if;
                   else
-                     login_j <= 0;
-                     tx_next <= P(0) & (not rx_word(15 downto 0));
+                     -- peer's echo does not match what we sent: resync
+                     login_count <= 0;
+                     send_id     <= NINTENDO(0);
+                     tx_next     <= NINTENDO(0) & (not rx_word(15 downto 0));
                   end if;
+                  recv_id <= not rx_word(15 downto 0);
                end if;
                -- no inter-word handshake during login (plain SPI)
 
