@@ -136,6 +136,9 @@ static void handle_event(uint8_t ev)
         break;
     case 0x02:
         rfu_log("event: clock reversed (adapter is master)\n");
+        // Only now is the GBA listening as clock slave, so only now may the
+        // armed wait resolve into an injected notify.
+        rfu_core_wait_reversed();
         break;
     case 0x03:
         rfu_log("event: GBA acked our notify\n");

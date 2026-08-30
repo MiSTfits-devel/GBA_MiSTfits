@@ -128,14 +128,20 @@ int main(void)
 
     int next = rfu_core_wait_next_ms();
     CHECK(next >= 0, "no wait deadline reported while a wait is armed");
-    CHECK(next < 16, "wait deadline %d ms is >= the 16 ms frame tick, so the "
-                     "daemon would sleep past the retransmit window and "
-                     "report 'no child answered' before the reply lands", next);
-    printf("wait_next_ms = %d (must be < 16)\n", next);
+    // With a live peer we intentionally hold out for the full timeout rather
+    // than the ~11 ms retransmit window: that window models a local radio, but
+    // our peer is a TCP round trip away. (An earlier version of this test
+    // asserted next < 16 and drove exactly the regression that killed trades
+    // on their first exchange.)
+    CHECK(next > 100,
+          "wait deadline %d ms is short enough to fire the retransmit path "
+          "while a live peer's reply is still in flight", next);
+    printf("wait_next_ms = %d (live peer: full timeout)\n", next);
 
     // ---- 2. a reply inside the window counts as DATA, not silence ----
     // The GBA parks as slave; the child's answer arrives 5 ms later, well
     // inside the ~11 ms retransmit window.
+    rfu_core_wait_reversed();
     fake_ms += 5;
     uint8_t payload[16] = { 0xDE, 0xAD, 0xBE, 0xEF };
     child_sends(peer, net_assigned_slot, devid, payload, 8);
@@ -152,12 +158,21 @@ int main(void)
 
     // ---- 3. genuine silence must still report 'no child answered' ----
     // Guards against "fixing" the bug by never reporting the timeout at all.
-    // Drain the queued packet first via 0x26 (DataRx), otherwise data_avail()
-    // legitimately fires on the frame we just delivered.
+    // "Silence" now means the peer is genuinely GONE, not merely slow: the
+    // child disconnects, so there is nobody left who could answer.
     uint32_t drain[64];
     rfu_core_command(0x26, 0, params, drain);
 
+    uint8_t dis[RFU1_LEN_CMD];
+    memset(dis, 0, sizeof(dis));
+    be_put32(dis + 0, RFU1_MAGIC);
+    be_put32(dis + 4, RFU1_DISCONNECT);
+    be_put32(dis + 8, devid | ((uint32_t)net_assigned_slot << 16));
+    rfu_core_net_receive(peer, dis, sizeof(dis));
+    CHECK(!rfu_core_peer_live(), "peer still reported live after DISCONNECT");
+
     rfu_core_wait_begin();
+    rfu_core_wait_reversed();
     fake_ms += 200;                       // far past every deadline
     cmd = 0; nparams = 0;
     params[0] = 0;
@@ -167,12 +182,66 @@ int main(void)
     CHECK(nparams == 1 && params[0] == 0x0F0F,
           "expected the 0x0F0F 'no child answered' notify on real silence "
           "(nparams=%u params[0]=0x%08X)", nparams, params[0]);
-    printf("silence -> cmd=0x%02X nparams=%u params[0]=0x%08X\n",
+    printf("silence (peer gone) -> cmd=0x%02X nparams=%u params[0]=0x%08X\n",
            cmd, nparams, nparams ? params[0] : 0);
 
     // ---- 4. with no wait armed there is no deadline to honour ----
     CHECK(rfu_core_wait_next_ms() < 0,
           "reported a deadline with no wait armed");
+
+    // Re-attach a child for the remaining latency tests.
+    devid = setup_host_with_child(peer);
+
+    // ---- 5. a LAN round trip must not read as "no child answered" ----
+    // This is the real-hardware failure. The retransmit window is ~11 ms, but
+    // a MiSTer<->laptop reply realistically lands tens of milliseconds later.
+    // A real adapter cannot distinguish slow from absent; we can, because the
+    // peer is connected and was heard from moments ago. Reporting 0x0F0F here
+    // makes Emerald abandon the trade on its FIRST exchange.
+    rfu_core_command(0x26, 0, params, drain);      // drain
+    rfu_core_wait_begin();
+    rfu_core_wait_reversed();
+
+    fake_ms += 40;                                 // past rtx (11 ms), not the
+                                                   // ~533 ms overall deadline
+    cmd = 0; nparams = 0; params[0] = 0;
+    got = rfu_core_wait_poll(&cmd, &nparams, params);
+    CHECK(!(got == 1 && nparams == 1 && params[0] == 0x0F0F),
+          "reported 0x0F0F 'no child answered' %u ms into the wait while the "
+          "peer was still connected -- this is the trade-killing regression",
+          40u);
+    if (got == 0)
+        printf("40ms into wait, peer live -> still waiting (correct)\n");
+
+    // and when the reply finally lands, it must read as data
+    child_sends(peer, net_assigned_slot, devid, payload, 8);
+    cmd = 0; nparams = 0;
+    got = rfu_core_wait_poll(&cmd, &nparams, params);
+    CHECK(got == 1 && cmd == 0x28 && nparams == 0,
+          "late-but-valid reply not reported as data (got=%d cmd=0x%02X "
+          "nparams=%u)", got, cmd, nparams);
+    printf("late reply -> cmd=0x%02X nparams=%u\n", cmd, nparams);
+
+    // ---- 6. the wait must not resolve before the clock actually reverses ----
+    // wait_begin() runs at ACK time, but the GBA only becomes clock slave when
+    // the FPGA reports the reversal. Resolving in between injects a notify
+    // into a GBA that is not listening yet.
+    rfu_core_command(0x26, 0, params, drain);      // drain
+    rfu_core_wait_begin();                         // armed, NOT yet reversed
+    child_sends(peer, net_assigned_slot, devid, payload, 8);
+    cmd = 0; nparams = 0;
+    got = rfu_core_wait_poll(&cmd, &nparams, params);
+    CHECK(got == 0,
+          "wait resolved before the clock reversed (cmd=0x%02X) -- the notify "
+          "would be injected while the GBA is still master", cmd);
+    printf("pre-reversal poll -> held (correct)\n");
+
+    rfu_core_wait_reversed();
+    got = rfu_core_wait_poll(&cmd, &nparams, params);
+    CHECK(got == 1 && cmd == 0x28,
+          "wait did not resolve once the reversal landed (got=%d cmd=0x%02X)",
+          got, cmd);
+    printf("post-reversal poll -> cmd=0x%02X\n", cmd);
 
     if (failures) {
         printf("\n%d CHECK(s) FAILED\n", failures);

@@ -52,6 +52,7 @@ static struct {
 static struct { uint32_t words[23]; uint8_t blen; } txbuf;
 
 static int      wait_armed;
+static int      wait_reversed;   // GBA has actually handed us the clock
 static uint32_t wait_deadline, rtx_deadline;
 
 static const char *state_names[] = { "IDLE", "HOST", "HOST-OPEN",
@@ -119,6 +120,7 @@ static void session_clear(void)
     memset(&txbuf, 0, sizeof(txbuf));
     state      = RFU_ST_IDLE;
     wait_armed = 0;
+    wait_reversed = 0;
 }
 
 void rfu_core_init(void)
@@ -461,8 +463,29 @@ void rfu_core_wait_begin(void)
     uint32_t now = rfu_now_ms();
     uint8_t  tmo = cfg_timeout ? cfg_timeout : DEF_TIMEOUT_FR;
     wait_armed    = 1;
+    wait_reversed = 0;
     wait_deadline = now + FRAMES_TO_MS(tmo);
     rtx_deadline  = now + FRAMES_TO_MS(cfg_rtxmax ? cfg_rtxmax : DEF_RTXMAX) / 6;
+}
+
+void rfu_core_wait_reversed(void)
+{
+    wait_reversed = 1;
+}
+
+int rfu_core_peer_live(void)
+{
+    int i;
+
+    if (is_host()) {
+        for (i = 0; i < MAX_CLIENTS; i++)
+            if (host.clients[i].devid && host.clients[i].ttl < CLIENT_TTL_FR)
+                return 1;
+        return 0;
+    }
+    if (state == RFU_ST_CLIENT)
+        return 1;
+    return 0;
 }
 
 int rfu_core_wait_next_ms(void)
@@ -473,12 +496,12 @@ int rfu_core_wait_next_ms(void)
     if (!wait_armed)
         return -1;
 
-    // Whichever deadline lands first decides when we must look again. The
-    // retransmit window is the short one (~11 ms at the defaults), and it is
-    // shorter than a frame tick, so the caller has to honour this rather than
-    // sleeping a fixed 16 ms.
     b = (int32_t)(wait_deadline - now);
-    if (is_host()) {
+    // The retransmit window only matters when we would actually act on it,
+    // i.e. when there is no live peer to keep waiting for. With a peer
+    // attached we hold out for the real deadline instead, so waking early
+    // would just burn CPU.
+    if (is_host() && !rfu_core_peer_live()) {
         a = (int32_t)(rtx_deadline - now);
         if (a < b) b = a;
     }
@@ -493,13 +516,28 @@ int rfu_core_wait_poll(uint8_t *cmd, uint8_t *nparams, uint32_t *params)
     if (!wait_armed)
         return 0;
 
+    // The GBA only listens once it has handed us the clock. gpSP guards this
+    // same edge; resolving earlier injects a notify into a GBA that is still
+    // master, which showed up in traces as the inject preceding the reversal.
+    if (!wait_reversed)
+        return 0;
+
     if (state == RFU_ST_IDLE) {
         // Nobody left to talk to: report the connection loss.
         *cmd = 0x29; *nparams = 1; params[0] = 0x0F;
     } else if (data_avail()) {
         *cmd = 0x28; *nparams = 0;
-    } else if (is_host() && (int32_t)(now - rtx_deadline) >= 0) {
-        // The retransmission window elapsed: send verified, no child answered.
+    } else if (is_host() && (int32_t)(now - rtx_deadline) >= 0 &&
+               !rfu_core_peer_live()) {
+        // The retransmit window elapsed and no peer is attached: this is the
+        // genuine "sent, nobody answered" case a real adapter reports.
+        //
+        // We deliberately do NOT report this merely because the window shut.
+        // That window (~11 ms) models a local radio's retransmit budget, but
+        // our peer is reached over TCP, where a reply routinely takes longer.
+        // Claiming "no child answered" about a peer we know is connected made
+        // Emerald abandon trades on their first exchange; we hold out for the
+        // real timeout instead, and let a late-but-valid reply count as data.
         *cmd = 0x28; *nparams = 1; params[0] = 0x00000F0F;
     } else if ((int32_t)(now - wait_deadline) >= 0) {
         *cmd = 0x27; *nparams = 0;   // MasterChangeTimer expiry
@@ -507,7 +545,8 @@ int rfu_core_wait_poll(uint8_t *cmd, uint8_t *nparams, uint32_t *params)
         return 0;
     }
 
-    wait_armed = 0;
+    wait_armed    = 0;
+    wait_reversed = 0;
     return 1;
 }
 
@@ -600,7 +639,15 @@ void rfu_core_net_receive(int peer, const void *buf, size_t len)
                 client.pkts[i].len = blen;
                 return;
             }
-        rfu_log("dropped a host frame (queue full)\n");
+        // Queue full. Drop the OLDEST frame, not this one: a trade only makes
+        // progress on current state, so serving stale frames while discarding
+        // fresh ones wedges it. Traces showed ~13 frames dropped per frame
+        // delivered, with the game reading data that was already obsolete.
+        rfu_log("host frame queue full; dropping oldest\n");
+        memmove(&client.pkts[0], &client.pkts[1],
+                (MAX_PKTS - 1) * sizeof(client.pkts[0]));
+        memcpy(client.pkts[MAX_PKTS - 1].data, &b[12], blen);
+        client.pkts[MAX_PKTS - 1].len = blen;
         break; }
 
     case RFU1_CLIENT_SEND: {
@@ -617,7 +664,12 @@ void rfu_core_net_receive(int peer, const void *buf, size_t len)
                 host.clients[slot].pkts[i].len = blen;
                 return;
             }
-        rfu_log("dropped a child frame (queue full)\n");
+        // Same reasoning as HOST_SEND: keep the freshest frame.
+        rfu_log("child frame queue full; dropping oldest\n");
+        memmove(&host.clients[slot].pkts[0], &host.clients[slot].pkts[1],
+                (MAX_PKTS - 1) * sizeof(host.clients[slot].pkts[0]));
+        memcpy(host.clients[slot].pkts[MAX_PKTS - 1].data, &b[12], blen);
+        host.clients[slot].pkts[MAX_PKTS - 1].len = blen;
         break; }
 
     case RFU1_CLIENT_ACK: {

@@ -37,7 +37,20 @@ void rfu_core_net_receive(int peer, const void *buf, size_t len);
 // Clock-reversal wait: armed when the GBA issues 0x25/0x27/0x37, then polled
 // until it yields the adapter-initiated command to inject.
 void rfu_core_wait_begin(void);
+
+// The FPGA reports that the GBA has actually handed us the clock. gpSP guards
+// the same edge ("Wait for GBA to go into slave mode before finishing the
+// wait!"): until this lands, resolving the wait would inject a notify the GBA
+// is not yet listening for.
+void rfu_core_wait_reversed(void);
+
 int  rfu_core_wait_poll(uint8_t *cmd, uint8_t *nparams, uint32_t *params);
+
+// True while a netplay/LAN peer is attached and has been heard from recently.
+// A real adapter cannot tell "slow" from "absent", but we can: claiming
+// "no child answered" about a peer we know is present ends trades that were
+// merely waiting on a network round trip.
+int  rfu_core_peer_live(void);
 
 // Milliseconds until the reversal wait needs a decision, or -1 when no wait is
 // armed. The daemon must not sleep past this: the retransmit window is ~11 ms,

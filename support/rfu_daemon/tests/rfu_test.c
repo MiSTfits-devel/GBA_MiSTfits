@@ -123,6 +123,9 @@ static void test_unit(void)
     // Reversal with nobody connected: the wait must always terminate, and
     // from N the adapter reports the connection loss.
     rfu_core_wait_begin();
+    // The FPGA signals event 0x02 once the GBA is actually clock slave; the
+    // wait deliberately does not resolve before that.
+    rfu_core_wait_reversed();
     {
         uint8_t wc = 0, wn = 0;
         uint32_t wp[RFU_MAX_WORDS];
