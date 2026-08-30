@@ -35,12 +35,18 @@ tests/rfu_test: tests/rfu_test.c rfu_core.c rfu_net.c netplay_host.c $(HDRS)
 tests/netplay_host_test: tests/netplay_host_test.c netplay_host.c rfu_core.c rfu_net.c $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ tests/netplay_host_test.c netplay_host.c rfu_core.c rfu_net.c
 
-check: tests/rfu_test tests/netplay_host_test
+# trade-window regression: stubs the transport, so it links rfu_core alone
+tests/trade_window_test: tests/trade_window_test.c rfu_core.c $(HDRS)
+	$(CC) $(CFLAGS) -I. -o $@ tests/trade_window_test.c rfu_core.c
+
+check: tests/rfu_test tests/netplay_host_test tests/trade_window_test
 	@tests/run_tests.sh
 	@echo "== netplay host wire oracle =="
 	@tests/netplay_host_test
+	@echo "== trade window regression =="
+	@tests/trade_window_test
 
 clean:
-	rm -f rfu_daemon rfu_daemon.arm $(OBJS) tests/rfu_test tests/netplay_host_test
+	rm -f rfu_daemon rfu_daemon.arm $(OBJS) tests/rfu_test tests/netplay_host_test tests/trade_window_test
 
 .PHONY: all mister check clean

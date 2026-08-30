@@ -465,6 +465,27 @@ void rfu_core_wait_begin(void)
     rtx_deadline  = now + FRAMES_TO_MS(cfg_rtxmax ? cfg_rtxmax : DEF_RTXMAX) / 6;
 }
 
+int rfu_core_wait_next_ms(void)
+{
+    uint32_t now = rfu_now_ms();
+    int32_t  a, b;
+
+    if (!wait_armed)
+        return -1;
+
+    // Whichever deadline lands first decides when we must look again. The
+    // retransmit window is the short one (~11 ms at the defaults), and it is
+    // shorter than a frame tick, so the caller has to honour this rather than
+    // sleeping a fixed 16 ms.
+    b = (int32_t)(wait_deadline - now);
+    if (is_host()) {
+        a = (int32_t)(rtx_deadline - now);
+        if (a < b) b = a;
+    }
+    if (b < 0) b = 0;
+    return (int)b;
+}
+
 int rfu_core_wait_poll(uint8_t *cmd, uint8_t *nparams, uint32_t *params)
 {
     uint32_t now = rfu_now_ms();

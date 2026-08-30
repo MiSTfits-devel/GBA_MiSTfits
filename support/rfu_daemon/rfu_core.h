@@ -39,6 +39,12 @@ void rfu_core_net_receive(int peer, const void *buf, size_t len);
 void rfu_core_wait_begin(void);
 int  rfu_core_wait_poll(uint8_t *cmd, uint8_t *nparams, uint32_t *params);
 
+// Milliseconds until the reversal wait needs a decision, or -1 when no wait is
+// armed. The daemon must not sleep past this: the retransmit window is ~11 ms,
+// shorter than a 16 ms frame tick, so polling only on the tick makes us report
+// "no child answered" while the peer's reply is still in flight.
+int  rfu_core_wait_next_ms(void);
+
 int  rfu_core_state(void);
 const char *rfu_core_state_name(void);
 

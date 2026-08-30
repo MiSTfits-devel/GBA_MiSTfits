@@ -252,6 +252,17 @@ int main(int argc, char **argv)
 
         int timeout = (int)(int32_t)(next_frame - rfu_now_ms());
         if (timeout < 0) timeout = 0;
+
+        // A reversal wait has its own, much shorter deadline: the retransmit
+        // window is ~11 ms against a 16 ms frame tick. Sleeping the full tick
+        // makes us decide the wait only after that window shut, so a peer's
+        // reply that genuinely arrived in time gets reported to the GBA as
+        // "no child answered" -- which ends a Pokemon trade in
+        // "Communication error". Never sleep past the nearer deadline.
+        int wait_ms = rfu_core_wait_next_ms();
+        if (wait_ms >= 0 && wait_ms < timeout)
+            timeout = wait_ms;
+
         if (poll(fds, nfds, timeout) < 0) {
             if (errno == EINTR) continue;
             perror("poll");
@@ -312,9 +323,13 @@ int main(int argc, char **argv)
                 next_frame = rfu_now_ms();          // fell behind; resync
             rfu_core_frame();
             rfu_net_tick();
+        }
 
-            // While the GBA is parked as clock slave, ship it the notify as
-            // soon as the core produces one.
+        // Evaluated EVERY iteration, not just on the frame tick: the wait's
+        // retransmit window is shorter than a tick, and gpSP likewise force-
+        // polls the network inside its wait ("otherwise we need to wait a
+        // full frame!"). Checking this only at 60 Hz loses trades.
+        {
             uint8_t  cmd = 0, nparams = 0;
             uint32_t params[RFU_MAX_WORDS];
             if (rfu_core_wait_poll(&cmd, &nparams, params)) {
