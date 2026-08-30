@@ -52,6 +52,7 @@ enum client_state {
 struct client {
     int      fd;
     int      state;
+    uint32_t protocol;   // negotiated netplay protocol version
     char     nick[NETPLAY_NICK_LEN + 1];
     uint8_t  rx[RXBUF_MAX];
     size_t   rxlen;
@@ -104,14 +105,33 @@ static void drop_client(struct client *c)
 
 // ---- handshake pieces ----
 
-static int send_header(struct client *c)
+// Protocol negotiation, mirroring RetroArch's select_protocol().
+//
+// HACK ALERT, quoting netplay_frontend.c: for backwards compatibility a
+// client sends its HIGHEST supported protocol in the otherwise-unused salt
+// field (header[3]) and its LOWEST in header[4]. A server picks the best
+// mutually supported version and echoes THAT back in its own header[4].
+// Getting this wrong makes RetroArch abort with "Failed to initialize
+// netplay" before a single command is exchanged.
+static uint32_t select_protocol(uint32_t lo_protocol, uint32_t hi_protocol)
+{
+    if (!hi_protocol)
+        return lo_protocol;                     // older client, no high field
+    if (hi_protocol > HIGH_NETPLAY_PROTOCOL_VERSION)
+        return HIGH_NETPLAY_PROTOCOL_VERSION;   // cap at what we implement
+    return hi_protocol;
+}
+
+static int send_header(struct client *c, uint32_t protocol)
 {
     uint32_t hdr[6];
     hdr[0] = htonl(NETPLAY_MAGIC);
     hdr[1] = htonl(NETPLAY_PLATFORM_MAGIC_LE);
     hdr[2] = htonl(NETPLAY_COMPRESSION_SUPPORTED);
-    hdr[3] = htonl(0);   // no password: salt unused
-    hdr[4] = htonl(HIGH_NETPLAY_PROTOCOL_VERSION);
+    // Server side this field is the password salt. 0 = no password, which
+    // tells the client to go straight to NICK instead of prompting.
+    hdr[3] = htonl(0);
+    hdr[4] = htonl(protocol);
     hdr[5] = htonl(nph_impl_magic(NETPLAY_TARGET_VERSION,
                                   HIGH_NETPLAY_PROTOCOL_VERSION));
     return send_all(c->fd, hdr, sizeof(hdr));
@@ -191,19 +211,37 @@ static int consume(struct client *c, int peer)
             if (c->rxlen < 24) return 0;
             uint32_t magic = nph_get32(c->rx);
             if (magic != NETPLAY_MAGIC) return -1;
+
+            // header[3] carries the client's HIGH protocol (the "salt hack"),
+            // header[4] its LOW. Pick the best both sides can speak.
+            uint32_t cli_hi = nph_get32(c->rx + 12);
+            uint32_t cli_lo = nph_get32(c->rx + 16);
+            uint32_t proto  = select_protocol(cli_lo, cli_hi);
+            if (proto < LOW_NETPLAY_PROTOCOL_VERSION ||
+                proto > HIGH_NETPLAY_PROTOCOL_VERSION) {
+                fprintf(stderr, "netplay: client protocol %u..%u "
+                        "outside our %d..%d\n", cli_lo, cli_hi,
+                        LOW_NETPLAY_PROTOCOL_VERSION,
+                        HIGH_NETPLAY_PROTOCOL_VERSION);
+                return -1;
+            }
+            c->protocol = proto;
+
+            // A differing impl magic is only a warning in RetroArch (it
+            // shows "different versions" and continues), so do not refuse.
             uint32_t their_impl = nph_get32(c->rx + 20);
             uint32_t our_impl   = nph_impl_magic(NETPLAY_TARGET_VERSION,
                                                  HIGH_NETPLAY_PROTOCOL_VERSION);
-            if (their_impl != our_impl) {
-                fprintf(stderr,
-                    "netplay: client impl magic 0x%08X != ours 0x%08X "
-                    "(RetroArch version mismatch)\n", their_impl, our_impl);
-                return -1;
-            }
+            if (their_impl != our_impl)
+                fprintf(stderr, "netplay: client impl magic 0x%08X != ours "
+                        "0x%08X (different RetroArch build; continuing)\n",
+                        their_impl, our_impl);
+
             memmove(c->rx, c->rx + 24, c->rxlen - 24);
             c->rxlen -= 24;
             c->state = CS_NICK;
-            if (send_header(c) < 0) return -1;
+            // Only now do we answer, echoing the negotiated protocol.
+            if (send_header(c, proto) < 0) return -1;
             continue;
         }
 

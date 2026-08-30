@@ -68,24 +68,30 @@ int main(int argc, char **argv)
     uint32_t impl = nph_impl_magic(NETPLAY_TARGET_VERSION,
                                    HIGH_NETPLAY_PROTOCOL_VERSION);
 
-    // 1. connection header
+    // 1. connection header. Mirror RetroArch's client exactly: HIGH protocol
+    // goes in the salt field, LOW in header[4] (the "HACK ALERT" in
+    // netplay_frontend.c). The server negotiates from these two.
     uint32_t hdr[6];
     hdr[0] = htonl(NETPLAY_MAGIC);
     hdr[1] = htonl(NETPLAY_PLATFORM_MAGIC_LE);
     hdr[2] = htonl(NETPLAY_COMPRESSION_SUPPORTED);
-    hdr[3] = htonl(0);
-    hdr[4] = htonl(HIGH_NETPLAY_PROTOCOL_VERSION);
+    hdr[3] = htonl(HIGH_NETPLAY_PROTOCOL_VERSION);
+    hdr[4] = htonl(LOW_NETPLAY_PROTOCOL_VERSION);
     hdr[5] = htonl(impl);
     CHECK(xwrite(fd, hdr, sizeof(hdr)) == 0, "send header");
 
     uint32_t r[6];
     CHECK(xread(fd, r, sizeof(r)) == 0, "no header from host");
     CHECK(ntohl(r[0]) == NETPLAY_MAGIC, "magic 0x%08X", ntohl(r[0]));
-    CHECK(ntohl(r[4]) == HIGH_NETPLAY_PROTOCOL_VERSION,
-          "protocol %u", ntohl(r[4]));
-    CHECK(ntohl(r[5]) == impl, "impl magic 0x%08X want 0x%08X (would refuse)",
-          ntohl(r[5]), impl);
-    printf("header ok (protocol=%u impl=0x%08X)\n", ntohl(r[4]), ntohl(r[5]));
+    uint32_t neg = ntohl(r[4]);
+    CHECK(neg >= LOW_NETPLAY_PROTOCOL_VERSION &&
+          neg <= HIGH_NETPLAY_PROTOCOL_VERSION,
+          "negotiated protocol %u outside %d..%d -> client would abort",
+          neg, LOW_NETPLAY_PROTOCOL_VERSION, HIGH_NETPLAY_PROTOCOL_VERSION);
+    if (ntohl(r[5]) != impl)
+        printf("note: impl magic 0x%08X != ours 0x%08X (warning only)\n",
+               ntohl(r[5]), impl);
+    printf("header ok (protocol=%u impl=0x%08X)\n", neg, ntohl(r[5]));
 
     // 2. NICK
     struct { uint32_t cmd[2]; char nick[NETPLAY_NICK_LEN]; } nk;

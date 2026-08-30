@@ -102,13 +102,16 @@ int main(void)
     pump(5);
 
     // ---- 1. connection header, 6 words, network order ----
-    // RetroArch sends its header immediately on connect and expects ours.
+    // RetroArch's client sends its HIGHEST supported protocol in the salt
+    // field (header[3]) and its LOWEST in header[4] -- see the "HACK ALERT"
+    // in netplay_frontend.c. A host that ignores this and answers with a
+    // fixed version makes RetroArch abort with "Failed to initialize netplay".
     uint32_t hdr[6];
     hdr[0] = htonl(NETPLAY_MAGIC);
     hdr[1] = htonl(NETPLAY_PLATFORM_MAGIC_LE);
     hdr[2] = htonl(NETPLAY_COMPRESSION_SUPPORTED);
-    hdr[3] = htonl(0);  // no password configured
-    hdr[4] = htonl(HIGH_NETPLAY_PROTOCOL_VERSION);
+    hdr[3] = htonl(HIGH_NETPLAY_PROTOCOL_VERSION);  // salt hack: our high
+    hdr[4] = htonl(LOW_NETPLAY_PROTOCOL_VERSION);   // our low
     hdr[5] = htonl(nph_impl_magic(NETPLAY_TARGET_VERSION,
                                   HIGH_NETPLAY_PROTOCOL_VERSION));
     CHECK(xwrite(cfd, hdr, sizeof(hdr)) == 0, "send client header");
@@ -121,13 +124,24 @@ int main(void)
     CHECK(ntohl(rhdr[1]) == NETPLAY_PLATFORM_MAGIC_LE,
           "platform magic: got 0x%08X want 0x%08X",
           ntohl(rhdr[1]), NETPLAY_PLATFORM_MAGIC_LE);
-    // A real client REJECTS the host if impl magic differs from its own.
+    // The client rejects the host outright unless the negotiated protocol
+    // sits inside its supported window.
+    uint32_t neg = ntohl(rhdr[4]);
+    CHECK(neg >= LOW_NETPLAY_PROTOCOL_VERSION &&
+          neg <= HIGH_NETPLAY_PROTOCOL_VERSION,
+          "negotiated protocol %u outside %d..%d -> RetroArch would abort "
+          "with 'Failed to initialize netplay'",
+          neg, LOW_NETPLAY_PROTOCOL_VERSION, HIGH_NETPLAY_PROTOCOL_VERSION);
+    // We advertised 5..7, so a correct host picks 7.
+    CHECK(neg == HIGH_NETPLAY_PROTOCOL_VERSION,
+          "expected host to negotiate %d, got %u",
+          HIGH_NETPLAY_PROTOCOL_VERSION, neg);
     uint32_t want_impl = nph_impl_magic(NETPLAY_TARGET_VERSION,
                                         HIGH_NETPLAY_PROTOCOL_VERSION);
     CHECK(ntohl(rhdr[5]) == want_impl,
-          "impl magic: got 0x%08X want 0x%08X (RetroArch would refuse)",
+          "impl magic: got 0x%08X want 0x%08X",
           ntohl(rhdr[5]), want_impl);
-    printf("header ok (impl_magic=0x%08X)\n", want_impl);
+    printf("header ok (protocol=%u impl_magic=0x%08X)\n", neg, want_impl);
 
     // ---- 2. NICK exchange ----
     struct { uint32_t cmd[2]; char nick[NETPLAY_NICK_LEN]; } nick;
