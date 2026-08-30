@@ -5,8 +5,9 @@
 // emulation. The FPGA (rtl/gba_wireless.vhd) implements the link-port
 // transport (login, STWI framing, handshakes, clock reversal) and
 // forwards every command packet here over the framework UART; this
-// daemon owns the RFU state machine -- the same split gpSP uses between
-// its SPI transport and rfu.c.
+// front end owns only the UART and the event loop. All adapter
+// semantics live in rfu_core.c and the radio in rfu_net.c -- the same
+// split gpSP uses between its SPI transport and rfu.c.
 //
 // UART framing (see gba_wireless.vhd header):
 //   0x01 CC LL <LL words LE>  <- FPGA: REQ from the GBA
@@ -15,217 +16,278 @@
 //   0x04 EV 00                <- FPGA: event (0 ping, 1 login, 2 reversal
 //                                entered, 3 GBA acked notify, 4 watchdog)
 //
-// Command semantics per docs/agb015_protocol.md. Networking (gpSP RFU1
-// rooms over RetroArch netpacket / LAN TCP) plugs into net_* below --
-// until that lands, this behaves like an adapter with no one else on
-// the air: games boot their wireless menus, host, and scan cleanly.
-#include <stdio.h>
-#include <stdint.h>
-#include <string.h>
-#include <stdlib.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <termios.h>
+// Command semantics per docs/agb015_protocol.md.
+#include "rfu_core.h"
+#include "rfu_net.h"
 
-#define MAXW 32
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
 
 #ifndef B921600           // absent on non-Linux dev hosts; target is Linux
 #define B921600 B115200
 #endif
 
-typedef enum { ST_N, ST_P, ST_PSC, ST_CSP, ST_CCP, ST_C } rfu_state_t;
+#define RFU_UDP_PORT 55440
 
-static int uart = -1;
-static rfu_state_t st = ST_N;
-static uint16_t own_id = 0;
-static uint8_t  avail_slots = 4, max_mframe = 4, mc_timer = 32;
-static uint8_t  broadcast[24];
-static int      reversed = 0;          // FPGA reported clock reversal
-static int      wait_pending = 0;      // GBA parked in 0x27/0x25 wait
+static int uart    = -1;
+static int verbose = 0;
 
-// --- networking hooks (RFU1 rooms; TODO: RetroArch netpacket client) ---
-static void net_host_start(const uint8_t bc[24]) { (void)bc; }
-static void net_host_stop(void) {}
-static int  net_scan(uint8_t out[4][28])         { (void)out; return 0; }
-static int  net_connect(uint16_t pid)            { (void)pid; return -1; }
-static void net_send(const uint32_t *w, int n)   { (void)w; (void)n; }
-static int  net_recv(uint32_t *w)                { (void)w; return 0; }
+// --- hooks required by rfu_core.h ----------------------------------------
 
-static void put_pkt(uint8_t type, uint8_t b1, uint8_t nwords, const uint32_t *w)
+uint32_t rfu_now_ms(void)
 {
-    uint8_t buf[3 + 4 * MAXW];
-    buf[0] = type; buf[1] = b1; buf[2] = nwords;
-    for (int i = 0; i < nwords; i++) {
-        buf[3+4*i+0] = w[i] & 0xff;        buf[3+4*i+1] = (w[i] >> 8) & 0xff;
-        buf[3+4*i+2] = (w[i] >> 16) & 0xff; buf[3+4*i+3] = (w[i] >> 24) & 0xff;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
+}
+
+void rfu_log(const char *fmt, ...)
+{
+    va_list ap;
+    if (!verbose)
+        return;
+    va_start(ap, fmt);
+    fprintf(stderr, "rfu: ");
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+// --- UART ----------------------------------------------------------------
+
+static int uart_write_all(const uint8_t *b, size_t n)
+{
+    while (n) {
+        ssize_t w = write(uart, b, n);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            perror("uart write");
+            return -1;
+        }
+        b += w;
+        n -= (size_t)w;
     }
-    if (write(uart, buf, 3 + 4 * nwords) < 0) perror("uart write");
+    return 0;
 }
-static void ack(uint8_t cmd, uint8_t nwords, const uint32_t *w)
+
+// 0x02 ACK / 0x03 adapter-initiated command, payload little endian
+static int send_packet(uint8_t type, uint8_t cc, uint8_t nwords, const uint32_t *w)
 {
-    put_pkt(0x02, cmd | 0x80, nwords, w);
-}
-static void reject(uint8_t reason)
-{
-    uint32_t w = reason;
-    put_pkt(0x02, 0xEE, 1, &w);
+    uint8_t buf[3 + 4 * RFU_MAX_WORDS];
+    size_t  n = 0;
+
+    if (nwords > RFU_MAX_WORDS)
+        return -1;
+    buf[n++] = type;
+    buf[n++] = cc;
+    buf[n++] = nwords;
+    for (int i = 0; i < nwords; i++) {
+        buf[n++] = (uint8_t)(w[i]);
+        buf[n++] = (uint8_t)(w[i] >> 8);
+        buf[n++] = (uint8_t)(w[i] >> 16);
+        buf[n++] = (uint8_t)(w[i] >> 24);
+    }
+    return uart_write_all(buf, n);
 }
 
 static void handle_req(uint8_t cmd, uint8_t len, const uint32_t *p)
 {
-    uint32_t r[MAXW];
-    switch (cmd) {
-    case 0x10: // Reset/hello
-        st = ST_N; own_id = 0;
-        ack(cmd, 0, NULL);
-        break;
-    case 0x11: // LinkStatus: 0xFF for connected slots
-        r[0] = (st == ST_C) ? 0xFF : 0;
-        ack(cmd, 1, r);
-        break;
-    case 0x13: // SystemStatus: id | slot bitmap | state
-        r[0] = own_id | ((uint32_t)(st == ST_C ? 1 : 0) << 16) |
-               ((uint32_t)(st == ST_PSC ? 2 : st == ST_P ? 1 :
-                           st == ST_CSP ? 3 : st == ST_CCP ? 4 :
-                           st == ST_C   ? 5 : 0) << 24);
-        ack(cmd, 1, r);
-        break;
-    case 0x14: // SlotStatus: EntrySlot + connected children
-        r[0] = (st == ST_PSC) ? 0 : 0xFF;
-        ack(cmd, 1, r); // no children yet (net layer will add them)
-        break;
-    case 0x16: // GameConfig: store the 24 broadcast bytes
-        for (int i = 0; i < 6 && i < len; i++)
-            memcpy(broadcast + 4 * i, &p[i], 4);
-        ack(cmd, 0, NULL);
-        break;
-    case 0x17: // SystemConfig
-        if (len >= 1) {
-            mc_timer    = p[0] & 0xff;
-            max_mframe  = (p[0] >> 8) & 0xff;
-            avail_slots = 4 - ((p[0] >> 16) & 3);
-        }
-        ack(cmd, 0, NULL);
-        break;
-    case 0x19: // SC_Start: host a room
-        st = ST_PSC; own_id = 0x61f1;
-        net_host_start(broadcast);
-        ack(cmd, 0, NULL);
-        break;
-    case 0x1A: // SC_Polling: newly connected children (none yet)
-        ack(cmd, 0, NULL);
-        break;
-    case 0x1B: // SC_End: close entry
-        st = ST_P;
-        ack(cmd, 0, NULL);
-        break;
-    case 0x1C: // SP_Start: scan
-        st = ST_CSP;
-        ack(cmd, 0, NULL);
-        break;
-    case 0x1D: case 0x1E: { // SP_Polling / SP_End: found parents
-        uint8_t found[4][28];
-        int n = net_scan(found);
-        for (int i = 0; i < n; i++)
-            memcpy(&r[7*i], found[i], 28);
-        if (cmd == 0x1E) st = ST_N;
-        ack(cmd, 7 * n, r);
-        break; }
-    case 0x1F: // CP_Start(pid)
-        st = ST_CCP;
-        (void)(len >= 1 && net_connect(p[0] & 0xffff));
-        ack(cmd, 0, NULL);
-        break;
-    case 0x20: case 0x21: // CP_Polling / CP_End
-        r[0] = 0x03000000; // parent not found (until net layer lands)
-        if (cmd == 0x21) st = ST_N;
-        ack(cmd, 1, r);
-        break;
-    case 0x24: case 0x25: // DataTx (&Change)
-        if (len >= 1) net_send(p, len);
-        ack(cmd, 0, NULL);
-        break;
-    case 0x26: { // DataRx
-        int n = net_recv(r);
-        ack(cmd, n, r);
-        break; }
-    case 0x27: // MS_Change (wait)
-        wait_pending = 1;
-        ack(cmd, 0, NULL);
-        break;
-    case 0x30: // Disconnect
-        st = (st == ST_C) ? ST_N : st;
-        ack(cmd, 0, NULL);
-        break;
-    case 0x32: case 0x33: case 0x34: // CPR: recovery -> fail cleanly
-        r[0] = 1;
-        ack(cmd, (cmd == 0x32) ? 0 : 1, r);
-        break;
-    case 0x3D: // StopMode: back to power-save
-        st = ST_N; own_id = 0;
-        ack(cmd, 0, NULL);
-        break;
-    default:
-        reject((cmd >= 0x10 && cmd <= 0x3D) ? 1 : 2);
+    uint32_t resp[RFU_MAX_WORDS];
+    int      n = rfu_core_command(cmd, len, p, resp);
+
+    if (n < 0) {
+        // rejection: the FPGA expects the 0xEE command with one reason word
+        uint32_t reason = (uint32_t)(-n);
+        rfu_log("req %02X len %u -> reject %u\n", cmd, len, reason);
+        send_packet(0x02, 0xEE, 1, &reason);
+        return;
     }
-    fprintf(stderr, "req %02X len %d -> state %d\n", cmd, len, st);
+
+    rfu_log("req %02X len %u -> ack %d word(s) [%s]\n",
+            cmd, len, n, rfu_core_state_name());
+    send_packet(0x02, (uint8_t)(cmd | 0x80), (uint8_t)n, resp);
+
+    // 0x25/0x27/0x37 hand the clock to us; arm the wait so the frame loop
+    // can inject 0x28/0x29/0x27 once there is something to report.
+    if (cmd == 0x25 || cmd == 0x27 || cmd == 0x37)
+        rfu_core_wait_begin();
 }
 
 static void handle_event(uint8_t ev)
 {
-    fprintf(stderr, "event %d\n", ev);
     switch (ev) {
-    case 0: st = ST_N; own_id = 0; reversed = 0; break; // ping reset
-    case 2: // reversal entered: nothing to report yet -> hand the clock
-            // back with a timeout MS_Change, like a real adapter whose
-            // MasterChangeTimer expired (afska: EVENT_WAIT_TIMEOUT).
-            // The net layer will instead inject 0x28 when data arrives.
-        reversed = 1;
-        if (wait_pending) {
-            put_pkt(0x03, 0x27, 0, NULL);
-            wait_pending = 0;
-        }
+    case 0x00:
+        rfu_log("event: GPIO ping -> adapter reset\n");
+        rfu_core_reset();
         break;
-    case 3: reversed = 0; break; // GBA acked our injected command
+    case 0x01:
+        rfu_log("event: login complete\n");
+        break;
+    case 0x02:
+        rfu_log("event: clock reversed (adapter is master)\n");
+        break;
+    case 0x03:
+        rfu_log("event: GBA acked our notify\n");
+        break;
+    case 0x04:
+        rfu_log("event: word watchdog fired\n");
+        break;
+    default:
+        rfu_log("event: unknown %02X\n", ev);
+        break;
     }
+}
+
+static void usage(const char *argv0)
+{
+    fprintf(stderr,
+        "usage: %s [-d /dev/ttyS1] [-p port] [-P host[:port]] [-L] [-v]\n"
+        "  -d  UART device (default /dev/ttyS1)\n"
+        "  -p  local UDP port (default %d)\n"
+        "  -P  peer to talk to; repeatable. Needed only across the internet.\n"
+        "  -L  disable LAN discovery (on by default)\n"
+        "  -v  log adapter activity to stderr\n",
+        argv0, RFU_UDP_PORT);
 }
 
 int main(int argc, char **argv)
 {
-    const char *dev = (argc > 1) ? argv[1] : "/dev/ttyS1";
+    const char *dev  = "/dev/ttyS1";
+    int         port = RFU_UDP_PORT;
+    int         lan  = 1;
+    const char *peers[16];
+    int         npeers = 0;
+
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "-d") && i + 1 < argc)      dev = argv[++i];
+        else if (!strcmp(argv[i], "-p") && i + 1 < argc) port = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "-P") && i + 1 < argc) {
+            if (npeers < (int)(sizeof(peers) / sizeof(peers[0])))
+                peers[npeers++] = argv[++i];
+            else
+                i++;
+        }
+        else if (!strcmp(argv[i], "-L")) lan = 0;
+        else if (!strcmp(argv[i], "-v")) verbose = 1;
+        else { usage(argv[0]); return 2; }
+    }
+
     uart = open(dev, O_RDWR | O_NOCTTY);
     if (uart < 0) { perror(dev); return 1; }
 
     struct termios tio;
-    tcgetattr(uart, &tio);
-    cfmakeraw(&tio);
-    cfsetspeed(&tio, B921600);
-    tio.c_cc[VMIN] = 1; tio.c_cc[VTIME] = 0;
-    tcsetattr(uart, TCSANOW, &tio);
+    if (tcgetattr(uart, &tio) == 0) {
+        cfmakeraw(&tio);
+        cfsetspeed(&tio, B921600);
+        tio.c_cc[VMIN] = 1;
+        tio.c_cc[VTIME] = 0;
+        tcsetattr(uart, TCSANOW, &tio);
+    }
 
-    fprintf(stderr, "rfu_daemon on %s\n", dev);
+    rfu_core_init();
+    if (rfu_net_open(port, lan) < 0) {
+        fprintf(stderr, "rfu_daemon: cannot open udp/%d\n", port);
+        return 1;
+    }
+    for (int i = 0; i < npeers; i++)
+        rfu_net_add_peer(peers[i], port);
 
-    uint8_t hdr[3];
+    fprintf(stderr, "rfu_daemon: %s <-> udp/%d%s\n",
+            dev, port, lan ? " (LAN discovery on)" : "");
+
+    // Single loop over both the UART and the socket. The ~60 Hz housekeeping
+    // tick drives session timeouts and, while the clock is reversed, decides
+    // when to inject the adapter-initiated notify the GBA is parked waiting
+    // for -- so it must keep running even when the UART is silent.
+    uint8_t  hdr[3];
+    size_t   hgot = 0;
+    uint8_t  raw[4 * RFU_MAX_WORDS];
+    size_t   rgot = 0, rneed = 0;
+    int      in_body = 0;
+    uint32_t next_frame = rfu_now_ms();
+
     for (;;) {
-        for (int got = 0; got < 3; ) {
-            int n = read(uart, hdr + got, 3 - got);
-            if (n <= 0) { perror("uart read"); return 1; }
-            got += n;
-        }
-        uint8_t nwords = hdr[2];
-        if (nwords > MAXW) { fprintf(stderr, "bad len %d\n", nwords); continue; }
-        uint8_t raw[4 * MAXW];
-        for (int got = 0; got < 4 * nwords; ) {
-            int n = read(uart, raw + got, 4 * nwords - got);
-            if (n <= 0) { perror("uart read"); return 1; }
-            got += n;
-        }
-        uint32_t w[MAXW];
-        for (int i = 0; i < nwords; i++)
-            w[i] = raw[4*i] | (raw[4*i+1] << 8) | (raw[4*i+2] << 16) |
-                   ((uint32_t)raw[4*i+3] << 24);
+        struct pollfd fds[2];
+        fds[0].fd = uart;          fds[0].events = POLLIN; fds[0].revents = 0;
+        fds[1].fd = rfu_net_fd();  fds[1].events = POLLIN; fds[1].revents = 0;
 
-        if (hdr[0] == 0x01)      handle_req(hdr[1], nwords, w);
-        else if (hdr[0] == 0x04) handle_event(hdr[1]);
+        int timeout = (int)(int32_t)(next_frame - rfu_now_ms());
+        if (timeout < 0) timeout = 0;
+        if (poll(fds, 2, timeout) < 0) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            return 1;
+        }
+
+        if (fds[0].revents & POLLIN) {
+            if (!in_body) {
+                ssize_t n = read(uart, hdr + hgot, 3 - hgot);
+                if (n <= 0) { perror("uart read"); return 1; }
+                hgot += (size_t)n;
+                if (hgot == 3) {
+                    hgot = 0;
+                    if (hdr[2] > RFU_MAX_WORDS) {
+                        fprintf(stderr, "rfu_daemon: bad length %u\n", hdr[2]);
+                    } else {
+                        rneed = 4u * hdr[2];
+                        rgot  = 0;
+                        in_body = 1;
+                    }
+                }
+            }
+            if (in_body) {
+                while (rgot < rneed) {
+                    ssize_t n = read(uart, raw + rgot, rneed - rgot);
+                    if (n < 0) {
+                        if (errno == EINTR) continue;
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                        perror("uart read");
+                        return 1;
+                    }
+                    if (n == 0) { fprintf(stderr, "uart eof\n"); return 1; }
+                    rgot += (size_t)n;
+                }
+                if (rgot == rneed) {
+                    in_body = 0;
+                    uint32_t w[RFU_MAX_WORDS];
+                    for (int i = 0; i < hdr[2]; i++)
+                        w[i] = (uint32_t)raw[4*i]
+                             | ((uint32_t)raw[4*i+1] << 8)
+                             | ((uint32_t)raw[4*i+2] << 16)
+                             | ((uint32_t)raw[4*i+3] << 24);
+                    if (hdr[0] == 0x01)      handle_req(hdr[1], hdr[2], w);
+                    else if (hdr[0] == 0x04) handle_event(hdr[1]);
+                }
+            }
+        }
+
+        if (fds[1].revents & POLLIN)
+            rfu_net_poll();
+
+        if ((int32_t)(rfu_now_ms() - next_frame) >= 0) {
+            next_frame += 16;                       // ~60 Hz
+            if ((int32_t)(rfu_now_ms() - next_frame) > 100)
+                next_frame = rfu_now_ms();          // fell behind; resync
+            rfu_core_frame();
+            rfu_net_tick();
+
+            // While the GBA is parked as clock slave, ship it the notify as
+            // soon as the core produces one.
+            uint8_t  cmd = 0, nparams = 0;
+            uint32_t params[RFU_MAX_WORDS];
+            if (rfu_core_wait_poll(&cmd, &nparams, params)) {
+                rfu_log("inject %02X (%u param words)\n", cmd, nparams);
+                send_packet(0x03, cmd, nparams, params);
+            }
+        }
     }
 }
