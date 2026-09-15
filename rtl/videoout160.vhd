@@ -16,6 +16,13 @@ entity videoout160 is
 
       blend                   : in  std_logic;
       borderOn                : in  std_logic;
+      -- 90 degree scanout: the frames in DDR3 are already stored transposed
+      -- (see gpufifo address mapping in gba_wrap), so this only switches the
+      -- scanout geometry: 240x160 becomes 160x240, and the 2P profile's
+      -- 480x160 side by side pair becomes 160x480 with player 1 stacked on
+      -- top of player 2. Direction lives on the write side, both directions
+      -- scan out identically.
+      rotate_on               : in  std_logic := '0';
       videoHshift             : in  signed(3 downto 0);
       videoVshift             : in  signed(2 downto 0);
 
@@ -82,13 +89,47 @@ architecture arch of videoout160 is
    -- timing
    signal div              : unsigned(2 downto 0) := (others => '0');
    signal x                : unsigned(9 downto 0) := (others => '0');
-   signal y                : unsigned(8 downto 0) := (others => '0');
+   signal y                : unsigned(9 downto 0) := (others => '0'); -- up to 530 lines when 2P is rotated
 
    signal lineInNew        : std_logic := '0';
    signal lineInNew_1      : std_logic := '0';
-   signal vpos             : unsigned(7 downto 0) := (others => '0');
+   signal vpos             : unsigned(8 downto 0) := (others => '0'); -- output line, 0..479 when 2P is rotated
 
    signal borderEff        : std_logic;
+
+   -- Runtime scanout geometry. Rotation keeps the frame period identical and
+   -- only reshapes the raster, so all of the frame pacing below stays valid:
+   --   1P        240x160 of 399 x 265 ce ticks at clk3x/8
+   --   1P rot    160x240 of 399 x 265 ce ticks at clk3x/8
+   --   2P        480x160 of 798 x 265 ce ticks at clk3x/4
+   --   2P rot    160x480 of 399 x 530 ce ticks at clk3x/4
+   -- 399 x 530 and 798 x 265 are the same 211470 ticks, so the 2P rotated
+   -- raster is the 2P raster with half the line length and twice the lines.
+   signal rot              : std_logic;
+   signal rot_dual         : std_logic;
+   signal hact_s           : integer range 0 to 1023;
+   signal htotal_s         : integer range 0 to 1023;
+   signal hsync_st_s       : integer range 0 to 1023;
+   signal hsync_end_s      : integer range 0 to 1023;
+   signal yreset_s         : integer range 0 to 1023;
+   signal vact_start       : integer range 0 to 1023;
+   signal vact_end         : integer range 0 to 1023;
+   signal vpos_base        : integer range 0 to 1023;
+   signal fetch_start      : integer range 0 to 1023;
+   signal fetch_end        : integer range 0 to 1023;
+   signal sep_line         : integer range 0 to 1023;
+   signal burstlen         : unsigned(9 downto 0);
+   signal vshift_eff       : signed(2 downto 0);
+   signal pause_ymax       : integer range 0 to 1023;
+   signal pause_target     : integer range 0 to 1023;
+
+   -- 2P rotated: each output line comes from one core only, the top 240 from
+   -- player 1 and the bottom 240 from player 2 (or one core line doubled when
+   -- a single player view is selected)
+   signal fetch_core2      : std_logic;
+   signal fetch_row        : unsigned(7 downto 0);
+   signal fetchFrame       : unsigned(1 downto 0);
+   signal fetchFramePrev   : unsigned(1 downto 0);
 
    type tPauseState is
    (
@@ -97,7 +138,7 @@ architecture arch of videoout160 is
       WAIT_LINES
    );
    signal pauseState       : tPauseState := IDLE;
-   signal vsyncwaitcnt     : unsigned(8 downto 0) := (others => '0');
+   signal vsyncwaitcnt     : unsigned(9 downto 0) := (others => '0');
 
    -- output
    signal lineWriteAddr    : unsigned(7 downto 0) := (others => '0');
@@ -141,8 +182,46 @@ architecture arch of videoout160 is
 
 begin
 
-   -- dual has no border framebuffer (it would need a 960 wide image)
-   borderEff <= borderOn and (not dual);
+   -- dual has no border framebuffer (it would need a 960 wide image), and a
+   -- rotated frame has nowhere to put a 320x240 landscape border either
+   rot       <= rotate_on;
+   rot_dual  <= rotate_on and dual;
+   borderEff <= borderOn and (not dual) and (not rot);
+
+   hact_s      <= 160 when rot = '1' else HACT;
+   htotal_s    <= 398 when (rot = '1' or dual = '0') else HTOTAL;
+   hsync_st_s  <= 293 when (rot = '1' or dual = '0') else HSYNC_ST;
+   hsync_end_s <= 325 when (rot = '1' or dual = '0') else HSYNC_ST + HSYNC_LEN;
+
+   yreset_s    <= 529 when rot_dual = '1' else 264;
+   vact_start  <=  25 when rot_dual = '1' else  22 when rot = '1' else  62;
+   vact_end    <= 505 when rot_dual = '1' else 262 when rot = '1' else 222;
+   vpos_base   <=  24 when rot_dual = '1' else  21 when rot = '1' else  61;
+   fetch_start <=  24 when rot_dual = '1' else  21 when rot = '1' else  61;
+   fetch_end   <= 504 when rot_dual = '1' else 261 when rot = '1' else 222;
+   sep_line    <= vact_start + 239; -- 2P rotated seam, the last player 1 line
+   pause_ymax   <= yreset_s - 8;
+   pause_target <= yreset_s - 4;
+   burstlen    <= to_unsigned( 40, 10) when rot = '1' else to_unsigned( 60, 10); -- 64bit words per line
+   -- only 3 blank lines are left below the rotated 1P image, so the V-Sync
+   -- adjust range no longer fits; hold it at 0 while rotated
+   vshift_eff  <= (others => '0') when rot = '1' else videoVshift;
+
+   -- 2P rotated line source: both = player 1 on top, player 2 below; a single
+   -- player view line doubles that core to fill the same 480 lines
+   fetch_core2 <= '0'                                     when rot_dual = '0' else
+                  '0'                                     when display_select = "01" else
+                  '1'                                     when display_select = "10" else
+                  '1'                                     when vpos >= 240 else
+                  '0';
+
+   fetch_row   <= vpos(7 downto 0)                        when rot_dual = '0' else
+                  resize(vpos(8 downto 1), 8)             when display_select /= "00" else
+                  resize(vpos - 240, 8)                   when vpos >= 240 else
+                  vpos(7 downto 0);
+
+   fetchFrame     <= currFrame2_scan when fetch_core2 = '1' else currFrame;
+   fetchFramePrev <= prevFrame2_scan when fetch_core2 = '1' else prevFrame;
 
    ilineram: entity mem.dpram_dif
    generic map
@@ -236,19 +315,28 @@ begin
 
          lineInNew_1 <= lineInNew;
 
-         if (dual = '1') then
+         -- latch core 2's buffer pair once per scanout frame, above the
+         -- active area, so the right/bottom half never switches mid frame
+         if (dual = '1' and lineInNew /= lineInNew_1 and y < vpos_base) then
+            currFrame2_scan <= currFrame2;
+            prevFrame2_scan <= prevFrame2;
+         end if;
+
+         if (dual = '1' and pixel2_we = '1' and pixel2_x = 239 and pixel2_y = 159) then
+            nextFrame2 <= nextFrame2 + 1;
+            currFrame2 <= nextFrame2;
+            prevFrame2 <= currFrame2;
+         end if;
+
+         if (dual = '1' and rot = '0') then
 
             -- per line: core 1 into words 0..59, core 2 into words 60..119,
             -- with blend the same again from the previous frames into lineram2
-            if (lineInNew /= lineInNew_1 and y < 61) then
-               currFrame2_scan <= currFrame2;
-               prevFrame2_scan <= prevFrame2;
-            end if;
 
             if (y >= 61 and y < 62+160) then
                if (lineInNew /= lineInNew_1) then
                   ddr3_request  <= '1';
-                  ddr3_address  <= '1' & 8x"0" & currFrame & vpos & 6x"0" & "000";
+                  ddr3_address  <= '1' & 8x"0" & currFrame & fetch_row & 6x"0" & "000";
                   ddr3_burstcnt <= 10x"3C"; -- 60 * 64bit = 240 * 16 bit
                   lineWriteAddr <= vpos(0) & 7x"0";
                   secondFrame   <= '0';
@@ -257,14 +345,14 @@ begin
                   case (fetchPhase) is
                      when "00" =>
                         ddr3_request  <= '1';
-                        ddr3_address  <= '1' & 7x"0" & '1' & currFrame2_scan & vpos & 6x"0" & "000";
+                        ddr3_address  <= '1' & 7x"0" & '1' & currFrame2_scan & fetch_row & 6x"0" & "000";
                         ddr3_burstcnt <= 10x"3C";
                         lineWriteAddr <= vpos(0) & to_unsigned(60, 7);
                         fetchPhase    <= "01";
                      when "01" =>
                         if (blend = '1') then
                            ddr3_request  <= '1';
-                           ddr3_address  <= '1' & 8x"0" & prevFrame & vpos & 6x"0" & "000";
+                           ddr3_address  <= '1' & 8x"0" & prevFrame & fetch_row & 6x"0" & "000";
                            ddr3_burstcnt <= 10x"3C";
                            lineWriteAddr <= vpos(0) & 7x"0";
                            secondFrame   <= '1';
@@ -272,19 +360,13 @@ begin
                         end if;
                      when "10" =>
                         ddr3_request  <= '1';
-                        ddr3_address  <= '1' & 7x"0" & '1' & prevFrame2_scan & vpos & 6x"0" & "000";
+                        ddr3_address  <= '1' & 7x"0" & '1' & prevFrame2_scan & fetch_row & 6x"0" & "000";
                         ddr3_burstcnt <= 10x"3C";
                         lineWriteAddr <= vpos(0) & to_unsigned(60, 7);
                         fetchPhase    <= "11";
                      when others => null;
                   end case;
                end if;
-            end if;
-
-            if (pixel2_we = '1' and pixel2_x = 239 and pixel2_y = 159) then
-               nextFrame2 <= nextFrame2 + 1;
-               currFrame2 <= nextFrame2;
-               prevFrame2 <= currFrame2;
             end if;
 
          else
@@ -295,18 +377,19 @@ begin
                ddr3_address   <= x"D" & to_unsigned(1280 * to_integer(y - 21), 24);
                ddr3_burstcnt <= 10x"A0"; -- 160 * 64bit = 320 * 32 bit
                blineWriteAddr <= vpos(0) & 8x"0";
-            elsif (y >= 61 and y < 62+160) then
+            elsif (y >= fetch_start and y < fetch_end) then
                if ((lineInNew /= lineInNew_1 and borderEff = '0') or (ddr3_done = '1' and borderReadOn = '1')) then
                   borderReadOn <= '0';
                   ddr3_request  <= '1';
-                  ddr3_address  <= '1' & "00000000" & currFrame & vpos & 6x"0" & "000";
-                  ddr3_burstcnt <= 10x"3C"; -- 60 * 64bit = 240 * 16 bit
+                  -- bit 19 picks core 2's frame buffer bank at byte 0x8080000
+                  ddr3_address  <= '1' & 7x"0" & fetch_core2 & fetchFrame & fetch_row & 6x"0" & "000";
+                  ddr3_burstcnt <= burstlen; -- 60 words = 240 px, rotated 40 words = 160 px
                   lineWriteAddr <= '0' & vpos(0) & 6x"0";
                   secondFrame   <= '0';
                elsif (ddr3_done = '1' and secondFrame = '0' and blend = '1' ) then
                   secondFrame                <= '1';
                   ddr3_request               <= '1';
-                  ddr3_address(18 downto 17) <= prevFrame;
+                  ddr3_address(18 downto 17) <= fetchFramePrev;
                   lineWriteAddr(5 downto 0)  <= (others => '0');
                end if;
             end if;
@@ -333,8 +416,10 @@ begin
          if (div = 0 or (dual = '1' and div = 4)) then
             videoout_ce <= '1';
 
-            if (x < HACT and y >= 62 and y < 222) then
-               if (dual = '1' and separator_on = '1' and display_select = "00" and (x = 239 or x = 240)) then
+            if (x < hact_s and y >= vact_start and y < vact_end) then
+               if (dual = '1' and separator_on = '1' and display_select = "00" and
+                   ((rot = '0' and (x = 239 or x = 240)) or
+                    (rot = '1' and (y = sep_line or y = sep_line + 1)))) then
                   -- 2P separator: neutral 50% gray, RGB555 0x3DEF widened to 8 bits/channel
                   videoout_r      <= "01111011";
                   videoout_g      <= "01111011";
@@ -356,35 +441,36 @@ begin
                if (y  = 21 and x = 359) then videoout_vblank <= '0'; end if;
                if (y >= 62+199)         then videoout_vblank <= '1'; end if;
             else
-               if (x = HACT)    then videoout_hblank <= '1'; end if;
-               if (x =    0)    then videoout_hblank <= '0'; end if;
-               if (y  = 62)     then videoout_vblank <= '0'; end if;
-               if (y >= 62+160) then videoout_vblank <= '1'; end if;
+               if (x = hact_s)      then videoout_hblank <= '1'; end if;
+               if (x =    0)        then videoout_hblank <= '0'; end if;
+               if (y  = vact_start) then videoout_vblank <= '0'; end if;
+               if (y >= vact_end)   then videoout_vblank <= '1'; end if;
             end if;
 
-            if(x = HSYNC_ST + to_integer(videoHshift)) then
+            if(x = hsync_st_s + to_integer(videoHshift)) then
                videoout_hsync <= '1';
-               if (videoVshift < -1) then
-                  if (y = 265 + to_integer(videoVshift)) then videoout_vsync <= '1'; end if;
+               if (vshift_eff < -1) then
+                  if (y = yreset_s + 1 + to_integer(vshift_eff)) then videoout_vsync <= '1'; end if;
                else
-                  if (y = 1 + to_integer(videoVshift)) then videoout_vsync <= '1'; end if;
+                  if (y = 1 + to_integer(vshift_eff)) then videoout_vsync <= '1'; end if;
                end if;
-               if (y = 4 + to_integer(videoVshift)) then videoout_vsync <= '0'; end if;
+               if (y = 4 + to_integer(vshift_eff)) then videoout_vsync <= '0'; end if;
             end if;
 
-            if(x = HSYNC_ST + HSYNC_LEN + to_integer(videoHshift)) then videoout_hsync <= '0'; end if;
+            if(x = hsync_end_s + to_integer(videoHshift)) then videoout_hsync <= '0'; end if;
 
             if (x = 0) then
-               if (y >= 21 and y < 62+199) then
+               -- 21 rather than fetch_start: the border prefetch starts early
+               if (y >= 21 and y < fetch_end) then
                   lineInNew <= not lineInNew;
-                  vpos      <= resize(y - 61, vpos'length);
+                  vpos      <= resize(y - vpos_base, vpos'length);
                end if;
             end if;
          end if;
 
          if(videoout_ce = '1') then
             if(videoout_hblank = '1') then
-               if (dual = '1') then
+               if (dual = '1' and rot = '0') then
                   if (display_select = "10") then
                      lineReadAddr <= vpos(0) & to_unsigned(240, 9); -- player 2 half: +240
                   else
@@ -397,8 +483,8 @@ begin
                singleDoubleTick <= '0';
             else
                blineReadAddr <= blineReadAddr + 1;
-               if (x < HACT) then
-                  if (dual = '1' and display_select /= "00") then
+               if (x < hact_s) then
+                  if (dual = '1' and rot = '0' and display_select /= "00") then
                      -- single-player: advance the source column every other
                      -- output column so each pixel is shown twice (2x wide)
                      singleDoubleTick <= not singleDoubleTick;
@@ -412,16 +498,16 @@ begin
             end if;
 
             x <= x + 1;
-            if(x = HTOTAL) then
+            if(x = htotal_s) then
                x <= (others => '0');
-               if (y < 511) then y <= y + 1; end if;
+               if (y < 1023) then y <= y + 1; end if;
             end if;
          end if;
 
          -- fractional frame reset, must hit between two ce ticks: div = 5 is
          -- one of 8 subticks at ce = clk3x/8, one of the two "01" subticks
          -- falls inside the 4 subtick window at ce = clk3x/4
-         if (x = 0 and y = 264 and ((dual = '0' and div = 5) or (dual = '1' and div(1 downto 0) = "01"))) then
+         if (x = 0 and y = yreset_s and ((dual = '0' and div = 5) or (dual = '1' and div(1 downto 0) = "01"))) then
             x  <= (others => '0');
             y  <= (others => '0');
          end if;
@@ -430,9 +516,9 @@ begin
             when IDLE =>
                allowUnpause <= '1';
                if (pixel_we = '1' and pixel_x = 0 and pixel_y = 150) then
-                  if (inPause = '0' and y < 256) then
+                  if (inPause = '0' and y < pause_ymax) then
                      pauseState   <= WAIT_PAUSING;
-                     vsyncwaitcnt <= 260 - y;
+                     vsyncwaitcnt <= pause_target - y;
                      requestPause <= '1';
                   end if;
                end if;

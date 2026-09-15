@@ -65,6 +65,11 @@ entity gba_wrap is
       interframe_blend      : in     std_logic_vector(1 downto 0); -- 0 = off, 1 = blend, 2 = 30hz
       shade_mode            : in     std_logic_vector(2 downto 0);
       borderOn              : in     std_logic;     
+      -- 90 degree video rotation: 00 = off, 01 = clockwise, 10 = counter
+      -- clockwise. Rotation happens where the GPU pixels are written into
+      -- the DDR3 frame buffers, which is a per pixel scattered write either
+      -- way, so it costs no extra bandwidth and no extra frame of latency.
+      videoRotate           : in     std_logic_vector(1 downto 0) := "00";
       videoHshift           : in     signed(3 downto 0);      
       videoVshift           : in     signed(2 downto 0);      
       specialmodule         : in     std_logic;                    -- 0 = off, 1 = use gamepak GPIO Port at address 0x080000C4..0x080000C8
@@ -196,6 +201,23 @@ entity gba_wrap is
       sound2_select         : in     std_logic_vector(1 downto 0) := "00"; -- 0 = core 1, 1 = core 2, 2 = 50/50 mix, 3 = split (P1 left / P2 right)
       display2p_select      : in     std_logic_vector(1 downto 0) := "00"; -- 0 = both side by side, 1 = player 1 only, 2 = player 2 only (2P profile, view only)
       separator_line        : in     std_logic := '0'; -- 1 = draw a thin line at the x=239/240 seam ("both" display mode only)
+      -- physical GBA cartridge on the Multisystem2 adapter (see gba_cart_phys.vhd).
+      -- When cart_phys_en is set the whole 0x8..0xF window is served by the real
+      -- cartridge instead of memorymux_extern, so its ROM, saves, EEPROM and GPIO
+      -- devices are all the genuine article.
+      cart_phys_en          : in     std_logic := '0';
+      cart_phys_timing      : in     std_logic_vector(1 downto 0) := "00";
+      cart_ad_out           : out    std_logic_vector(15 downto 0);
+      cart_ad_in            : in     std_logic_vector(15 downto 0) := (others => '1');
+      cart_ad_drive         : out    std_logic;
+      cart_a_out            : out    std_logic_vector(7 downto 0);
+      cart_a_in             : in     std_logic_vector(7 downto 0) := (others => '1');
+      cart_a_drive          : out    std_logic;
+      cart_cs_n             : out    std_logic;
+      cart_cs2_n            : out    std_logic;
+      cart_rd_n             : out    std_logic;
+      cart_wr_n             : out    std_logic;
+      cart_phi              : out    std_logic;
       -- debug interface
       GBA_BusAddr           : in     std_logic_vector(27 downto 0);
       GBA_BusRnW            : in     std_logic;
@@ -255,6 +277,14 @@ architecture arch of gba_wrap is
    signal matrix_remap_addr : std_logic_vector(26 downto 0);
    signal cart_done         : std_logic;
    signal cart_readdata     : std_logic_vector(31 downto 0);
+
+   -- cart channel fan-out: exactly one of the two responders is armed
+   signal cart_ena_ext      : std_logic;
+   signal cart_done_ext     : std_logic;
+   signal cart_readdata_ext : std_logic_vector(31 downto 0);
+   signal cart_ena_phys     : std_logic;
+   signal cart_done_phys    : std_logic;
+   signal cart_readdata_phys: std_logic_vector(31 downto 0);
    signal cart_waitcnt      : std_logic_vector(15 downto 0);
    signal dma_eepromcount   : unsigned(16 downto 0);
    signal cart_reset        : std_logic; 
@@ -414,13 +444,16 @@ architecture arch of gba_wrap is
    
    signal gpufifo_reset    : std_logic;
    signal gpufifo_Din      : std_logic_vector(33 downto 0); -- 16bit data + 18 bit address
+   signal videoRotate_on   : std_logic;
+   signal gpufifo_row      : std_logic_vector(7 downto 0);
+   signal gpufifo_col      : std_logic_vector(7 downto 0);
    signal gpufifo_Wr       : std_logic;
    signal gpufifo_nearfull : std_logic;
    signal gpufifo_empty    : std_logic;
    signal gpufifo_Frame    : std_logic_vector(1 downto 0);
 
    -- core 2 write channel (2P profile): whole 64bit words, tied off otherwise
-   signal gpufifo2_Din     : std_logic_vector(79 downto 0);
+   signal gpufifo2_Din     : std_logic_vector(81 downto 0);
    signal gpufifo2_Wr      : std_logic;
    signal gpufifo2_Frame   : std_logic_vector(1 downto 0);
 
@@ -791,6 +824,49 @@ begin
       remap_sdram_addr => matrix_remap_addr
    );
 
+   -- Physical cartridge master. Held in reset (and with every pin released)
+   -- unless the OSD option is on, so a build without the adapter fitted is
+   -- bit-for-bit the same core it was before.
+   igba_cart_phys : entity work.gba_cart_phys
+   port map
+   (
+      clk1x            => clk1x,
+      clk6x            => clk6x,
+      reset            => cart_reset,
+
+      enable           => cart_phys_en,
+      timing_sel       => cart_phys_timing,
+
+      cart_ena         => cart_ena_phys,
+      cart_32          => cart_32,
+      cart_rnw         => cart_rnw,
+      cart_addr        => cart_addr,
+      cart_writedata   => cart_writedata,
+      cart_writedata32 => cart_writedata32,
+      cart_be32        => cart_be32,
+      cart_done        => cart_done_phys,
+      cart_readdata    => cart_readdata_phys,
+
+      cart_waitcnt     => cart_waitcnt,
+
+      pin_ad_out       => cart_ad_out,
+      pin_ad_in        => cart_ad_in,
+      pin_ad_drive     => cart_ad_drive,
+      pin_a_out        => cart_a_out,
+      pin_a_in         => cart_a_in,
+      pin_a_drive      => cart_a_drive,
+      pin_cs_n         => cart_cs_n,
+      pin_cs2_n        => cart_cs2_n,
+      pin_rd_n         => cart_rd_n,
+      pin_wr_n         => cart_wr_n,
+      pin_phi          => cart_phi
+   );
+
+   cart_ena_ext  <= cart_ena and not cart_phys_en;
+   cart_ena_phys <= cart_ena and     cart_phys_en;
+   cart_done     <= cart_done_phys     when cart_phys_en = '1' else cart_done_ext;
+   cart_readdata <= cart_readdata_phys when cart_phys_en = '1' else cart_readdata_ext;
+
    imemorymux_extern : entity work.memorymux_extern
    generic map
    (
@@ -816,14 +892,14 @@ begin
       ss_wired_out         => save_wired_or(0),   
       ss_wired_done        => save_wired_done(0),  
                     
-      cart_ena             => cart_ena,      
+      cart_ena             => cart_ena_ext,
       cart_idle            => cart_idle,      
       cart_32              => cart_32,          
       cart_rnw             => cart_rnw,      
       cart_addr            => cart_addr,     
       cart_writedata       => cart_writedata,
-      cart_done            => cart_done,     
-      cart_readdata        => cart_readdata, 
+      cart_done            => cart_done_ext,
+      cart_readdata        => cart_readdata_ext,
       
       cart_waitcnt         => cart_waitcnt,
 
@@ -969,6 +1045,8 @@ begin
       signal c2_word          : std_logic_vector(47 downto 0) := (others => '0'); -- pixels 0..2 of the 64bit word in flight
       signal c2_data16        : std_logic_vector(15 downto 0);
       signal c2_xu            : unsigned(7 downto 0);
+      signal c2_row           : std_logic_vector(7 downto 0);
+      signal c2_col           : std_logic_vector(7 downto 0);
       -- internal link cable: wired AND of both open drain ends, registered on
       -- clk1x (both cores share the domain; gba_serial wants registered inputs)
       signal l2_sc            : std_logic := '1'; -- SC bus, both ends
@@ -1315,8 +1393,24 @@ begin
          end if;
       end process;
 
-      gpufifo2_Din <= gpufifo2_Frame & std_logic_vector(to_unsigned(pixel2_shade_y, 8)) & std_logic_vector(c2_xu(7 downto 2)) & c2_data16 & c2_word;
-      gpufifo2_Wr  <= pixel2_shade_we when (c2_xu(1 downto 0) = "11") else '0';
+      -- rotated: same (row, column) remap as core 1, but consecutive pixels
+      -- of a line now land in different DDR3 rows, so the 4 pixel packing
+      -- above cannot be used - push one pixel per entry, replicated across
+      -- the word, and let DDR3Mux pick it out with byte enables
+      c2_row <= std_logic_vector(c2_xu)                                    when videoRotate = "01" else
+                std_logic_vector(to_unsigned(239 - pixel2_shade_x, 8))     when videoRotate = "10" else
+                std_logic_vector(to_unsigned(pixel2_shade_y, 8));
+
+      c2_col <= std_logic_vector(to_unsigned(159 - pixel2_shade_y, 8))     when videoRotate = "01" else
+                std_logic_vector(to_unsigned(pixel2_shade_y, 8))           when videoRotate = "10" else
+                std_logic_vector(c2_xu(7 downto 2)) & "00";
+
+      gpufifo2_Din <= gpufifo2_Frame & c2_row & c2_col &
+                      (c2_data16 & c2_data16 & c2_data16 & c2_data16) when videoRotate_on = '1' else
+                      gpufifo2_Frame & c2_row & c2_col & (c2_data16 & c2_word);
+
+      gpufifo2_Wr  <= pixel2_shade_we                                  when videoRotate_on = '1' else
+                      pixel2_shade_we when (c2_xu(1 downto 0) = "11") else '0';
 
       -- audio select, registered: sources are independent free running cores
       process (clk1x)
@@ -1525,6 +1619,7 @@ begin
 
       blend                   => interframe_blend(0),
       borderOn                => borderOn,
+      rotate_on               => videoRotate_on,
       videoHshift             => videoHshift,
       videoVshift             => videoVshift,
 
@@ -1850,7 +1945,26 @@ begin
    );
    
    gpufifo_reset  <= '0';
-   gpufifo_Din    <= gpufifo_Frame & std_logic_vector(to_unsigned(pixel_out_y,8)) & std_logic_vector(to_unsigned(pixel_out_x,8)) & '0' & pixel_out_data;
+
+   videoRotate_on <= videoRotate(0) or videoRotate(1);
+
+   -- frame buffer address is {frame, row(8), column(8)} of 16 bit pixels with
+   -- a fixed 256 pixel row stride, so a 90 degree rotation is just a different
+   -- (row, column) mapping of the same incoming pixel stream:
+   --   off : row = y        (160 rows) column = x         (240 wide)
+   --   cw  : row = x        (240 rows) column = 159 - y   (160 wide)
+   --   ccw : row = 239 - x  (240 rows) column = y         (160 wide)
+   -- The rotated frame is 240 * 512 bytes = 120k, still inside the 128k that
+   -- the DDR3 map reserves per frame buffer.
+   gpufifo_row <= std_logic_vector(to_unsigned(pixel_out_x, 8))       when videoRotate = "01" else
+                  std_logic_vector(to_unsigned(239 - pixel_out_x, 8)) when videoRotate = "10" else
+                  std_logic_vector(to_unsigned(pixel_out_y, 8));
+
+   gpufifo_col <= std_logic_vector(to_unsigned(159 - pixel_out_y, 8)) when videoRotate = "01" else
+                  std_logic_vector(to_unsigned(pixel_out_y, 8))       when videoRotate = "10" else
+                  std_logic_vector(to_unsigned(pixel_out_x, 8));
+
+   gpufifo_Din    <= gpufifo_Frame & gpufifo_row & gpufifo_col & '0' & pixel_out_data;
    gpufifo_Wr     <= pixel_out_we;
    
    iDDR3Mux : entity work.DDR3Mux
@@ -1887,6 +2001,7 @@ begin
       rdram_dataRead   => rdram_dataRead,  
                        
       gpufifo_reset    => gpufifo_reset,
+      gpufifo_rotate   => videoRotate_on,
       gpufifo_Din      => gpufifo_Din,
       gpufifo_Wr       => gpufifo_Wr,
       gpufifo_nearfull => gpufifo_nearfull,

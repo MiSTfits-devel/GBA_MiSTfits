@@ -1,0 +1,5 @@
+set_global_assignment -name SYSTEMVERILOG_FILE mistfits/mistfits_direct_video_mixer.sv
+set_global_assignment -name SYSTEMVERILOG_FILE mistfits/mistfits_hq2x.sv
+set_global_assignment -name SYSTEMVERILOG_FILE mistfits/mistfits_pixel_scheduler.sv
+set_global_assignment -name SYSTEMVERILOG_FILE mistfits/mistfits_hps.sv
+set_global_assignment -name SYSTEMVERILOG_FILE mistfits/mistfits_video_mixer.sv

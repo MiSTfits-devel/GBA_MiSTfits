@@ -1,0 +1,552 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  CMSIS-SVD description of the Game Boy Advance IO map, for the Peripherals
+  view of a CLion GDB Remote Debug configuration pointed at support/gdb_daemon.
+
+  Add it under Run > Edit Configurations > (your remote config) > Peripheral
+  Device > "From file", then tick the peripherals you want watched.
+
+  Address map, for reference (regions outside IO are not SVD peripherals):
+
+    00000000  16K   BIOS, read only
+    02000000 256K   EWRAM, 16 bit bus, 2 wait states
+    03000000  32K   IWRAM, 32 bit bus, no waits
+    04000000   1K   IO, described below
+    05000000   1K   palette RAM, 16 bit writes only
+    06000000  96K   VRAM, 16 bit writes only
+    07000000   1K   OAM, 16 bit writes only
+    08000000  32M   cartridge ROM, wait state 0
+    0A000000  32M   cartridge ROM, wait state 1
+    0C000000  32M   cartridge ROM, wait state 2
+    0E000000  64K   cartridge SRAM, 8 bit bus
+-->
+<device schemaVersion="1.1"
+        xmlns:xs="http://www.w3.org/2001/XMLSchema-instance"
+        xs:noNamespaceSchemaLocation="CMSIS-SVD.xsd">
+  <vendor>Nintendo</vendor>
+  <name>GBA</name>
+  <version>1.0</version>
+  <description>Game Boy Advance (AGB) memory mapped IO</description>
+  <addressUnitBits>8</addressUnitBits>
+  <width>16</width>
+  <size>16</size>
+  <access>read-write</access>
+  <resetValue>0x0000</resetValue>
+  <resetMask>0xFFFF</resetMask>
+
+  <cpu>
+    <name>ARM7TDMI</name>
+    <revision>r0p0</revision>
+    <endian>little</endian>
+    <mpuPresent>false</mpuPresent>
+    <fpuPresent>false</fpuPresent>
+    <nvicPrioBits>0</nvicPrioBits>
+    <vendorSystickConfig>false</vendorSystickConfig>
+  </cpu>
+
+  <peripherals>
+
+    <!-- ================================================== display -->
+    <peripheral>
+      <name>PPU</name>
+      <description>LCD controller, backgrounds, windows and blending</description>
+      <baseAddress>0x04000000</baseAddress>
+      <addressBlock>
+        <offset>0</offset>
+        <size>0x56</size>
+        <usage>registers</usage>
+      </addressBlock>
+      <registers>
+
+        <register>
+          <name>DISPCNT</name>
+          <description>Display control</description>
+          <addressOffset>0x00</addressOffset>
+          <fields>
+            <field><name>BG_MODE</name><bitRange>[2:0]</bitRange>
+              <description>0-2 tiled, 3-5 bitmap</description></field>
+            <field><name>CGB_MODE</name><bitRange>[3:3]</bitRange><access>read-only</access></field>
+            <field><name>FRAME</name><bitRange>[4:4]</bitRange>
+              <description>Bitmap frame select, modes 4 and 5</description></field>
+            <field><name>HBLANK_FREE</name><bitRange>[5:5]</bitRange>
+              <description>Allow OAM access during H-blank</description></field>
+            <field><name>OBJ_1D</name><bitRange>[6:6]</bitRange>
+              <description>1 = linear OBJ tile mapping</description></field>
+            <field><name>FORCED_BLANK</name><bitRange>[7:7]</bitRange></field>
+            <field><name>BG0_ON</name><bitRange>[8:8]</bitRange></field>
+            <field><name>BG1_ON</name><bitRange>[9:9]</bitRange></field>
+            <field><name>BG2_ON</name><bitRange>[10:10]</bitRange></field>
+            <field><name>BG3_ON</name><bitRange>[11:11]</bitRange></field>
+            <field><name>OBJ_ON</name><bitRange>[12:12]</bitRange></field>
+            <field><name>WIN0_ON</name><bitRange>[13:13]</bitRange></field>
+            <field><name>WIN1_ON</name><bitRange>[14:14]</bitRange></field>
+            <field><name>WINOBJ_ON</name><bitRange>[15:15]</bitRange></field>
+          </fields>
+        </register>
+
+        <register>
+          <name>GREENSWAP</name>
+          <description>Undocumented green swap</description>
+          <addressOffset>0x02</addressOffset>
+        </register>
+
+        <register>
+          <name>DISPSTAT</name>
+          <description>Display status and interrupt select</description>
+          <addressOffset>0x04</addressOffset>
+          <fields>
+            <field><name>VBLANK</name><bitRange>[0:0]</bitRange><access>read-only</access></field>
+            <field><name>HBLANK</name><bitRange>[1:1]</bitRange><access>read-only</access></field>
+            <field><name>VCOUNT_MATCH</name><bitRange>[2:2]</bitRange><access>read-only</access></field>
+            <field><name>VBLANK_IRQ</name><bitRange>[3:3]</bitRange></field>
+            <field><name>HBLANK_IRQ</name><bitRange>[4:4]</bitRange></field>
+            <field><name>VCOUNT_IRQ</name><bitRange>[5:5]</bitRange></field>
+            <field><name>VCOUNT_SETTING</name><bitRange>[15:8]</bitRange></field>
+          </fields>
+        </register>
+
+        <register>
+          <name>VCOUNT</name>
+          <description>Current scanline, 0-227</description>
+          <addressOffset>0x06</addressOffset>
+          <access>read-only</access>
+        </register>
+
+        <register>
+          <name>BG0CNT</name>
+          <description>BG0 control</description>
+          <addressOffset>0x08</addressOffset>
+          <fields>
+            <field><name>PRIORITY</name><bitRange>[1:0]</bitRange></field>
+            <field><name>CHAR_BASE</name><bitRange>[3:2]</bitRange>
+              <description>Tile data base, 16 KB units</description></field>
+            <field><name>MOSAIC</name><bitRange>[6:6]</bitRange></field>
+            <field><name>PALETTE_256</name><bitRange>[7:7]</bitRange></field>
+            <field><name>SCREEN_BASE</name><bitRange>[12:8]</bitRange>
+              <description>Tilemap base, 2 KB units</description></field>
+            <field><name>WRAP</name><bitRange>[13:13]</bitRange>
+              <description>Affine wraparound, BG2 and BG3 only</description></field>
+            <field><name>SIZE</name><bitRange>[15:14]</bitRange></field>
+          </fields>
+        </register>
+        <register><name>BG1CNT</name><addressOffset>0x0A</addressOffset>
+          <derivedFrom>BG0CNT</derivedFrom></register>
+        <register><name>BG2CNT</name><addressOffset>0x0C</addressOffset>
+          <derivedFrom>BG0CNT</derivedFrom></register>
+        <register><name>BG3CNT</name><addressOffset>0x0E</addressOffset>
+          <derivedFrom>BG0CNT</derivedFrom></register>
+
+        <register><name>BG0HOFS</name><addressOffset>0x10</addressOffset><access>write-only</access></register>
+        <register><name>BG0VOFS</name><addressOffset>0x12</addressOffset><access>write-only</access></register>
+        <register><name>BG1HOFS</name><addressOffset>0x14</addressOffset><access>write-only</access></register>
+        <register><name>BG1VOFS</name><addressOffset>0x16</addressOffset><access>write-only</access></register>
+        <register><name>BG2HOFS</name><addressOffset>0x18</addressOffset><access>write-only</access></register>
+        <register><name>BG2VOFS</name><addressOffset>0x1A</addressOffset><access>write-only</access></register>
+        <register><name>BG3HOFS</name><addressOffset>0x1C</addressOffset><access>write-only</access></register>
+        <register><name>BG3VOFS</name><addressOffset>0x1E</addressOffset><access>write-only</access></register>
+
+        <register><name>BG2PA</name><addressOffset>0x20</addressOffset><access>write-only</access>
+          <description>BG2 affine dx, 8.8 fixed point</description></register>
+        <register><name>BG2PB</name><addressOffset>0x22</addressOffset><access>write-only</access></register>
+        <register><name>BG2PC</name><addressOffset>0x24</addressOffset><access>write-only</access></register>
+        <register><name>BG2PD</name><addressOffset>0x26</addressOffset><access>write-only</access></register>
+        <register><name>BG2X</name><addressOffset>0x28</addressOffset><size>32</size><access>write-only</access>
+          <description>BG2 reference X, 20.8 fixed point</description></register>
+        <register><name>BG2Y</name><addressOffset>0x2C</addressOffset><size>32</size><access>write-only</access></register>
+
+        <register><name>BG3PA</name><addressOffset>0x30</addressOffset><access>write-only</access></register>
+        <register><name>BG3PB</name><addressOffset>0x32</addressOffset><access>write-only</access></register>
+        <register><name>BG3PC</name><addressOffset>0x34</addressOffset><access>write-only</access></register>
+        <register><name>BG3PD</name><addressOffset>0x36</addressOffset><access>write-only</access></register>
+        <register><name>BG3X</name><addressOffset>0x38</addressOffset><size>32</size><access>write-only</access></register>
+        <register><name>BG3Y</name><addressOffset>0x3C</addressOffset><size>32</size><access>write-only</access></register>
+
+        <register><name>WIN0H</name><addressOffset>0x40</addressOffset><access>write-only</access>
+          <description>Window 0 horizontal, [15:8] left, [7:0] right+1</description></register>
+        <register><name>WIN1H</name><addressOffset>0x42</addressOffset><access>write-only</access></register>
+        <register><name>WIN0V</name><addressOffset>0x44</addressOffset><access>write-only</access></register>
+        <register><name>WIN1V</name><addressOffset>0x46</addressOffset><access>write-only</access></register>
+
+        <register>
+          <name>WININ</name>
+          <description>Inside-window layer enables</description>
+          <addressOffset>0x48</addressOffset>
+          <fields>
+            <field><name>WIN0_BG0</name><bitRange>[0:0]</bitRange></field>
+            <field><name>WIN0_BG1</name><bitRange>[1:1]</bitRange></field>
+            <field><name>WIN0_BG2</name><bitRange>[2:2]</bitRange></field>
+            <field><name>WIN0_BG3</name><bitRange>[3:3]</bitRange></field>
+            <field><name>WIN0_OBJ</name><bitRange>[4:4]</bitRange></field>
+            <field><name>WIN0_BLEND</name><bitRange>[5:5]</bitRange></field>
+            <field><name>WIN1_BG0</name><bitRange>[8:8]</bitRange></field>
+            <field><name>WIN1_BG1</name><bitRange>[9:9]</bitRange></field>
+            <field><name>WIN1_BG2</name><bitRange>[10:10]</bitRange></field>
+            <field><name>WIN1_BG3</name><bitRange>[11:11]</bitRange></field>
+            <field><name>WIN1_OBJ</name><bitRange>[12:12]</bitRange></field>
+            <field><name>WIN1_BLEND</name><bitRange>[13:13]</bitRange></field>
+          </fields>
+        </register>
+        <register>
+          <name>WINOUT</name>
+          <description>Outside-window and OBJ-window layer enables</description>
+          <addressOffset>0x4A</addressOffset>
+        </register>
+
+        <register><name>MOSAIC</name><addressOffset>0x4C</addressOffset><access>write-only</access></register>
+
+        <register>
+          <name>BLDCNT</name>
+          <description>Colour special effects select</description>
+          <addressOffset>0x50</addressOffset>
+          <fields>
+            <field><name>SRC_BG0</name><bitRange>[0:0]</bitRange></field>
+            <field><name>SRC_BG1</name><bitRange>[1:1]</bitRange></field>
+            <field><name>SRC_BG2</name><bitRange>[2:2]</bitRange></field>
+            <field><name>SRC_BG3</name><bitRange>[3:3]</bitRange></field>
+            <field><name>SRC_OBJ</name><bitRange>[4:4]</bitRange></field>
+            <field><name>SRC_BACKDROP</name><bitRange>[5:5]</bitRange></field>
+            <field><name>EFFECT</name><bitRange>[7:6]</bitRange>
+              <description>0 none, 1 alpha, 2 brighten, 3 darken</description></field>
+            <field><name>DST_BG0</name><bitRange>[8:8]</bitRange></field>
+            <field><name>DST_BG1</name><bitRange>[9:9]</bitRange></field>
+            <field><name>DST_BG2</name><bitRange>[10:10]</bitRange></field>
+            <field><name>DST_BG3</name><bitRange>[11:11]</bitRange></field>
+            <field><name>DST_OBJ</name><bitRange>[12:12]</bitRange></field>
+            <field><name>DST_BACKDROP</name><bitRange>[13:13]</bitRange></field>
+          </fields>
+        </register>
+        <register><name>BLDALPHA</name><addressOffset>0x52</addressOffset>
+          <description>Alpha coefficients, [4:0] EVA, [12:8] EVB</description></register>
+        <register><name>BLDY</name><addressOffset>0x54</addressOffset><access>write-only</access>
+          <description>Brightness coefficient EVY, [4:0]</description></register>
+      </registers>
+    </peripheral>
+
+    <!-- ================================================== sound -->
+    <peripheral>
+      <name>SOUND</name>
+      <description>PSG channels 1-4 and the two DMA sound FIFOs</description>
+      <baseAddress>0x04000060</baseAddress>
+      <addressBlock>
+        <offset>0</offset>
+        <size>0x48</size>
+        <usage>registers</usage>
+      </addressBlock>
+      <registers>
+        <register><name>SOUND1CNT_L</name><addressOffset>0x00</addressOffset>
+          <description>Channel 1 sweep</description></register>
+        <register><name>SOUND1CNT_H</name><addressOffset>0x02</addressOffset>
+          <description>Channel 1 duty, length, envelope</description></register>
+        <register><name>SOUND1CNT_X</name><addressOffset>0x04</addressOffset>
+          <description>Channel 1 frequency and control</description></register>
+        <register><name>SOUND2CNT_L</name><addressOffset>0x08</addressOffset></register>
+        <register><name>SOUND2CNT_H</name><addressOffset>0x0C</addressOffset></register>
+        <register><name>SOUND3CNT_L</name><addressOffset>0x10</addressOffset>
+          <description>Channel 3 wave RAM bank control</description></register>
+        <register><name>SOUND3CNT_H</name><addressOffset>0x12</addressOffset></register>
+        <register><name>SOUND3CNT_X</name><addressOffset>0x14</addressOffset></register>
+        <register><name>SOUND4CNT_L</name><addressOffset>0x18</addressOffset></register>
+        <register><name>SOUND4CNT_H</name><addressOffset>0x1C</addressOffset></register>
+
+        <register>
+          <name>SOUNDCNT_L</name>
+          <description>PSG mixing and volume</description>
+          <addressOffset>0x20</addressOffset>
+        </register>
+        <register>
+          <name>SOUNDCNT_H</name>
+          <description>DMA sound mixing and PSG downmix</description>
+          <addressOffset>0x22</addressOffset>
+          <fields>
+            <field><name>PSG_VOLUME</name><bitRange>[1:0]</bitRange>
+              <description>0 = 25%, 1 = 50%, 2 = 100%</description></field>
+            <field><name>DMA_A_VOLUME</name><bitRange>[2:2]</bitRange></field>
+            <field><name>DMA_B_VOLUME</name><bitRange>[3:3]</bitRange></field>
+            <field><name>DMA_A_RIGHT</name><bitRange>[8:8]</bitRange></field>
+            <field><name>DMA_A_LEFT</name><bitRange>[9:9]</bitRange></field>
+            <field><name>DMA_A_TIMER</name><bitRange>[10:10]</bitRange></field>
+            <field><name>DMA_A_RESET</name><bitRange>[11:11]</bitRange></field>
+            <field><name>DMA_B_RIGHT</name><bitRange>[12:12]</bitRange></field>
+            <field><name>DMA_B_LEFT</name><bitRange>[13:13]</bitRange></field>
+            <field><name>DMA_B_TIMER</name><bitRange>[14:14]</bitRange></field>
+            <field><name>DMA_B_RESET</name><bitRange>[15:15]</bitRange></field>
+          </fields>
+        </register>
+        <register><name>SOUNDCNT_X</name><addressOffset>0x24</addressOffset>
+          <description>Master enable and per-channel status</description></register>
+        <register>
+          <name>SOUNDBIAS</name>
+          <description>DC bias and PWM resampling rate</description>
+          <addressOffset>0x28</addressOffset>
+          <fields>
+            <field><name>BIAS</name><bitRange>[9:1]</bitRange></field>
+            <field><name>SAMPLE_RATE</name><bitRange>[15:14]</bitRange>
+              <description>0 = 9 bit 32 kHz, 3 = 6 bit 262 kHz</description></field>
+          </fields>
+        </register>
+        <register><name>WAVE_RAM</name><addressOffset>0x30</addressOffset><size>32</size>
+          <description>Channel 3 wave pattern, 16 bytes, banked</description></register>
+        <register><name>FIFO_A</name><addressOffset>0x40</addressOffset><size>32</size><access>write-only</access></register>
+        <register><name>FIFO_B</name><addressOffset>0x44</addressOffset><size>32</size><access>write-only</access></register>
+      </registers>
+    </peripheral>
+
+    <!-- ================================================== dma -->
+    <peripheral>
+      <name>DMA</name>
+      <description>Four DMA channels; 0 highest priority, 3 lowest</description>
+      <baseAddress>0x040000B0</baseAddress>
+      <addressBlock>
+        <offset>0</offset>
+        <size>0x30</size>
+        <usage>registers</usage>
+      </addressBlock>
+      <registers>
+        <register><name>DMA0SAD</name><addressOffset>0x00</addressOffset><size>32</size><access>write-only</access></register>
+        <register><name>DMA0DAD</name><addressOffset>0x04</addressOffset><size>32</size><access>write-only</access></register>
+        <register><name>DMA0CNT_L</name><addressOffset>0x08</addressOffset><access>write-only</access>
+          <description>Transfer count, 0 means maximum</description></register>
+        <register>
+          <name>DMA0CNT_H</name>
+          <description>Channel 0 control</description>
+          <addressOffset>0x0A</addressOffset>
+          <fields>
+            <field><name>DST_CTRL</name><bitRange>[6:5]</bitRange>
+              <description>0 inc, 1 dec, 2 fixed, 3 inc+reload</description></field>
+            <field><name>SRC_CTRL</name><bitRange>[8:7]</bitRange></field>
+            <field><name>REPEAT</name><bitRange>[9:9]</bitRange></field>
+            <field><name>WIDTH_32</name><bitRange>[10:10]</bitRange></field>
+            <field><name>GAMEPAK_DRQ</name><bitRange>[11:11]</bitRange>
+              <description>DMA3 only</description></field>
+            <field><name>TIMING</name><bitRange>[13:12]</bitRange>
+              <description>0 now, 1 vblank, 2 hblank, 3 special</description></field>
+            <field><name>IRQ</name><bitRange>[14:14]</bitRange></field>
+            <field><name>ENABLE</name><bitRange>[15:15]</bitRange></field>
+          </fields>
+        </register>
+
+        <register><name>DMA1SAD</name><addressOffset>0x0C</addressOffset><size>32</size><access>write-only</access></register>
+        <register><name>DMA1DAD</name><addressOffset>0x10</addressOffset><size>32</size><access>write-only</access></register>
+        <register><name>DMA1CNT_L</name><addressOffset>0x14</addressOffset><access>write-only</access></register>
+        <register><name>DMA1CNT_H</name><addressOffset>0x16</addressOffset><derivedFrom>DMA0CNT_H</derivedFrom></register>
+
+        <register><name>DMA2SAD</name><addressOffset>0x18</addressOffset><size>32</size><access>write-only</access></register>
+        <register><name>DMA2DAD</name><addressOffset>0x1C</addressOffset><size>32</size><access>write-only</access></register>
+        <register><name>DMA2CNT_L</name><addressOffset>0x20</addressOffset><access>write-only</access></register>
+        <register><name>DMA2CNT_H</name><addressOffset>0x22</addressOffset><derivedFrom>DMA0CNT_H</derivedFrom></register>
+
+        <register><name>DMA3SAD</name><addressOffset>0x24</addressOffset><size>32</size><access>write-only</access></register>
+        <register><name>DMA3DAD</name><addressOffset>0x28</addressOffset><size>32</size><access>write-only</access></register>
+        <register><name>DMA3CNT_L</name><addressOffset>0x2C</addressOffset><access>write-only</access></register>
+        <register><name>DMA3CNT_H</name><addressOffset>0x2E</addressOffset><derivedFrom>DMA0CNT_H</derivedFrom></register>
+      </registers>
+    </peripheral>
+
+    <!-- ================================================== timers -->
+    <peripheral>
+      <name>TIMER</name>
+      <description>Four 16 bit timers, cascadable</description>
+      <baseAddress>0x04000100</baseAddress>
+      <addressBlock>
+        <offset>0</offset>
+        <size>0x10</size>
+        <usage>registers</usage>
+      </addressBlock>
+      <registers>
+        <register><name>TM0CNT_L</name><addressOffset>0x00</addressOffset>
+          <description>Reads the counter, writes the reload value</description></register>
+        <register>
+          <name>TM0CNT_H</name>
+          <description>Timer 0 control</description>
+          <addressOffset>0x02</addressOffset>
+          <fields>
+            <field><name>PRESCALER</name><bitRange>[1:0]</bitRange>
+              <description>0 = 1, 1 = 64, 2 = 256, 3 = 1024 cycles</description></field>
+            <field><name>CASCADE</name><bitRange>[2:2]</bitRange>
+              <description>Count overflows of the previous timer</description></field>
+            <field><name>IRQ</name><bitRange>[6:6]</bitRange></field>
+            <field><name>ENABLE</name><bitRange>[7:7]</bitRange></field>
+          </fields>
+        </register>
+        <register><name>TM1CNT_L</name><addressOffset>0x04</addressOffset></register>
+        <register><name>TM1CNT_H</name><addressOffset>0x06</addressOffset><derivedFrom>TM0CNT_H</derivedFrom></register>
+        <register><name>TM2CNT_L</name><addressOffset>0x08</addressOffset></register>
+        <register><name>TM2CNT_H</name><addressOffset>0x0A</addressOffset><derivedFrom>TM0CNT_H</derivedFrom></register>
+        <register><name>TM3CNT_L</name><addressOffset>0x0C</addressOffset></register>
+        <register><name>TM3CNT_H</name><addressOffset>0x0E</addressOffset><derivedFrom>TM0CNT_H</derivedFrom></register>
+      </registers>
+    </peripheral>
+
+    <!-- ================================================== serial -->
+    <peripheral>
+      <name>SIO</name>
+      <description>Link port: normal, multiplayer, UART and JOY bus modes</description>
+      <baseAddress>0x04000120</baseAddress>
+      <addressBlock>
+        <offset>0</offset>
+        <size>0x10</size>
+        <usage>registers</usage>
+      </addressBlock>
+      <registers>
+        <register><name>SIODATA32</name><addressOffset>0x00</addressOffset><size>32</size>
+          <description>Normal mode 32 bit data; also SIOMULTI0/1</description></register>
+        <register><name>SIOMULTI2</name><addressOffset>0x04</addressOffset></register>
+        <register><name>SIOMULTI3</name><addressOffset>0x06</addressOffset></register>
+        <register>
+          <name>SIOCNT</name>
+          <description>Serial control; bit meanings depend on RCNT mode</description>
+          <addressOffset>0x08</addressOffset>
+          <fields>
+            <field><name>BAUD</name><bitRange>[1:0]</bitRange>
+              <description>9600, 38400, 57600, 115200</description></field>
+            <field><name>SI_TERMINAL</name><bitRange>[2:2]</bitRange><access>read-only</access>
+              <description>Multiplayer: 0 = parent</description></field>
+            <field><name>SD_ALL_READY</name><bitRange>[3:3]</bitRange><access>read-only</access></field>
+            <field><name>MULTI_ID</name><bitRange>[5:4]</bitRange><access>read-only</access></field>
+            <field><name>MULTI_ERROR</name><bitRange>[6:6]</bitRange><access>read-only</access></field>
+            <field><name>START_BUSY</name><bitRange>[7:7]</bitRange></field>
+            <field><name>IRQ</name><bitRange>[14:14]</bitRange></field>
+          </fields>
+        </register>
+        <register><name>SIOMLT_SEND</name><addressOffset>0x0A</addressOffset>
+          <description>Multiplayer send; SIODATA8 in normal and UART modes</description></register>
+        <register>
+          <name>RCNT</name>
+          <description>Mode select and general purpose IO on the link pins</description>
+          <addressOffset>0x14</addressOffset>
+          <fields>
+            <field><name>GPIO_DATA</name><bitRange>[3:0]</bitRange></field>
+            <field><name>GPIO_DIR</name><bitRange>[7:4]</bitRange></field>
+            <field><name>GPIO_IRQ</name><bitRange>[8:8]</bitRange></field>
+            <field><name>MODE</name><bitRange>[15:14]</bitRange>
+              <description>0/1 serial, 2 general purpose, 3 JOY bus</description></field>
+          </fields>
+        </register>
+      </registers>
+    </peripheral>
+
+    <!-- ================================================== keypad -->
+    <peripheral>
+      <name>KEYPAD</name>
+      <description>Buttons; all inputs are active low</description>
+      <baseAddress>0x04000130</baseAddress>
+      <addressBlock>
+        <offset>0</offset>
+        <size>0x4</size>
+        <usage>registers</usage>
+      </addressBlock>
+      <registers>
+        <register>
+          <name>KEYINPUT</name>
+          <description>Button state, 0 = pressed</description>
+          <addressOffset>0x00</addressOffset>
+          <access>read-only</access>
+          <resetValue>0x03FF</resetValue>
+          <fields>
+            <field><name>A</name><bitRange>[0:0]</bitRange></field>
+            <field><name>B</name><bitRange>[1:1]</bitRange></field>
+            <field><name>SELECT</name><bitRange>[2:2]</bitRange></field>
+            <field><name>START</name><bitRange>[3:3]</bitRange></field>
+            <field><name>RIGHT</name><bitRange>[4:4]</bitRange></field>
+            <field><name>LEFT</name><bitRange>[5:5]</bitRange></field>
+            <field><name>UP</name><bitRange>[6:6]</bitRange></field>
+            <field><name>DOWN</name><bitRange>[7:7]</bitRange></field>
+            <field><name>R</name><bitRange>[8:8]</bitRange></field>
+            <field><name>L</name><bitRange>[9:9]</bitRange></field>
+          </fields>
+        </register>
+        <register>
+          <name>KEYCNT</name>
+          <description>Keypad interrupt select</description>
+          <addressOffset>0x02</addressOffset>
+          <fields>
+            <field><name>MASK</name><bitRange>[9:0]</bitRange></field>
+            <field><name>IRQ</name><bitRange>[14:14]</bitRange></field>
+            <field><name>AND_MODE</name><bitRange>[15:15]</bitRange>
+              <description>0 = any selected key, 1 = all of them</description></field>
+          </fields>
+        </register>
+      </registers>
+    </peripheral>
+
+    <!-- ================================================== system -->
+    <peripheral>
+      <name>SYSTEM</name>
+      <description>Interrupt control, wait states and power management</description>
+      <baseAddress>0x04000200</baseAddress>
+      <addressBlock>
+        <offset>0</offset>
+        <size>0x10</size>
+        <usage>registers</usage>
+      </addressBlock>
+      <registers>
+        <register>
+          <name>IE</name>
+          <description>Interrupt enable</description>
+          <addressOffset>0x00</addressOffset>
+          <fields>
+            <field><name>VBLANK</name><bitRange>[0:0]</bitRange></field>
+            <field><name>HBLANK</name><bitRange>[1:1]</bitRange></field>
+            <field><name>VCOUNT</name><bitRange>[2:2]</bitRange></field>
+            <field><name>TIMER0</name><bitRange>[3:3]</bitRange></field>
+            <field><name>TIMER1</name><bitRange>[4:4]</bitRange></field>
+            <field><name>TIMER2</name><bitRange>[5:5]</bitRange></field>
+            <field><name>TIMER3</name><bitRange>[6:6]</bitRange></field>
+            <field><name>SERIAL</name><bitRange>[7:7]</bitRange></field>
+            <field><name>DMA0</name><bitRange>[8:8]</bitRange></field>
+            <field><name>DMA1</name><bitRange>[9:9]</bitRange></field>
+            <field><name>DMA2</name><bitRange>[10:10]</bitRange></field>
+            <field><name>DMA3</name><bitRange>[11:11]</bitRange></field>
+            <field><name>KEYPAD</name><bitRange>[12:12]</bitRange></field>
+            <field><name>GAMEPAK</name><bitRange>[13:13]</bitRange></field>
+          </fields>
+        </register>
+        <register>
+          <name>IF</name>
+          <description>Interrupt request flags; write a 1 to acknowledge</description>
+          <addressOffset>0x02</addressOffset>
+          <derivedFrom>IE</derivedFrom>
+        </register>
+        <register>
+          <name>WAITCNT</name>
+          <description>Game Pak wait states and prefetch</description>
+          <addressOffset>0x04</addressOffset>
+          <fields>
+            <field><name>SRAM</name><bitRange>[1:0]</bitRange></field>
+            <field><name>WS0_N</name><bitRange>[3:2]</bitRange></field>
+            <field><name>WS0_S</name><bitRange>[4:4]</bitRange></field>
+            <field><name>WS1_N</name><bitRange>[6:5]</bitRange></field>
+            <field><name>WS1_S</name><bitRange>[7:7]</bitRange></field>
+            <field><name>WS2_N</name><bitRange>[9:8]</bitRange></field>
+            <field><name>WS2_S</name><bitRange>[10:10]</bitRange></field>
+            <field><name>PHI_OUT</name><bitRange>[12:11]</bitRange></field>
+            <field><name>PREFETCH</name><bitRange>[14:14]</bitRange></field>
+            <field><name>GAMEPAK_TYPE</name><bitRange>[15:15]</bitRange><access>read-only</access></field>
+          </fields>
+        </register>
+        <register>
+          <name>IME</name>
+          <description>Master interrupt enable</description>
+          <addressOffset>0x08</addressOffset>
+          <fields>
+            <field><name>ENABLE</name><bitRange>[0:0]</bitRange></field>
+          </fields>
+        </register>
+        <register>
+          <name>POSTFLG</name>
+          <description>Post-boot flag; 1 after the BIOS has run once</description>
+          <addressOffset>0x100</addressOffset>
+          <size>8</size>
+        </register>
+        <register>
+          <name>HALTCNT</name>
+          <description>Write 0 to Halt, 0x80 to Stop</description>
+          <addressOffset>0x101</addressOffset>
+          <size>8</size>
+          <access>write-only</access>
+        </register>
+      </registers>
+    </peripheral>
+
+  </peripherals>
+</device>

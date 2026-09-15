@@ -1,5 +1,114 @@
 # Changelog
 
+## 2026-09-15
+
+### Saves on a physical Game Pak
+
+- **Fixed: no EEPROM game could save.** The first cut raised `/CS` at the end
+  of every cartridge write. EEPROM is a serial device on the ROM bus that
+  counts bits and needs its whole command - 9 bits for a read request, 73 for
+  a write - inside a single `/CS` assertion, so every command reached the
+  cartridge as a string of aborted 1-bit commands. Writes now burst the way
+  reads already did: `/CS` stays low across a sequential run and only goes
+  high for a non-sequential access or a `/CS2` one, which is what a real AGB
+  does when DMA3 walks up `0x0DFFFF00`. This is what a tester was seeing as
+  "ROM boots but saves don't work" on *Phantasy Star Collection* (`AGB-AYCP`),
+  whose board carries a ROHM 9854 64 Kbit EEPROM; SRAM and FLASH carts were
+  not affected.
+- `sim/tb_cart_phys.vhd` grew the two save devices it was missing: an EEPROM
+  that aborts a command when `/CS` rises part way through, exactly like the
+  chip, and counts those aborts; and a FLASH chip with the 5555/2AAA/5555
+  unlock, the autoselect ID a save library reads before it will save at all,
+  and byte program. The EEPROM model is parameterised by address width and is
+  exercised at both of them - the 6-bit/4 Kbit part and the 14-bit/64 Kbit
+  part that the reporting cartridge carries. The EEPROM test fails the old
+  design 73 times over.
+- `/CS2` accesses no longer follow the Fast/Normal/Safe ladder. Every preset
+  now holds `/RD` or `/WR` low for at least 400 ns, which is what FlashGBX's
+  LK firmware uses against real cartridges and explicitly attributes to FRAM -
+  the save chip in many repro carts and battery-free replacements. Saves are a
+  few thousand bytes now and then, so the time is not felt; a chip that
+  answers late corrupts a save silently.
+- The pin map is now cross-checked against Heber's published expansion-header
+  pinout rather than only traced from the adapter netlist, which confirms
+  `USER_IO[6]` = DIR1, `USER_IO[5]` = DIR2 and `USER_IO[4]` = cartridge pin 30.
+  `docs/mms2_cart.md` records why that netlist calls pin 30 `~{MCLR}`: it is
+  the Game Boy `/RESET` pin, and on a GBA Game Pak the same pin is `/CS2`.
+  Nothing about a reset line is missing - there isn't one on a GBA cartridge.
+
+### Physical GBA cartridges on the Multisystem2 (`GBA_MMS2` revision)
+
+- New Quartus revision `GBA_MMS2` plays a **real Game Pak** plugged into the
+  Heber GB/GBC/GBA cartridge adapter. No dumping: the emulated CPU's whole
+  cartridge window (0x8..0xF) is wired to the connector, so the cartridge's
+  ROM, its SRAM/FLASH saves, its EEPROM and its GPIO devices (RTC, solar,
+  gyro, rumble) are the real thing rather than emulations of one.
+- The adapter has had GBA support in hardware all along and was waiting on an
+  accuracy-grade core: the Game Pak bus is specified in 16.777216 MHz cycles,
+  and only now does the core run at literally that rate. `clk6x` (exactly 6x)
+  sequences the bus, putting every edge on a ~10 ns grid.
+- `rtl/gba_cart_phys.vhd` implements the bus: the `/CS` address latch, the
+  cartridge's own 16-bit auto-increment counter (so bursts skip the address
+  phase, and restart across the 128 KB wrap where the counter runs out), the
+  `/CS2` save window with its data on A16-23, and the `WAITCNT`-driven PHI
+  terminal.
+- New **Hardware → MMS2 Cartridge** toggle, and a **Cart Bus Timing**
+  preset (Normal/Safe/Fast) to trade margin against speed on tired connectors
+  and slow repro carts. The emulated wait state runs concurrently with the
+  physical access, so an access that fits inside it costs nothing.
+- Cartridge reads cost 7 emulated cycles random / 4 burst at Normal, against
+  3 and 1 on a real AGB, so ROM-resident code runs slower than hardware (code
+  the game copies into IWRAM or EWRAM is untouched). About half of that is the
+  clk1x/clk6x handshake rather than the bus - see `docs/mms2_cart.md`.
+- Backup-RAM menu entries are hidden while the cartridge is in use - the saves
+  live on the cartridge. The SNAC link port is unavailable in cartridge mode,
+  which needs two of its pins for the level shifter direction controls.
+- `sim/tb_cart_phys.vhd` drives the design against a behavioural Game Pak that
+  implements only what GBATEK specifies, and asserts continuously that `/CS`
+  and `/CS2` are never both low and that neither end ever drives into the
+  other.
+- See `docs/mms2_cart.md` for the pin map (traced from the adapter's netlist),
+  the bus protocol and the measured timing.
+- `MISTER_MMS2` moves 29 FPGA pins to the expansion header, which is correct
+  only on a Multisystem2 - hence a separate revision. `GBA`, `GBA2P` and
+  `GBA2P_MEMTEST` are unaffected.
+
+## 2026-09-04
+
+### 90 degree video rotation
+
+- New **Video & Audio > Rotate Video** option: *Off*, *90 CW*, *90 CCW*, for
+  playing on a physically rotated monitor. 1P scanout becomes 160x240 and
+  "Original" aspect becomes 2:3.
+- The 2P profile rotates into a **stack**: the 480x160 side-by-side pair
+  becomes 160x480 with player 1 above player 2, which is what a quarter turn
+  of the side-by-side frame naturally gives and what fills a portrait screen
+  best (each player gets 640x960 of a portrait 1080p panel, against 540x810
+  if the rotated pair were left side by side). The 2P Separator Line becomes
+  a horizontal seam, and the single-player views line double instead of
+  pixel doubling. "Original" aspect is 1:3 stacked, 2:3 single player.
+- The rotated 2P raster is 399 x 530 pixel clocks against 798 x 265 - the
+  same 211470 ticks per frame, halved line length for twice the lines - so
+  the frame period, and everything paced off it, is unchanged there too.
+- Core 2's frame buffer channel now carries one pixel per entry with byte
+  enables when rotated (4x the entries, same bytes) and its FIFO is 512 deep
+  instead of 256, for the same reason as core 1's.
+- Rotation is applied where GPU pixels enter the DDR3 frame buffers, by
+  remapping the (row, column) of each pixel, so it costs no extra frame of
+  latency and no extra copy of the frame. The frame buffer's fixed 256 pixel
+  row stride means a rotated 240x160 frame still fits the 128k reserved per
+  buffer.
+- DDR3Mux writes rotated frames one pixel at a time with byte enables: under
+  rotation the four pixels of a 64 bit word come from four different GBA
+  scanlines, so the usual write combining cannot be used.
+- The frame period is unchanged (399 x 265 pixel clocks), so core-to-video
+  pacing, pause and rewind behave exactly as before; only the active window
+  moves.
+- Borders and CRT V-Sync Adjust are hidden and inactive while rotated - the
+  border image is a 320x240 landscape frame, and a rotated frame leaves only
+  3 blank lines below the image. The 2P profile cannot rotate: it scans out a
+  480 wide side-by-side frame.
+
 ## 2026-07-11
 
 ### Real link timing and physical AGB-015 path

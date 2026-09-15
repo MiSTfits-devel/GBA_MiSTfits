@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# SPDX-FileCopyrightText: 2026 Sarah Aronson <v@pingas.org>
+# GBA_MMS2 revision: the 1P core built for a Heber Multisystem2 with the
+# GB/GBC/GBA cartridge adapter fitted, so a real Game Pak can be played
+# straight off the bus. See docs/mms2_cart.md.
+#
+# This is a separate revision on purpose. MISTER_MMS2 takes 29 FPGA pins away
+# from their stock functions (mainboard LEDs and keys, the ADC, the Arduino
+# header, the second SD slot, and the SDRAM strobes the MMS2 ties off on the
+# board) and routes them to the expansion header instead - correct on a
+# Multisystem2, wrong on anything else. The plain GBA revision is unchanged.
+
+source GBA.qsf
+
+set_global_assignment -name VERILOG_MACRO "MISTER_MMS2=1"
+
+# ---- Multisystem2 expansion bus ----
+source sys/mms2_pins.tcl

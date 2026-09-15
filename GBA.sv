@@ -173,13 +173,25 @@ module emu
 	// Set USER_OUT to 1 to read from USER_IN.
 	input   [6:0] USER_IN,
 	output  [6:0] USER_OUT,
+`ifdef MISTER_MMS2
+	// Push-pull direction per USER pin (1 = the core drives it). The stock
+	// framework is open drain only; the cartridge adapter needs real drivers
+	// on the two level shifter direction controls.
+	output  [6:0] USER_DIR,
+	// Multisystem2 expansion bus - the physical cartridge lives here.
+	input  [28:0] MMS_BUS_IN,
+	output [28:0] MMS_BUS_OUT,
+	output [28:0] MMS_BUS_DIR,
+`endif
 
 	input         OSD_STATUS
 );
 
 assign ADC_BUS  = 'Z;
 assign {UART_RTS, UART_DTR} = 0;
+`ifndef MISTER_MMS2
 assign USER_OUT = linkport_user_out; // all released ('1) unless the link port claims its pins
+`endif
 
 assign AUDIO_S   = 1;
 assign AUDIO_MIX = status[8:7];
@@ -212,7 +224,26 @@ pll pll
 	.locked(pll_locked)
 );
 
-wire reset = RESET | buttons[1] | status[0] | cart_download | bk_loading;
+////////////////////  PHYSICAL CARTRIDGE (Multisystem2)  ////////////////
+`ifdef MISTER_MMS2
+wire       cart_real   = status[67];
+wire [1:0] cart_timing = status[69:68];
+`else
+wire       cart_real   = 1'b0;
+wire [1:0] cart_timing = 2'b00;
+`endif
+
+// Switching the cartridge in or out changes what the whole 0x8..0xF window
+// is, so the core is held in reset across the transition (and at power up).
+reg        cart_real_d   = 1'b0;
+reg  [7:0] cart_mode_rst = 8'hFF;
+always @(posedge clk_sys) begin
+	cart_real_d <= cart_real;
+	if (cart_real != cart_real_d) cart_mode_rst <= 8'hFF;
+	else if (|cart_mode_rst)      cart_mode_rst <= cart_mode_rst - 1'd1;
+end
+
+wire reset = RESET | buttons[1] | status[0] | cart_download | bk_loading | (|cart_mode_rst);
 
 ////////////////////////////  HPS I/O  //////////////////////////////////
 
@@ -221,6 +252,7 @@ wire reset = RESET | buttons[1] | status[0] | cart_download | bk_loading;
 // 01234567890123456789012345678901 23456789012345678901234567890123
 // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
 // X XXXXXXXXXRXXXXXXXXXXXXXXXXXXXX XXXXXXXXXXXXXXXXxxxxxxxxxxxx
+// 64 = Robby Mode, 65..66 = Rotate Video
 
 `include "build_id.v"
 parameter CONF_STR = {
@@ -257,10 +289,11 @@ parameter CONF_STR = {
 	"P1O[26:24],Modify Colors,Off,GBA 2.2,GBA 1.6,NDS 1.6,VBA 1.4,75%,50%,25%;",
 	"P1-;",
    "P1O[55:52],CRT H-Sync Adjust,0,1,2,3,4,5,6,7,-8,-7,-6,-5,-4,-3,-2,-1;",
-	"P1O[58:56],CRT V-Sync Adjust,0,1,2,3,-4,-3,-2,-1;",
+	"H10P1O[58:56],CRT V-Sync Adjust,0,1,2,3,-4,-3,-2,-1;",
 	"P1-;",
-	"P1O[51],Borders,Off,On;",
-	"P1FC2,BOR,Load Border,3D000000;",
+	"P1O[66:65],Rotate Video,Off,90 CW,90 CCW;",
+	"H10P1O[51],Borders,Off,On;",
+	"H10P1FC2,BOR,Load Border,3D000000;",
 	"P1-;",
 	"P1O[39],Sync core to video,On,Off;",
 	"P1O[10:9],Flickerblend,Off,Blend,30Hz;",
@@ -290,6 +323,11 @@ parameter CONF_STR = {
 	"P2R[63],Reset Player 1;",
 	"P2R[1],Reset Player 2;",
    "P2-;",
+`endif
+`ifdef MISTER_MMS2
+   "P2-;",
+	"P2O[67],MMS2 Cartridge,Off,On;",
+	"H11P2O[69:68],Cart Bus Timing,Normal,Safe,Fast;",
 `endif
    "P2-,Save setting + reload Core;",
 	"P2O[28],Homebrew BIOS,Off,On;",
@@ -354,7 +392,19 @@ parameter CONF_STR = {
 
 wire  [1:0] buttons;
 wire [127:0] status;
+
+// rotated, the 2P profile's 480x160 side by side pair becomes a 160x480
+// stack with player 1 above player 2
+wire [1:0] video_rotate = status[66:65];
+
 wire [15:0] status_menumask = {
+	4'b0000,                           // unused
+`ifdef MISTER_MMS2
+	~cart_real,                        // H11: hide Cart Bus Timing unless the cartridge is in use
+`else
+	1'b0,                              // H11: unused
+`endif
+	|video_rotate,                     // H10: hide borders and V-Sync adjust while the image is rotated
 `ifdef GBA2P_LITE
 	(status[46:44] == 3'd2),        // H9: hide Link Debug Overlay when Multiplayer is Off (2P profile: Off = 2)
 `else
@@ -659,6 +709,72 @@ gba_linkport linkport
 	.link_sd_in  (link_sd_in  )
 );
 
+wire [15:0] cart_ad_out, cart_ad_in;
+wire  [7:0] cart_a_out,  cart_a_in;
+wire        cart_ad_drive, cart_a_drive;
+wire        cart_cs_n, cart_cs2_n, cart_rd_n, cart_wr_n, cart_phi;
+
+`ifdef MISTER_MMS2
+////////////////////  Multisystem2 cartridge wiring  /////////////////////
+//
+// Pin map taken from the adapter's own netlist (Heber MMS2-Gameboy-Cart-
+// Adapter, board 23467) - see docs/mms2_cart.md:
+//
+//   MMS_BUS[7:0]   AD0-7      MMS_BUS[19:12] AD8-15     (shifters U3/U4, DIR1)
+//   MMS_BUS[21:20] A16-17     MMS_BUS[28:23] A18-23     (shifter  U5,    DIR2)
+//   MMS_BUS[8]     PHI        MMS_BUS[9]     /WR
+//   MMS_BUS[10]    /RD        MMS_BUS[11]    /CS        (shifter  U2, fixed out)
+//   MMS_BUS[22]    shifter /OE, and through D4/Q5 the cartridge's own power
+//   USER_IO[4]     /CS2 (open drain via a BSS138, 10k pull up to VCART)
+//   USER_IO[5]     DIR2       USER_IO[6]     DIR1       (1 = FPGA drives)
+
+// Releasing /OE turns the shifters off AND drops the cartridge's supply, which
+// is what makes swapping carts with the user button held safe. buttons[1] is
+// the Multisystem2's front (yellow) button.
+wire        cart_bus_live = cart_real & ~buttons[1];
+
+assign cart_ad_in = {MMS_BUS_IN[19:12], MMS_BUS_IN[7:0]};
+assign cart_a_in  = {MMS_BUS_IN[28:23], MMS_BUS_IN[21:20]};
+
+assign MMS_BUS_OUT[7:0]   = cart_ad_out[7:0];
+assign MMS_BUS_OUT[8]     = cart_phi;
+assign MMS_BUS_OUT[9]     = cart_wr_n;
+assign MMS_BUS_OUT[10]    = cart_rd_n;
+assign MMS_BUS_OUT[11]    = cart_cs_n;
+assign MMS_BUS_OUT[19:12] = cart_ad_out[15:8];
+assign MMS_BUS_OUT[21:20] = cart_a_out[1:0];
+assign MMS_BUS_OUT[22]    = 1'b0;               // /OE is asserted by driving the pin at all
+assign MMS_BUS_OUT[28:23] = cart_a_out[7:2];
+
+// The FPGA's own tristates track the shifter direction exactly, so the two
+// never drive towards each other.
+assign MMS_BUS_DIR[7:0]   = {8{cart_bus_live & cart_ad_drive}};
+assign MMS_BUS_DIR[11:8]  = {4{cart_bus_live}};
+assign MMS_BUS_DIR[19:12] = {8{cart_bus_live & cart_ad_drive}};
+assign MMS_BUS_DIR[21:20] = {2{cart_bus_live & cart_a_drive}};
+assign MMS_BUS_DIR[22]    = cart_bus_live;
+assign MMS_BUS_DIR[28:23] = {6{cart_bus_live & cart_a_drive}};
+
+// USER port. Pins 0..3 stay with the link port on its usual open drain
+// convention (DIR = ~OUT, drive low or release); the cartridge takes 4..6,
+// where /CS2 is open drain and the two direction controls are push-pull.
+assign USER_OUT[3:0] = 4'b0000;
+assign USER_DIR[3:0] = ~linkport_user_out[3:0];
+
+assign USER_OUT[4]   = 1'b0;
+assign USER_OUT[5]   = cart_a_drive;
+assign USER_OUT[6]   = cart_ad_drive;
+
+assign USER_DIR[4]   = cart_real ? (cart_bus_live & ~cart_cs2_n) : ~linkport_user_out[4];
+assign USER_DIR[5]   = cart_real ?  cart_bus_live                : ~linkport_user_out[5];
+assign USER_DIR[6]   = cart_real ?  cart_bus_live                : ~linkport_user_out[6];
+`else
+// No expansion bus on this revision: the cartridge master is held disabled by
+// cart_real=0, and these inputs are what an unpowered, unpopulated bus reads.
+assign cart_ad_in = 16'hFFFF;
+assign cart_a_in  = 8'hFF;
+`endif
+
 // GBA2P_LITE: the 2P build profile drops savestates/rewind and cheats -
 // irrelevant for realtime 2P and they pay for the second core.
 // GBA2P_MEMTEST: hardware bisect profile - single core with the 2P build's
@@ -751,7 +867,8 @@ gba
    .load_state(ss_load),
    .interframe_blend(status[10:9]),
    .shade_mode(status[26:24]),
-   .borderOn(status[51]),
+   .borderOn(status[51] & ~|video_rotate),
+   .videoRotate(video_rotate),
    .videoHshift(status[55:52]),
    .videoVshift(status[58:56]),
 	.specialmodule(gpio_quirk | status[40]),
@@ -856,6 +973,20 @@ gba
 	.AnalogTiltY(joystick_analog_0[15:8]),
 	.Rumble(cart_rumble),
    .KeyPause(joy[10]),
+
+   .cart_phys_en    (cart_real    ),
+   .cart_phys_timing(cart_timing  ),
+   .cart_ad_out     (cart_ad_out  ),
+   .cart_ad_in      (cart_ad_in   ),
+   .cart_ad_drive   (cart_ad_drive),
+   .cart_a_out      (cart_a_out   ),
+   .cart_a_in       (cart_a_in    ),
+   .cart_a_drive    (cart_a_drive ),
+   .cart_cs_n       (cart_cs_n    ),
+   .cart_cs2_n      (cart_cs2_n   ),
+   .cart_rd_n       (cart_rd_n    ),
+   .cart_wr_n       (cart_wr_n    ),
+   .cart_phi        (cart_phi     ),
 
    .link_enable     (link_enable     ),
    .link_wireless   (link_wireless   ),
@@ -1254,11 +1385,13 @@ video_freak video_freak
 	// show one core's 240x160 image pixel-doubled to fill the same 480x160
 	// frame, so "Original" needs the normal single-GBA 3:2 ratio instead of
 	// the side-by-side 3:1 - half the width ratio, image content is unchanged.
-	.ARX((!ar) ? 12'd3 : (ar - 1'd1)),
-	.ARY((!ar) ? ((|status[21:20]) ? 12'd2 : 12'd1) : 12'd0),
+	// Rotated the same frame is a 160x480 stack, so both ratios turn on end.
+	.ARX((!ar) ? ((|video_rotate) ? ((|status[21:20]) ? 12'd2 : 12'd1) : 12'd3) : (ar - 1'd1)),
+	.ARY((!ar) ? ((|video_rotate) ? 12'd3 : ((|status[21:20]) ? 12'd2 : 12'd1)) : 12'd0),
 `else
-	.ARX((!ar) ? ((status[51]) ? 12'd4 : 12'd3) : (ar - 1'd1)),
-	.ARY((!ar) ? ((status[51]) ? 12'd3 : 12'd2) : 12'd0),
+	// rotated "Original" is the 3:2 GBA screen stood on end
+	.ARX((!ar) ? ((|video_rotate) ? 12'd2 : (status[51]) ? 12'd4 : 12'd3) : (ar - 1'd1)),
+	.ARY((!ar) ? ((|video_rotate) ? 12'd3 : (status[51]) ? 12'd3 : 12'd2) : 12'd0),
 `endif
 	.CROP_SIZE(0),
 	.CROP_OFF(0),
@@ -1307,7 +1440,9 @@ always @(posedge clk_6x) begin : size_block
 			save_sz <= img_size[17:9] - 2'd2;
 	end
 
-	bk_ena <= |save_sz;
+	// With a real cartridge the saves live on the cartridge itself, so the
+	// SD-card backup path stays out of the way entirely.
+	bk_ena <= (|save_sz) & ~cart_real;
 end
 
 reg  bk_state  = 0;

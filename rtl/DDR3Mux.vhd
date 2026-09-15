@@ -72,6 +72,9 @@ entity DDR3Mux is
       rdram_ready      : out tDDDR3Single;
       rdram_dataRead   : out std_logic_vector(63 downto 0);
       
+      -- 1 = the GPU is writing a rotated frame, see below
+      gpufifo_rotate   : in  std_logic := '0';
+
       gpufifo_reset    : in  std_logic;
       gpufifo_Din      : in  std_logic_vector(33 downto 0); -- 16bit data + 18 bit address
       gpufifo_Wr       : in  std_logic;
@@ -80,7 +83,11 @@ entity DDR3Mux is
 
       -- second channel takes whole 64bit words (4 pixels), not single pixels:
       -- one entry per 2 clk1x is all the drain rate left over during blend
-      gpufifo2_Din     : in  std_logic_vector(79 downto 0) := (others => '0'); -- 16 bit word address + 64bit data
+      -- {frame(2), row(8), column(8), data(64)}: bits 81..66 are the 64bit
+      -- word address and bits 65..64 the pixel within it, which un-rotated
+      -- is always "00" (the channel carries whole 4 pixel words) and rotated
+      -- selects the byte enables for a single pixel write
+      gpufifo2_Din     : in  std_logic_vector(81 downto 0) := (others => '0');
       gpufifo2_Wr      : in  std_logic := '0';
       gpufifo2_empty   : out std_logic;
 
@@ -121,7 +128,7 @@ architecture arch of DDR3Mux is
    signal gpufifo_Next     : std_logic_vector(47 downto 0) := (others => '0');
 
    -- gpu fifo 2 (2P profile)
-   signal gpufifo2_Dout    : std_logic_vector(79 downto 0) := (others => '0');
+   signal gpufifo2_Dout    : std_logic_vector(81 downto 0) := (others => '0');
    signal gpufifo2_Rd      : std_logic := '0';
 
 begin
@@ -223,16 +230,40 @@ begin
                    
                   elsif (gpufifo_empty = '0' and gpufifo_Rd = '0') then
 
-                     if (gpufifo_Dout(17 downto 16) = "00") then gpufifo_Next(15 downto  0) <= gpufifo_Dout(15 downto 0); end if;
-                     if (gpufifo_Dout(17 downto 16) = "01") then gpufifo_Next(31 downto 16) <= gpufifo_Dout(15 downto 0); end if;
-                     if (gpufifo_Dout(17 downto 16) = "10") then gpufifo_Next(47 downto 32) <= gpufifo_Dout(15 downto 0); end if;
-                     if (gpufifo_Dout(17 downto 16) = "11") then
-                        ddr3_DIN_reg <= gpufifo_Dout(15 downto 0) & gpufifo_Next;
-                        ddr3_WE <= '1';
+                     if (gpufifo_rotate = '1') then
+
+                        -- A rotated frame puts consecutive pixels of a GBA
+                        -- scanline in consecutive DDR3 rows, so the four
+                        -- pixels of a 64 bit word never arrive back to back
+                        -- and the write combining below would both stall and
+                        -- mix pixels from different lines. Write each pixel on
+                        -- its own with byte enables instead: 4x the write
+                        -- requests, same bytes, and the drain still keeps up
+                        -- with the GPU's one pixel per ~7 clk1x.
+                        ddr3_DIN_reg <= gpufifo_Dout(15 downto 0) & gpufifo_Dout(15 downto 0) & gpufifo_Dout(15 downto 0) & gpufifo_Dout(15 downto 0);
+                        ddr3_WE      <= '1';
+                        case (gpufifo_Dout(17 downto 16)) is
+                           when "00"   => ddr3_BE <= x"03";
+                           when "01"   => ddr3_BE <= x"0C";
+                           when "10"   => ddr3_BE <= x"30";
+                           when others => ddr3_BE <= x"C0";
+                        end case;
+
+                     else
+
+                        if (gpufifo_Dout(17 downto 16) = "00") then gpufifo_Next(15 downto  0) <= gpufifo_Dout(15 downto 0); end if;
+                        if (gpufifo_Dout(17 downto 16) = "01") then gpufifo_Next(31 downto 16) <= gpufifo_Dout(15 downto 0); end if;
+                        if (gpufifo_Dout(17 downto 16) = "10") then gpufifo_Next(47 downto 32) <= gpufifo_Dout(15 downto 0); end if;
+                        if (gpufifo_Dout(17 downto 16) = "11") then
+                           ddr3_DIN_reg <= gpufifo_Dout(15 downto 0) & gpufifo_Next;
+                           ddr3_WE <= '1';
+                        end if;
+
+                        ddr3_BE    <= x"FF";
+
                      end if;
-                  
+
                      gpufifo_Rd <= '1';
-                     ddr3_BE    <= x"FF";
                      ddr3_ADDR(24 downto 0) <= "100000000" & gpufifo_Dout(33 downto 18);
                      ddr3_BURSTCNT <= x"01";
 
@@ -242,8 +273,18 @@ begin
                      ddr3_WE       <= '1';
 
                      gpufifo2_Rd   <= '1';
-                     ddr3_BE       <= x"FF";
-                     ddr3_ADDR(24 downto 0) <= "100000001" & gpufifo2_Dout(79 downto 64);
+                     if (gpufifo_rotate = '1') then
+                        -- one pixel per entry, replicated across the word
+                        case (gpufifo2_Dout(65 downto 64)) is
+                           when "00"   => ddr3_BE <= x"03";
+                           when "01"   => ddr3_BE <= x"0C";
+                           when "10"   => ddr3_BE <= x"30";
+                           when others => ddr3_BE <= x"C0";
+                        end case;
+                     else
+                        ddr3_BE    <= x"FF";
+                     end if;
+                     ddr3_ADDR(24 downto 0) <= "100000001" & gpufifo2_Dout(81 downto 66);
                      ddr3_BURSTCNT <= x"01";
 
                   end if;
@@ -333,8 +374,10 @@ begin
       iGPUFifo2: entity mem.SyncFifoFallThrough
       generic map
       (
-         SIZE             => 256,
-         DATAWIDTH        => 80, -- 16 bit word address + 64bit data
+         -- rotated frames put one pixel per entry instead of four, so the
+         -- channel sees 4x the entries at the same pixel rate
+         SIZE             => 512,
+         DATAWIDTH        => 82, -- 18 bit pixel address + 64bit data
          NEARFULLDISTANCE => 16
       )
       port map

@@ -46,15 +46,19 @@ module sys_top
 	//////////// SDR ///////////
 	output [12:0] SDRAM_A,
 	inout  [15:0] SDRAM_DQ,
+`ifndef MISTER_MMS2
 	output        SDRAM_DQML,
 	output        SDRAM_DQMH,
+`endif
 	output        SDRAM_nWE,
 	output        SDRAM_nCAS,
 	output        SDRAM_nRAS,
 	output        SDRAM_nCS,
 	output  [1:0] SDRAM_BA,
 	output        SDRAM_CLK,
+`ifndef MISTER_MMS2
 	output        SDRAM_CKE,
+`endif
 
 `ifdef MISTER_DUAL_SDRAM
 	////////// SDR #2 //////////
@@ -82,9 +86,11 @@ module sys_top
 	output		  AUDIO_SPDIF,
 
 	//////////// SDIO ///////////
+`ifndef MISTER_MMS2
 	inout   [3:0] SDIO_DAT,
 	inout         SDIO_CMD,
 	output        SDIO_CLK,
+`endif
 
 	//////////// I/O ///////////
 	output        LED_USER,
@@ -97,6 +103,7 @@ module sys_top
 
 	////////// I/O ALT /////////
 	output        SD_SPI_CS,
+`ifndef MISTER_MMS2
 	input         SD_SPI_MISO,
 	output        SD_SPI_CLK,
 	output        SD_SPI_MOSI,
@@ -113,16 +120,47 @@ module sys_top
 
 	////////// MB KEY ///////////
 	input   [1:0] KEY,
+`endif
 
 	////////// MB SWITCH ////////
 	input   [3:0] SW,
 
+`ifndef MISTER_MMS2
 	////////// MB LED ///////////
 	output  [7:0] LED,
+`endif
 
 	///////// USER IO ///////////
 	inout   [6:0] USER_IO
+
+`ifdef MISTER_MMS2
+	,
+	///////// MULTISYSTEM2 EXPANSION BUS /////////
+	// 29 pins that the Multisystem2 routes to its expansion header instead of
+	// the stock functions above (LEDs, mainboard keys, ADC, Arduino I/O,
+	// second SD slot, and the SDRAM strobes the MMS2 ties off on the board).
+	// Every pin below is literally one of those, which is why they have to
+	// leave the port list for this revision.
+	inout  [28:0] MMS_BUS
+`endif
 );
+
+`ifdef MISTER_MMS2
+// The framework logic that used to reach those pins is left exactly as it was
+// and now drives (or reads) plain nets instead - cheaper to keep than to
+// #ifdef out, and it keeps this file diffable against upstream.
+wire        SDRAM_DQML, SDRAM_DQMH, SDRAM_CKE;
+wire  [3:0] SDIO_DAT;
+wire        SDIO_CMD, SDIO_CLK;
+wire        SD_SPI_MISO = 1'b1;
+wire        SD_SPI_CLK, SD_SPI_MOSI;
+wire        SDCD_SPDIF  = 1'b1;   // no second SD slot on Multisystem2
+wire        IO_SCL, IO_SDA;
+wire        ADC_SCK, ADC_SDI, ADC_CONVST;
+wire        ADC_SDO;          // part of the emu ADC_BUS tristate, left to it
+wire  [1:0] KEY        = 2'b11;   // released; the MMS2 buttons arrive over the HPS
+wire  [7:0] LED;
+`endif
 
 //////////////////////  Secondary SD  ///////////////////////////////////
 wire SD_CS, SD_CLK, SD_MOSI, SD_MISO, SD_CD;
@@ -156,6 +194,17 @@ wire led_locked;
 //LEDs on de10-nano board
 assign LED = (led_overtake & led_state) | (~led_overtake & {1'b0,led_locked,1'b0, ~led_p, 1'b0, ~led_d, 1'b0, ~led_u});
 
+`ifdef MISTER_MMS2
+// Multisystem2 has no MCP23009 port expander, and its I2C pins are part of the
+// expansion bus, so the controller is left out entirely rather than talking to
+// a net that goes nowhere.
+wire [2:0] mcp_btn  = 3'b000;
+wire       mcp_sdcd = 1'b0;
+wire       mcp_en   = 1'b0;
+wire       mcp_mode = 1'b0;
+assign     IO_SCL   = 1'b1;
+assign     IO_SDA   = 1'b1;
+`else
 wire [2:0] mcp_btn;
 wire       mcp_sdcd;
 wire       mcp_en;
@@ -173,6 +222,7 @@ mcp23009 mcp23009
 	.scl(IO_SCL),
 	.sda(IO_SDA)
 );
+`endif
 
 wire io_dig = mcp_en ? mcp_mode : SW[3];
 
@@ -1528,7 +1578,9 @@ end
 
 /////////////////////////  Audio output  ////////////////////////////////
 
+`ifndef MISTER_MMS2
 assign SDCD_SPDIF = (mcp_en & ~spdif) ? 1'b0 : 1'bZ;
+`endif
 
 `ifndef MISTER_DUAL_SDRAM
 	wire analog_l, analog_r;
@@ -1629,6 +1681,36 @@ audio_out audio_out
 
 ////////////////  User I/O (USB 3.0 connector) /////////////////////////
 
+`ifdef MISTER_MMS2
+// The cartridge adapter needs real push-pull drivers on these pins (two of
+// them are the level shifter direction controls), so the core gets an explicit
+// direction per pin instead of the stock open-drain convention. A core that
+// still wants open drain just ties USER_DIR[n] to ~USER_OUT[n] and drives 0.
+// The SW[1] HDMI-I2S overlay is dropped here: those pins belong to the
+// expansion header on this revision.
+assign USER_IO[0] = user_dir[0] ? user_out[0] : 1'bZ;
+assign USER_IO[1] = user_dir[1] ? user_out[1] : 1'bZ;
+assign USER_IO[2] = user_dir[2] ? user_out[2] : 1'bZ;
+assign USER_IO[3] = user_dir[3] ? user_out[3] : 1'bZ;
+assign USER_IO[4] = user_dir[4] ? user_out[4] : 1'bZ;
+assign USER_IO[5] = user_dir[5] ? user_out[5] : 1'bZ;
+assign USER_IO[6] = user_dir[6] ? user_out[6] : 1'bZ;
+
+assign user_in    = USER_IO;
+
+////////////////  Multisystem2 expansion bus  //////////////////////////
+
+wire [28:0] mms_bus_in, mms_bus_out, mms_bus_dir;
+
+assign mms_bus_in = MMS_BUS;
+
+genvar mmsi;
+generate
+	for (mmsi = 0; mmsi <= 28; mmsi = mmsi + 1) begin : MMS_BUS_ASSIGN
+		assign MMS_BUS[mmsi] = mms_bus_dir[mmsi] ? mms_bus_out[mmsi] : 1'bZ;
+	end
+endgenerate
+`else
 assign USER_IO[0] =                       !user_out[0]  ? 1'b0 : 1'bZ;
 assign USER_IO[1] =                       !user_out[1]  ? 1'b0 : 1'bZ;
 assign USER_IO[2] = !(SW[1] ? HDMI_I2S   : user_out[2]) ? 1'b0 : 1'bZ;
@@ -1644,6 +1726,7 @@ assign user_in[3] =         USER_IO[3];
 assign user_in[4] = SW[1] | USER_IO[4];
 assign user_in[5] = SW[1] | USER_IO[5];
 assign user_in[6] =         USER_IO[6];
+`endif
 
 
 ///////////////////  User module connection ////////////////////////////
@@ -1679,6 +1762,9 @@ sync_fix sync_v(clk_vid, vs_emu, vs_fix);
 sync_fix sync_h(clk_vid, hs_emu, hs_fix);
 
 wire  [6:0] user_out, user_in;
+`ifdef MISTER_MMS2
+wire  [6:0] user_dir;
+`endif
 
 assign clk_ihdmi= clk_vid;
 assign ce_hpix  = vga_ce_sl;
@@ -1848,6 +1934,13 @@ emu emu
 
 	.USER_OUT(user_out),
 	.USER_IN(user_in)
+`ifdef MISTER_MMS2
+	,
+	.USER_DIR(user_dir),
+	.MMS_BUS_IN(mms_bus_in),
+	.MMS_BUS_OUT(mms_bus_out),
+	.MMS_BUS_DIR(mms_bus_dir)
+`endif
 );
 
 endmodule
