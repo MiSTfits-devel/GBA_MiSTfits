@@ -611,25 +611,25 @@ begin
       end if;
 
       report "=== timing summary (emulated 16.78 MHz cycles per access) ===";
-      report "  non-sequential ROM read (normal preset): " & integer'image(nseq_c) & " cycles";
-      report "  sequential ROM read (normal preset):     " & integer'image(seq_c) & " cycles";
+      report "  non-sequential ROM read (accurate preset, default): " & integer'image(nseq_c) & " cycles";
+      report "  sequential ROM read (accurate preset, default):     " & integer'image(seq_c) & " cycles";
 
-      timing_sel <= "10";   -- fast
+      timing_sel <= "01";   -- tolerant
       for i in 0 to 10 loop tick; end loop;
       access_cart(x"9000000", '1', '0', (others => '0'), x"00", d, c);
-      check16("fast preset still correct", d, rom_word(to_unsigned(16#800000#, 24)));
-      report "  non-sequential ROM read (fast preset): " & integer'image(c) & " cycles";
+      check16("tolerant preset still correct", d, rom_word(to_unsigned(16#800000#, 24)));
+      report "  non-sequential ROM read (tolerant preset): " & integer'image(c) & " cycles";
       access_cart(x"9000002", '1', '0', (others => '0'), x"00", d, c);
-      report "  sequential ROM read (fast preset):     " & integer'image(c) & " cycles";
+      report "  sequential ROM read (tolerant preset):     " & integer'image(c) & " cycles";
 
-      timing_sel <= "01";   -- safe
+      timing_sel <= "00";   -- back to accurate
       for i in 0 to 10 loop tick; end loop;
       access_cart(x"9000100", '1', '0', (others => '0'), x"00", d, c);
-      check16("safe preset still correct", d, rom_word(to_unsigned(16#800080#, 24)));
-      report "  non-sequential ROM read (safe preset): " & integer'image(c) & " cycles";
+      check16("accurate preset still correct", d, rom_word(to_unsigned(16#800080#, 24)));
+      report "  non-sequential ROM read (accurate preset): " & integer'image(c) & " cycles";
       access_cart(x"9000102", '1', '0', (others => '0'), x"00", d, c);
-      check16("safe preset sequential", d, rom_word(to_unsigned(16#800081#, 24)));
-      report "  sequential ROM read (safe preset):     " & integer'image(c) & " cycles";
+      check16("accurate preset sequential", d, rom_word(to_unsigned(16#800081#, 24)));
+      report "  sequential ROM read (accurate preset):     " & integer'image(c) & " cycles";
 
       report "=== disabled core must release every pin ===";
       enable <= '0';

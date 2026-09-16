@@ -45,3 +45,4 @@ sim/tests/rom_words.hex
 sim/tests/rom2_words.hex
 sim/tests/ewram_alias_test.gba
 build/
+sim/tests/eeprom_words.hex

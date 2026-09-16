@@ -27,8 +27,8 @@ exactly 6x) sequences the bus, which puts every edge on a ~10 ns grid.
    button is held the shifters are off and the cartridge is unpowered, so
    swapping is safe.
 3. OSD → **Hardware → MMS2 Cartridge → On**. Toggling it resets the core.
-4. If the game does not boot, try **Hardware → Cart Bus Timing → Safe** and
-   reseat the cartridge.
+4. If the game does not boot, try **Hardware → Cart Bus Timing → Tolerant**
+   and reseat the cartridge.
 
 Saves stay on the cartridge, so the SD-card backup-RAM menu entries are hidden
 while the cartridge is in use. Save states are unavailable for the same reason
@@ -122,9 +122,8 @@ emulated 16.78 MHz cycles of CPU stall per access:
 
 | Preset | Random ROM read | Burst ROM read |
 |---|---|---|
-| Fast   | 5 | 4 |
-| Normal | 7 | 4 |
-| Safe   | 10 | 5 |
+| Accurate (default) | 10 | 5 |
+| Tolerant | 13 | 7 |
 
 A real AGB does 3 and 1 at a typical `WAITCNT`. The emulated wait state runs
 *concurrently* with the physical access — `gba_memorymux` asserts `cart_ena`
@@ -132,18 +131,52 @@ and counts down at the same time — so anything that finishes inside its wait
 state costs nothing at all, and anything slower just stalls the CPU. Data is
 never wrong either way, so the presets are purely a speed/margin trade.
 
-`Normal` is sized to give the cartridge about the access time a real AGB gives
-it, plus headroom for the two LVC8T245 crossings (~6.5 ns each way) that a real
-AGB does not have. Start there, drop to `Safe` if a cartridge misbehaves.
+### There is no "faster than hardware" setting, on purpose
 
-The `/CS2` save window deliberately does **not** follow that ladder. FlashGBX's
-LK firmware, which is tested against a very large pile of real cartridges,
-holds `/RD` or `/WR` low for 400 ns on every SRAM access and 500 ns on a flash
-write, and says plainly that FRAM needs it — and FRAM is what many repro carts
-and battery-free save replacements use. Every preset here clears 400 ns for
-that reason. A save is a few thousand bytes now and then, so nobody can feel
-the difference, whereas a chip that answers late returns a wrong save byte in
-silence.
+An earlier cut offered Fast / Normal / Safe. That was a mistake, and the
+numbers say why:
+
+| | address→data | sequential beat |
+|---|---|---|
+| old `Fast` | 89 ns | 40 ns |
+| old `Normal` (was the default) | 149 ns | 70 ns |
+| **`Accurate`** (default now) | **308 ns** | **179 ns** |
+| `Tolerant` | 507 ns | 298 ns |
+| real AGB, power-on `WAITCNT` | 298 ns | 179 ns |
+| real AGB, fastest a game can set (`N=3,S=1`) | 238 ns | 119 ns |
+
+The old default gave a Game Pak **less than half** the access time a real AGB
+gives it at power-on, and its sequential beat was quicker than the fastest
+window any real AGB can be configured to produce. A mask ROM is the fastest
+device on that bus and shrugs that off — which is exactly why ROM booted fine
+— but the save chips are the slowest things on the cartridge, and one that
+answers late does not fail loudly, it returns a wrong byte.
+
+Going faster than hardware also buys almost nothing. A burst read cannot drop
+below four emulated cycles whatever these windows are, because about half of
+that is the clk1x/clk6x handshake rather than the bus, and code the game copies
+into IWRAM or EWRAM never touches this bus at all.
+
+**These windows are a floor, not a contract with the game.** They do not track
+`WAITCNT`. Homebrew that sets the aggressive `N=3,S=1` wait states — Apotris
+does, and real hardware is fine with it — still reads correct data here: the
+emulated wait state expires, the physical access is not finished yet, and the
+CPU simply stalls until it is. The game loses the speed it asked for and
+nothing else. Honouring a fast `WAITCNT` on the physical bus would mean handing
+the slowest chip on the cartridge a 119 ns window, which is the failure this
+whole section exists to avoid.
+
+`sim/tb_cart_eeprom.vhd` checks exactly that: its probe sets `WAITCNT` to
+`0x4595` (WS0 and WS2 at `N=3,S=1`, prefetch on) before running the EEPROM
+transfer, and the bench fails if the probe did not take, so a pass means the
+save survived the fastest wait states a game can ask for.
+
+The `/CS2` save window has its own floor on top of that. FlashGBX's LK
+firmware, which is tested against a very large pile of real cartridges, holds
+`/RD` or `/WR` low for 400 ns on every SRAM access and 500 ns on a flash write,
+and says plainly that FRAM needs it — and FRAM is what many repro carts and
+battery-free save replacements use. Both presets clear that. A save is a few
+thousand bytes now and then, so nobody can feel the difference.
 
 **Four cycles is the floor for a burst read, and it is not the bus that sets
 it.** Roughly half of those 238 ns is handshake: the request has to cross into
@@ -189,7 +222,7 @@ is unaffected, because none of it touches this bus.
   actually has. Nobody has yet watched a real cartridge commit a real save
   with the fix in, though. SRAM and FLASH carts were never affected by this
   bug, so if one of those still will not save it is something else — try
-  **Safe** first.
+  **Tolerant** first.
 
 ## Why a separate revision
 

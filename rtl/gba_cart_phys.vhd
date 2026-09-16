@@ -57,7 +57,7 @@ entity gba_cart_phys is
       reset            : in     std_logic;
 
       enable           : in     std_logic;                     -- physical cart selected
-      timing_sel       : in     std_logic_vector(1 downto 0);  -- 0 = normal, 1 = safe, 2 = fast
+      timing_sel       : in     std_logic_vector(1 downto 0);  -- 0 = accurate, 1 = tolerant
 
       -- request side, identical to memorymux_extern
       cart_ena         : in     std_logic;
@@ -91,14 +91,26 @@ architecture arch of gba_cart_phys is
 
    -- Phase lengths in clk6x ticks (9.934 ns each, 6 per emulated cycle).
    --
-   -- "normal" is sized so that the cartridge sees roughly the access time a
-   -- real AGB gives it at WAITCNT N=3, plus headroom for the two LVC8T245
-   -- crossings (~6.5 ns each way) that a real AGB does not have. "safe"
-   -- roughly doubles every window for tired connectors and slow repro carts;
-   -- "fast" trims to the point where a sequential read fits inside two
-   -- emulated cycles. Only the wall clock speed of the emulated CPU changes -
-   -- a request that outruns its emulated wait state simply stalls the core,
-   -- it never returns wrong data.
+   -- There is no "go faster than hardware" setting here, and there should not
+   -- be one. A Game Pak is specified to answer within the windows a real AGB
+   -- gives it; anything quicker is not an optimisation, it is a bet that this
+   -- particular cartridge happens to beat its own spec, and losing that bet
+   -- returns a wrong byte in silence rather than failing loudly. There is also
+   -- nothing to win: a burst read cannot go below four emulated cycles no
+   -- matter how short these windows get, because half of that is the
+   -- clk1x/clk6x handshake rather than the bus, and code the game copies into
+   -- IWRAM or EWRAM never touches this bus at all.
+   --
+   -- ACCURATE is therefore the default and matches a real AGB at its power-on
+   -- WAITCNT (WS0 N=4,S=2): ~308 ns from address to data, ~179 ns per
+   -- sequential beat. That is also comfortably above the fastest a game can
+   -- ever configure (~238/119 ns), so every cartridge sees at least the time
+   -- it was designed for, plus headroom for the two LVC8T245 crossings
+   -- (~6.5 ns each way) that a real AGB does not have in the path.
+   --
+   -- TOLERANT is the only other setting: everything stretched roughly 1.7x for
+   -- tired connectors, dirty contacts and slow reproduction cartridges. It
+   -- costs a little emulated speed and nothing else.
    type t_timing is record
       t_as      : integer range 0 to 63;   -- address setup before /CS falls
       t_ah      : integer range 0 to 63;   -- address hold after /CS falls
@@ -129,12 +141,11 @@ architecture arch of gba_cart_phys is
    -- it has got back up means the chip sees one long select with the address
    -- changing underneath it - which on a write corrupts the neighbouring byte.
 
-   --                                    as ah tz rdN rdS rdh csh  wrs wr wrh  s2s s2a s2rec
-   constant TIMING_NORMAL : t_timing := ( 2, 2, 2,  9,  5,  2,  2,   2, 10,  2,   2, 52,   48);
-   constant TIMING_SAFE   : t_timing := ( 5, 5, 3, 18, 12,  4,  4,   4, 20,  4,   5, 84,   80);
-   constant TIMING_FAST   : t_timing := ( 1, 1, 1,  6,  3,  1,  1,   1,  6,  1,   1, 42,   48);
+   --                                      as ah tz rdN rdS rdh csh  wrs wr wrh  s2s s2a s2rec
+   constant TIMING_ACCURATE : t_timing := ( 5, 5, 3, 18, 14,  4,  4,   4, 24,  4,   5, 84,   80);
+   constant TIMING_TOLERANT : t_timing := ( 8, 8, 5, 30, 24,  6,  6,   6, 36,  6,   8,120,  120);
 
-   signal tm : t_timing := TIMING_NORMAL;
+   signal tm : t_timing := TIMING_ACCURATE;
 
    type t_state is
    (
@@ -196,9 +207,7 @@ architecture arch of gba_cart_phys is
 
 begin
 
-   tm <= TIMING_SAFE when timing_sel = "01" else
-         TIMING_FAST when timing_sel = "10" else
-         TIMING_NORMAL;
+   tm <= TIMING_TOLERANT when timing_sel(0) = '1' else TIMING_ACCURATE;
 
    -- 0xE/0xF is the /CS2 (SRAM/FLASH) window, everything below it is /CS ROM.
    -- Decoded off req_addr because ST_IDLE needs it to pick a branch, before

@@ -227,7 +227,7 @@ pll pll
 ////////////////////  PHYSICAL CARTRIDGE (Multisystem2)  ////////////////
 `ifdef MISTER_MMS2
 wire       cart_real   = status[67];
-wire [1:0] cart_timing = status[69:68];
+wire [1:0] cart_timing = {1'b0, status[68]};
 `else
 wire       cart_real   = 1'b0;
 wire [1:0] cart_timing = 2'b00;
@@ -289,11 +289,11 @@ parameter CONF_STR = {
 	"P1O[26:24],Modify Colors,Off,GBA 2.2,GBA 1.6,NDS 1.6,VBA 1.4,75%,50%,25%;",
 	"P1-;",
    "P1O[55:52],CRT H-Sync Adjust,0,1,2,3,4,5,6,7,-8,-7,-6,-5,-4,-3,-2,-1;",
-	"H10P1O[58:56],CRT V-Sync Adjust,0,1,2,3,-4,-3,-2,-1;",
+	"H2P1O[58:56],CRT V-Sync Adjust,0,1,2,3,-4,-3,-2,-1;",
 	"P1-;",
 	"P1O[66:65],Rotate Video,Off,90 CW,90 CCW;",
-	"H10P1O[51],Borders,Off,On;",
-	"H10P1FC2,BOR,Load Border,3D000000;",
+	"H2P1O[51],Borders,Off,On;",
+	"H2P1FC2,BOR,Load Border,3D000000;",
 	"P1-;",
 	"P1O[39],Sync core to video,On,Off;",
 	"P1O[10:9],Flickerblend,Off,Blend,30Hz;",
@@ -327,7 +327,7 @@ parameter CONF_STR = {
 `ifdef MISTER_MMS2
    "P2-;",
 	"P2O[67],MMS2 Cartridge,Off,On;",
-	"H11P2O[69:68],Cart Bus Timing,Normal,Safe,Fast;",
+	"H7P2O[68],Cart Bus Timing,Accurate,Tolerant;",
 `endif
    "P2-,Save setting + reload Core;",
 	"P2O[28],Homebrew BIOS,Off,On;",
@@ -397,22 +397,31 @@ wire [127:0] status;
 // stack with player 1 above player 2
 wire [1:0] video_rotate = status[66:65];
 
+// Only bits 0..9 are addressable. The framework's menu parser consumes exactly
+// ONE character after an H/h/D/d prefix (`p += 2` in Main_MiSTer's menu.cpp),
+// so "H10" reads as H1 followed by a stray '0' - which then fails the page
+// check and the entry silently never appears in the OSD. Two-digit indices
+// look like they work and do not. Keep every mask index a single digit.
 wire [15:0] status_menumask = {
-	4'b0000,                           // unused
-`ifdef MISTER_MMS2
-	~cart_real,                        // H11: hide Cart Bus Timing unless the cartridge is in use
-`else
-	1'b0,                              // H11: unused
-`endif
-	|video_rotate,                     // H10: hide borders and V-Sync adjust while the image is rotated
+	6'b000000,                         // unused
 `ifdef GBA2P_LITE
 	(status[46:44] == 3'd2),        // H9: hide Link Debug Overlay when Multiplayer is Off (2P profile: Off = 2)
 `else
 	(status[46:44] == 3'd0),        // H9: hide Link Debug Overlay when Multiplayer is Off (1P profile: Off = 0)
 `endif
 	|status[21:20],                    // H8: hide 2P Separator Line unless 2P Display is Both
-	1'b1,                              // H7: unused (Link Role removed -- the cable's plug position picks the master, like real hardware)
-	~solar_quirk, status[27], cart_loaded, |cart_type, 1'b0 /* was force_turbo, dead since the accuracy core */, ~gg_active, ~bk_ena};
+`ifdef MISTER_MMS2
+	~cart_real,                        // H7: hide Cart Bus Timing unless the cartridge is in use
+`else
+	1'b0,                              // H7: unused
+`endif
+	~solar_quirk,                      // H6
+	status[27],                        // H5
+	cart_loaded,                       // H4
+	|cart_type,                        // H3
+	|video_rotate,                     // H2: hide borders and V-Sync adjust while the image is rotated
+	~gg_active,                        // H1
+	~bk_ena};                          // H0
 wire        forced_scandoubler;
 reg  [31:0] sd_lba;
 reg         sd_rd = 0;

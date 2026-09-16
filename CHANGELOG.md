@@ -2,6 +2,35 @@
 
 ## 2026-09-15
 
+### Cart Bus Timing: accurate by default, and actually visible
+
+- **Fixed: the Cart Bus Timing option never appeared in the OSD at all.** It
+  was tagged `H11`, and three video options (CRT V-Sync Adjust, Borders, Load
+  Border) were tagged `H10`. The framework's menu parser consumes exactly one
+  character after an `H`/`h`/`D`/`d` prefix (`p += 2` in Main_MiSTer's
+  `menu.cpp`), so those read as `H1` followed by a stray digit, which then
+  failed the page check and dropped the entries on the floor. No other MiSTer
+  core uses a two-digit index. Moved to the free single-digit bits `H2` and
+  `H7`, with a comment on the mask so nobody re-lays the same trap.
+- **`Fast` and `Normal` are gone; `Accurate` is the default.** The old default
+  gave a Game Pak 149 ns from address to data and 70 ns per sequential beat,
+  against the 298 / 179 ns a real AGB gives it at power-on `WAITCNT` - and
+  70 ns is quicker than the fastest window any real AGB can be configured to
+  produce. The mask ROM is the fastest device on that bus and tolerated it,
+  which is why ROM booted; the save chips are the slowest, and one that answers
+  late returns a wrong byte rather than an error. `Accurate` now matches
+  hardware (308 / 179 ns); `Tolerant` stretches it ~1.7x for tired connectors
+  and slow repro carts. Dropping `Fast` costs nothing: a burst read cannot go
+  below four emulated cycles regardless, because half of that is the
+  clk1x/clk6x handshake rather than the bus.
+- These windows are a floor and deliberately do **not** follow `WAITCNT`, so
+  homebrew that asks for the aggressive `N=3,S=1` wait states still reads
+  correct data - it just stalls instead of going faster. Covered by the new
+  integration bench, whose probe sets `WAITCNT=0x4595` and which fails if that
+  did not take.
+- Cartridge reads now cost 10 emulated cycles random / 5 burst at `Accurate`
+  (13 / 7 at `Tolerant`), against 7 / 4 at the old `Normal`.
+
 ### Saves on a physical Game Pak
 
 - **Fixed: no EEPROM game could save.** The first cut raised `/CS` at the end
@@ -19,7 +48,14 @@
   that aborts a command when `/CS` rises part way through, exactly like the
   chip, and counts those aborts; and a FLASH chip with the 5555/2AAA/5555
   unlock, the autoselect ID a save library reads before it will save at all,
-  and byte program. The EEPROM model is parameterised by address width and is
+  and byte program. `sim/tb_cart_eeprom.vhd` goes further and drives the whole
+  thing from the **real core** - actual ARM CPU, actual DMA, actual memorymux,
+  running a compiled ARM probe ROM that performs a genuine EEPROM save - so the
+  handshake and the burst detection are exercised the way the hardware
+  exercises them, not the way a hand-written stimulus would. Against the
+  pre-fix RTL that bench sees exactly one command bit reach the cartridge;
+  against the fix it sees all 81 and the chip latches the write.
+  The EEPROM model is parameterised by address width and is
   exercised at both of them - the 6-bit/4 Kbit part and the 14-bit/64 Kbit
   part that the reporting cartridge carries. The EEPROM test fails the old
   design 73 times over.
