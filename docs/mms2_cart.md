@@ -67,6 +67,20 @@ FlashGBX LK firmware, which drives the same silicon:
   every write beat, so a 73-bit EEPROM command reached the cartridge as 73
   aborted 1-bit commands. `sim/tb_cart_phys.vhd` now models an EEPROM that
   aborts on a mid-command `/CS` the way the silicon does, and counts it.
+* **`/CS` is released as soon as the bus goes quiet**, not parked low between
+  transfers. A real AGB only holds `/CS` down across a genuine run of back-to-
+  back accesses; the moment nothing is being fetched it goes high, which is why
+  a cartridge sees a deselect measured in *microseconds* between two separate
+  DMA transfers. Parking it low instead looks harmless — the next access raises
+  it for `t_csh` on its way to a fresh address phase — but `t_csh` is tens of
+  nanoseconds, and an EEPROM uses that rising edge to re-arm its output between
+  the read request and the data phase. Give it a blip instead of an edge and it
+  never re-arms, so the request is accepted, the readout runs, and every bit
+  comes out of step: the game finds save hardware, reads a mangled save, and
+  bounces you back to the title screen. The sequencer therefore drops `/CS` and
+  invalidates its burst after `t_idle` quiet ticks, which is short enough that
+  back-to-back beats still burst and long enough that separate transfers get a
+  real deselect.
 * **PHI** follows `WAITCNT[12:11]` (off / 4.19 / 8.38 / 16.78 MHz) like real
   hardware. It is off at boot, which is where nearly every game leaves it.
 
@@ -165,6 +179,9 @@ CPU simply stalls until it is. The game loses the speed it asked for and
 nothing else. Honouring a fast `WAITCNT` on the physical bus would mean handing
 the slowest chip on the cartridge a 119 ns window, which is the failure this
 whole section exists to avoid.
+
+Both benches model the minimum deselect as well, so a `/CS` that only blips
+fails the test rather than passing it quietly.
 
 `sim/tb_cart_eeprom.vhd` checks exactly that: its probe sets `WAITCNT` to
 `0x4595` (WS0 and WS2 at `N=3,S=1`, prefetch on) before running the EEPROM

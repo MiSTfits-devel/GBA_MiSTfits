@@ -125,6 +125,7 @@ architecture arch of gba_cart_phys is
       t_s2s     : integer range 0 to 63;   -- address/data setup around /CS2
       t_s2a     : integer range 0 to 127;  -- SRAM /RD or /WR low width
       t_s2rec   : integer range 0 to 127;  -- /CS2 RC rise after release
+      t_idle    : integer range 0 to 63;   -- quiet ticks before /CS is released
    end record;
 
    -- The /CS2 numbers do NOT follow the preset ladder the way the ROM ones do.
@@ -141,9 +142,9 @@ architecture arch of gba_cart_phys is
    -- it has got back up means the chip sees one long select with the address
    -- changing underneath it - which on a write corrupts the neighbouring byte.
 
-   --                                      as ah tz rdN rdS rdh csh  wrs wr wrh  s2s s2a s2rec
-   constant TIMING_ACCURATE : t_timing := ( 5, 5, 3, 18, 14,  4,  4,   4, 24,  4,   5, 84,   80);
-   constant TIMING_TOLERANT : t_timing := ( 8, 8, 5, 30, 24,  6,  6,   6, 36,  6,   8,120,  120);
+   --                                      as ah tz rdN rdS rdh csh  wrs wr wrh  s2s s2a s2rec idle
+   constant TIMING_ACCURATE : t_timing := ( 5, 5, 3, 18, 14,  4,  4,   4, 24,  4,   5, 84,   80,  24);
+   constant TIMING_TOLERANT : t_timing := ( 8, 8, 5, 30, 24,  6,  6,   6, 36,  6,   8,120,  120,  32);
 
    signal tm : t_timing := TIMING_ACCURATE;
 
@@ -158,6 +159,7 @@ architecture arch of gba_cart_phys is
    signal state : t_state := ST_IDLE;
 
    signal delay          : integer range 0 to 127 := 0;
+   signal idle_cnt       : integer range 0 to 63 := 0;
 
    -- clk1x side of the handshake
    signal req_active     : std_logic := '0';
@@ -270,6 +272,7 @@ begin
             state        <= ST_IDLE;
             resp_ready   <= '0';
             burst_valid  <= '0';
+            idle_cnt     <= 0;
             beat_second  <= '0';
             pin_cs_n     <= '1';
             pin_cs2_n    <= '1';
@@ -283,6 +286,16 @@ begin
                delay <= delay - 1;
             end if;
 
+            -- Time spent with nothing to do. A real AGB drops /CS as soon as
+            -- the bus goes quiet and only holds it low across a genuine run of
+            -- back to back accesses, so a cartridge sees a deselect measured in
+            -- microseconds between two separate transfers.
+            if (state /= ST_IDLE) then
+               idle_cnt <= 0;
+            elsif (idle_cnt < 63) then
+               idle_cnt <= idle_cnt + 1;
+            end if;
+
             -- The CPU drops req_active on the clk1x edge where it takes our
             -- answer. Retire resp_ready here rather than in ST_ACKWAIT, so a
             -- long tail (the /CS2 recovery is ~0.5 us) cannot miss the window
@@ -294,6 +307,18 @@ begin
             case (state) is
 
                when ST_IDLE =>
+                  -- Parking /CS low through idle is what makes the next
+                  -- non-sequential access hand the cartridge a t_csh-wide
+                  -- deselect - tens of ns - where hardware gives it the whole
+                  -- quiet gap. An EEPROM needs that edge to re-arm its output
+                  -- between the read request and the data phase, so letting
+                  -- /CS sit low here silently mangles every save it reads.
+                  if (req_active_6x = '0' and burst_valid = '1'
+                      and idle_cnt >= tm.t_idle) then
+                     pin_cs_n    <= '1';
+                     burst_valid <= '0';
+                  end if;
+
                   if (req_active_6x = '1' and resp_ready = '0') then
                      beat_second <= '0';
                      s_addr      <= req_addr;

@@ -2,6 +2,35 @@
 
 ## 2026-09-15
 
+### `/CS` is released when the bus goes quiet
+
+- **Fixed: EEPROM saves read back mangled.** The sequencer parked `/CS` low
+  between transfers and only raised it on its way into the next address phase,
+  for `t_csh` - tens of nanoseconds. A real AGB drops `/CS` the moment the bus
+  goes quiet, so a cartridge normally sees a deselect measured in microseconds
+  between two DMA transfers, and an EEPROM uses that rising edge to re-arm its
+  output between the read request and the data phase. A blip instead of an edge
+  means it never re-arms: the request is accepted, the readout runs, and every
+  bit is out of step. The game finds save hardware, reads a corrupt save, and
+  drops back to the title screen - which is exactly what a tester saw on
+  *Phantasy Star Collection* once the `/CS` burst fix let the command through
+  at all.
+- The tell was that **Accurate and Tolerant behaved identically** while ROM
+  visibly stalled on Tolerant. `t_csh` is the one window that barely moves
+  between the presets (4 ticks vs 6, 40 ns vs 60 ns), so a fault that scales
+  with every other window and not with that one points here and almost nowhere
+  else.
+- `/CS` now drops, and the burst is invalidated, after `t_idle` quiet clk6x
+  ticks - short enough that back-to-back beats still burst (cycle costs are
+  unchanged at 10/5 and 13/7), long enough that separate transfers get a real
+  deselect. This is also just what the AGB's own S-cycle/N-cycle behaviour
+  does: go idle and the next access is non-sequential.
+- Both benches now model the minimum deselect and **fail** the pre-fix design
+  (3 short deselects in the integration bench, 5 in the unit bench) rather than
+  passing it quietly. The unit bench's stimulus also leaves a realistic gap
+  between transfers instead of firing them back to back, because that quiet gap
+  is part of what the hardware does.
+
 ### Cart Bus Timing: accurate by default, and actually visible
 
 - **Fixed: the Cart Bus Timing option never appeared in the OSD at all.** It

@@ -109,6 +109,18 @@ architecture sim of tb_cart_eeprom is
    signal ee_aborts : integer := 0;
    signal ee_writes : integer := 0;
    -- how many /CS assertions the command stream was chopped into
+
+   -- How long /CS has been released, in clk6x ticks. A real AGB drops /CS the
+   -- moment the bus goes quiet, so a cartridge sees a deselect measured in
+   -- microseconds between two separate transfers; an EEPROM uses that edge to
+   -- re-arm. A sequencer that parks /CS low through idle instead gives it only
+   -- t_csh - tens of nanoseconds - and the chip may never re-arm at all.
+   -- 40 ticks (10x t_csh) is the modelled floor: not a datasheet number, but
+   -- far below any genuine inter-transfer gap and far above a t_csh blip, so
+   -- it separates the two cases cleanly.
+   constant EE_MIN_DESEL : integer := 40;
+   signal cs_high_ticks  : integer range 0 to 1023 := 1023;
+   signal ee_short_desel : integer := 0;
    signal ee_cs_in_cmd : integer := 0;
 
    -- the 64 bits the probe reassembled after the round trip
@@ -209,6 +221,20 @@ begin
       cs_p := pin_cs_n; rd_p := pin_rd_n; wr_p := pin_wr_n;
    end process;
 
+
+   -- /CS release length, for the deselect check above
+   process (clk6x)
+   begin
+      if rising_edge(clk6x) then
+         if (pin_cs_n = '1') then
+            if (cs_high_ticks < 1023) then
+               cs_high_ticks <= cs_high_ticks + 1;
+            end if;
+         else
+            cs_high_ticks <= 0;
+         end if;
+      end if;
+   end process;
    -- the EEPROM itself, which aborts on a mid-command /CS like the real chip
    eeprom : process
       variable cs_p, wr_p, rd_p : std_logic := '1';
@@ -216,6 +242,9 @@ begin
       wait on pin_cs_n, pin_wr_n, pin_rd_n;
 
       if (pin_cs_n = '0' and cs_p = '1' and pin_a_out(7) = '1') then
+         if (cs_high_ticks < EE_MIN_DESEL) then
+            ee_short_desel <= ee_short_desel + 1;
+         end if;
          if (ee_state = EE_ARMED) then
             ee_state <= EE_READOUT;
             ee_rdcnt <= 0;
@@ -432,6 +461,7 @@ begin
       report "  /CS assertions total        : " & integer'image(cs_fall_cnt);
       report "  /CS assertions mid-command  : " & integer'image(ee_cs_in_cmd);
       report "  EEPROM commands aborted     : " & integer'image(ee_aborts);
+      report "  deselects too short to re-arm: " & integer'image(ee_short_desel);
       report "  EEPROM writes completed     : " & integer'image(ee_writes);
       report "  WAITCNT the game asked for  : 0x" & to_hstring(cart_waitcnt);
 
@@ -446,6 +476,11 @@ begin
       if (wr_pulses < 81) then
          report "the core never put the 81 command bits on the bus (saw " &
                 integer'image(wr_pulses) & ")" severity failure;
+      end if;
+      if (ee_short_desel > 0) then
+         report "DESELECT TOO SHORT " & integer'image(ee_short_desel) &
+                " times: /CS was parked low through the idle gap, so the chip " &
+                "only got a t_csh blip instead of a real deselect" severity failure;
       end if;
       if (ee_aborts > 0) then
          report "EEPROM command torn up by /CS " & integer'image(ee_aborts) &

@@ -116,6 +116,18 @@ architecture test of tb_cart_phys is
    signal ee_aborts : integer := 0;
    signal ee_writes : integer := 0;
 
+
+   -- How long /CS has been released, in clk6x ticks. A real AGB drops /CS the
+   -- moment the bus goes quiet, so a cartridge sees a deselect measured in
+   -- microseconds between two separate transfers; an EEPROM uses that edge to
+   -- re-arm. A sequencer that parks /CS low through idle instead gives it only
+   -- t_csh - tens of nanoseconds - and the chip may never re-arm at all.
+   -- 40 ticks (10x t_csh) is the modelled floor: not a datasheet number, but
+   -- far below any genuine inter-transfer gap and far above a t_csh blip, so
+   -- it separates the two cases cleanly.
+   constant EE_MIN_DESEL : integer := 40;
+   signal cs_high_ticks  : integer range 0 to 1023 := 1023;
+   signal ee_short_desel : integer := 0;
    -- scoreboard
    signal errors : integer := 0;
 
@@ -261,6 +273,9 @@ begin
       wait on pin_cs_n, pin_wr_n, pin_rd_n;
 
       if (pin_cs_n = '0' and cs_p = '1' and ee_sel = '1') then
+         if (cs_high_ticks < EE_MIN_DESEL) then
+            ee_short_desel <= ee_short_desel + 1;
+         end if;
          if (ee_state = EE_ARMED) then
             ee_state <= EE_READOUT;      -- the data phase of a read request
             ee_rdcnt <= 0;
@@ -310,6 +325,20 @@ begin
       cs_p := pin_cs_n; wr_p := pin_wr_n; rd_p := pin_rd_n;
    end process;
 
+
+   -- /CS release length, for the deselect check above
+   process (clk6x)
+   begin
+      if rising_edge(clk6x) then
+         if (pin_cs_n = '1') then
+            if (cs_high_ticks < 1023) then
+               cs_high_ticks <= cs_high_ticks + 1;
+            end if;
+         else
+            cs_high_ticks <= 0;
+         end if;
+      end if;
+   end process;
    -- electrical safety nets
    process (clk6x)
    begin
@@ -356,6 +385,15 @@ begin
          end loop;
          got  := cart_readdata;
          cycs := n;
+      end procedure;
+
+      -- Two separate transfers are separated in time on real hardware - the CPU
+      -- has to reprogram DMA3 between them, which is microseconds of quiet bus.
+      -- That gap is what releases /CS and gives the chip a real deselect, so
+      -- the stimulus has to leave it rather than firing commands back to back.
+      procedure bus_quiet is
+      begin
+         for i in 0 to 11 loop wait until rising_edge(clk1x); end loop;
       end procedure;
 
       -- One EEPROM command, the way DMA3 to 0x0DFFFF00 puts it on the bus:
@@ -529,6 +567,7 @@ begin
       report "=== EEPROM: the write stream is ONE command, /CS low throughout ===";
       -- "10" + address 0x15 + 64 data bits + stop bit = 73 halfword writes
       ee_wr   := "10" & "010101" & EE_PAT & "0";
+      bus_quiet;
       cs_mark := cs_fall_cnt;
       ee_stream(ee_wr, x"DFFFF00");
       expect("EEPROM write: one /CS for the whole stream", cs_fall_cnt - cs_mark, 1);
@@ -537,11 +576,13 @@ begin
 
       report "=== EEPROM: read request, then the 68 bit readout ===";
       ee_rd   := "11" & "010101" & "0";
+      bus_quiet;
       cs_mark := cs_fall_cnt;
       ee_stream(ee_rd, x"DFFFF00");
       expect("EEPROM read request: one /CS for the whole stream", cs_fall_cnt - cs_mark, 1);
       expect("EEPROM read request: no command torn up by /CS", ee_aborts, 0);
 
+      bus_quiet;
       ee_got := (others => '0');
       ea     := x"DFFFF00";
       for i in 0 to 67 loop
@@ -565,6 +606,7 @@ begin
       for i in 0 to 5 loop tick; end loop;
 
       ee_wr14 := "10" & "00000000101010" & EE_PAT2 & "0";
+      bus_quiet;
       cs_mark := cs_fall_cnt;
       ee_stream(ee_wr14, x"DFFFF00");
       expect("EEPROM 64K write: one /CS for the whole stream", cs_fall_cnt - cs_mark, 1);
@@ -572,11 +614,13 @@ begin
       expect("EEPROM 64K write: a second complete write latched", ee_writes, 2);
 
       ee_rd14 := "11" & "00000000101010" & "0";
+      bus_quiet;
       cs_mark := cs_fall_cnt;
       ee_stream(ee_rd14, x"DFFFF00");
       expect("EEPROM 64K read request: one /CS for the whole stream", cs_fall_cnt - cs_mark, 1);
       expect("EEPROM 64K read request: no command torn up by /CS", ee_aborts, 0);
 
+      bus_quiet;
       ee_got := (others => '0');
       ea     := x"DFFFF00";
       for i in 0 to 67 loop
@@ -595,6 +639,8 @@ begin
       end if;
       ee_abits <= 6;
       for i in 0 to 5 loop tick; end loop;
+
+      expect("every EEPROM command got a real deselect first", ee_short_desel, 0);
 
       report "=== EEPROM access must not leave a stale ROM burst behind ===";
       access_cart(x"8000000", '1', '0', (others => '0'), x"00", d, c);
