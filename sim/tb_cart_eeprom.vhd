@@ -111,6 +111,12 @@ architecture sim of tb_cart_eeprom is
    -- how many /CS assertions the command stream was chopped into
    signal ee_cs_in_cmd : integer := 0;
 
+   -- the 64 bits the probe reassembled after the round trip
+   signal rb_hi : std_logic_vector(31 downto 0) := (others => '0');
+   signal rb_lo : std_logic_vector(31 downto 0) := (others => '0');
+   constant EE_BLOCK : integer := 5;
+   constant PATTERN  : std_logic_vector(63 downto 0) := x"0123456789ABCDEF";
+
 begin
 
    clk   <= not clk   after CLK_PERIOD / 2  when not done else '0';
@@ -404,9 +410,12 @@ begin
       sampler : process (clk)
       begin
          if rising_edge(clk) then
-            if (m_ena = '1' and m_rnw = '0' and m_adr = x"03007800"
-                and m_dout = x"DEADBEEF") then
-               done_seen <= '1';
+            if (m_ena = '1' and m_rnw = '0') then
+               if (m_adr = x"03007804") then rb_hi <= m_dout; end if;
+               if (m_adr = x"03007808") then rb_lo <= m_dout; end if;
+               if (m_adr = x"03007800" and m_dout = x"DEADBEEF") then
+                  done_seen <= '1';
+               end if;
             end if;
          end if;
       end process;
@@ -446,7 +455,25 @@ begin
          report "EEPROM did not latch exactly one write (got " &
                 integer'image(ee_writes) & ")" severity failure;
       end if;
-      report "EEPROM COMMAND SURVIVED THE REAL CORE" severity note;
+
+      -- Direction 1: what the chip actually received off the bus.
+      report "  chip received : " & to_hstring(ee_mem(EE_BLOCK));
+      report "  probe read back: " & to_hstring(rb_hi & rb_lo);
+      report "  expected       : " & to_hstring(PATTERN);
+
+      if (ee_mem(EE_BLOCK) /= PATTERN) then
+         report "WRITE PATH WRONG: the chip received " &
+                to_hstring(ee_mem(EE_BLOCK)) & " but the game sent " &
+                to_hstring(PATTERN) severity failure;
+      end if;
+
+      -- Direction 2: what came back through the core to the game.
+      if ((rb_hi & rb_lo) /= PATTERN) then
+         report "READ PATH WRONG: the game got " & to_hstring(rb_hi & rb_lo) &
+                " but the chip holds " & to_hstring(PATTERN) severity failure;
+      end if;
+
+      report "EEPROM ROUND TRIP CORRECT IN BOTH DIRECTIONS" severity note;
 
       done <= true;
       stop;
