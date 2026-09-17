@@ -111,7 +111,7 @@ architecture arch of videoout160 is
    signal htotal_s         : integer range 0 to 1023;
    signal hsync_st_s       : integer range 0 to 1023;
    signal hsync_end_s      : integer range 0 to 1023;
-   signal yreset_s         : integer range 0 to 1023;
+   signal yreset_s         : integer range 0 to 1023 := 264; -- non-rotated default, so the derived pause lines below are in range at 0ms
    signal vact_start       : integer range 0 to 1023;
    signal vact_end         : integer range 0 to 1023;
    signal vpos_base        : integer range 0 to 1023;
