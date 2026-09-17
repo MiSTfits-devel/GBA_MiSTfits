@@ -278,7 +278,7 @@ begin
    wait_2_second <= 8 when (cart_waitcnt(10) = '0') else
                     1;
         
-   is_sequential <= '1' when (mem_bus_seq = '1' and unsigned(mem_bus_Adr(20 downto 1)) /= 0) else '0'; -- special case for first address of bank
+   is_sequential <= '1' when (mem_bus_seq = '1' and unsigned(mem_bus_Adr(16 downto 1)) /= 0) else '0'; -- the cart counts a 16 bit halfword address, so each 128 Kbyte block starts non-sequential
    
    wait_cartnext <= wait_sram                         when (                                                        mem_bus_Adr(27 downto 24) = x"E" or mem_bus_Adr(27 downto 24) = x"F") else
                     wait_0_first + wait_0_second + 1  when (mem_bus_acc = ACCESS_32BIT and is_sequential = '0' and (mem_bus_Adr(27 downto 24) = x"8" or mem_bus_Adr(27 downto 24) = x"9")) else
