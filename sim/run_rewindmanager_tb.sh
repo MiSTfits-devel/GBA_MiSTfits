@@ -7,9 +7,11 @@ cd "$(git rev-parse --show-toplevel)"
 WORK=sim/nvc_work
 mkdir -p "$WORK"
 
-nvc -L sim/nvc_libs --work="$WORK" -a \
+. sim/nvc_libs.sh
+
+nvc -L "$LIBS" --work="$WORK" -a \
    rtl/gba_statemanager.vhd \
    sim/tb_rewindmanager.vhd
 
-nvc -L sim/nvc_libs --work="$WORK" -e tb_rewindmanager
-nvc -L sim/nvc_libs --work="$WORK" -r tb_rewindmanager --stop-time=5ms --exit-severity=failure
+nvc -L "$LIBS" --work="$WORK" -e tb_rewindmanager
+nvc -L "$LIBS" --work="$WORK" -r tb_rewindmanager --stop-time=5ms --exit-severity=failure

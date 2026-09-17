@@ -13,8 +13,7 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-LIBS=sim/nvc_libs
-mkdir -p "$LIBS"
+. sim/nvc_libs.sh
 
 nvc -L "$LIBS" --work=mem:"$LIBS"/MEM -a --relaxed \
    rtl/SyncFifo.vhd \

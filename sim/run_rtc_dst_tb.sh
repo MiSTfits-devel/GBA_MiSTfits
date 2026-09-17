@@ -7,11 +7,13 @@ cd "$(git rev-parse --show-toplevel)"
 WORK=sim/nvc_work
 mkdir -p "$WORK"
 
-nvc -L sim/nvc_libs --work="$WORK" -a \
+. sim/nvc_libs.sh
+
+nvc -L "$LIBS" --work="$WORK" -a \
    rtl/proc_bus_gba.vhd \
    rtl/reg_savestates.vhd \
    rtl/gba_gpioRTCSolarGyro.vhd \
    sim/tb_rtc_dst.vhd
 
-nvc -L sim/nvc_libs --work="$WORK" -e tb_rtc_dst
-nvc -L sim/nvc_libs --work="$WORK" -r tb_rtc_dst --stop-time=2ms --exit-severity=failure
+nvc -L "$LIBS" --work="$WORK" -e tb_rtc_dst
+nvc -L "$LIBS" --work="$WORK" -r tb_rtc_dst --stop-time=2ms --exit-severity=failure

@@ -80,12 +80,7 @@ with open(dst, "w") as f:
 print(f"{dst}: {len(data)//4} words from {src}" + (", EWRAM clear skipped" if fastboot else ""))
 PYEOF
 
-LIBS=sim/nvc_libs
-mkdir -p "$LIBS"
-
-# analysis-only stub so SyncRamDualByteEnable's dead synthesis branch
-# type-checks without a Quartus install (see sim/altera_mf_stub.vhd)
-nvc --work=altera_mf:"$LIBS"/ALTERA_MF -a sim/altera_mf_stub.vhd
+. sim/nvc_libs.sh
 
 # memory primitives live in their own MEM library
 nvc -L "$LIBS" --work=mem:"$LIBS"/MEM -a --relaxed \

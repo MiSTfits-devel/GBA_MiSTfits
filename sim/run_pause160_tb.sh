@@ -8,10 +8,7 @@ set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
 DUAL="${DUAL:-1}"
-LIBS=sim/nvc_libs
-mkdir -p "$LIBS"
-
-nvc --work=altera_mf:"$LIBS"/ALTERA_MF -a sim/altera_mf_stub.vhd
+. sim/nvc_libs.sh
 
 nvc -L "$LIBS" --work=mem:"$LIBS"/MEM -a --relaxed \
    rtl/dpram.vhd

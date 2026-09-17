@@ -9,7 +9,8 @@
 -- enough of the altsyncram component to type-check. No architecture is bound
 -- to it and none is needed.
 --
--- Analyzed into a library named altera_mf by sim/run_link2p_cpu_tb.sh.
+-- Analyzed into a library named altera_mf by sim/nvc_libs.sh, which every
+-- bench that builds into sim/nvc_libs sources.
 
 library ieee;
 use ieee.std_logic_1164.all;

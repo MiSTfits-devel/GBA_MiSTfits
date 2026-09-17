@@ -53,10 +53,7 @@ print(f"{dst}: {len(data)//4} words from {src}")
 PYEOF
 fi
 
-LIBS=sim/nvc_libs
-mkdir -p "$LIBS"
-
-nvc --work=altera_mf:"$LIBS"/ALTERA_MF -a sim/altera_mf_stub.vhd
+. sim/nvc_libs.sh
 
 nvc -L "$LIBS" --work=mem:"$LIBS"/MEM -a --relaxed \
    rtl/SyncFifo.vhd \

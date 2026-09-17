@@ -4,8 +4,7 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
-LIBS=sim/nvc_libs
-mkdir -p "$LIBS"
+. sim/nvc_libs.sh
 
 nvc -L "$LIBS" --work=work:"$LIBS"/WORK -a --relaxed \
    rtl/proc_bus_gba.vhd \
