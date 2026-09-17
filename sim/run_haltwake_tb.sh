@@ -13,10 +13,24 @@ nvc -L "$LIBS" --work=work:"$LIBS"/WORK -a --relaxed \
    rtl/gba_cpu.vhd \
    sim/tb_haltwake.vhd
 
+fails=0
+
 for WS in 0 1 2 3; do
    for WD in 200 201 202 203; do
       echo "--- WAITSTATES=$WS WAKE_DELAY=$WD"
       nvc -L "$LIBS" --work=work:"$LIBS"/WORK -e tb_haltwake -gWAITSTATES=$WS -gWAKE_DELAY=$WD
-      nvc -L "$LIBS" --work=work:"$LIBS"/WORK -r tb_haltwake --stop-time=2ms 2>&1 | grep -E "PASSED|FAILED|TIMEOUT" || true
+      OUTPUT="$(nvc -L "$LIBS" --work=work:"$LIBS"/WORK -r tb_haltwake \
+         --stop-time=2ms --exit-severity=failure 2>&1)" || true
+      printf '%s\n' "$OUTPUT" | grep -E "PASSED|FAILED|TIMEOUT" || true
+      case "$OUTPUT" in
+         *"HALT-WAKE TEST PASSED"*) ;;
+         *) echo "FAIL: WAITSTATES=$WS WAKE_DELAY=$WD produced no pass sentinel" >&2
+            fails=$((fails + 1)) ;;
+      esac
    done
 done
+
+if [ "$fails" -ne 0 ]; then
+   echo "$fails of 16 halt-wake combinations failed" >&2
+   exit 1
+fi
