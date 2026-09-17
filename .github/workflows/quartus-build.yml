@@ -2,10 +2,10 @@ name: Quartus Build
 
 on:
   push:
-    branches: [2p-linkcable, release]
+    branches: [main, 2p-linkcable, release]
     tags: ['v*.*.*']
   pull_request:
-    branches: [2p-linkcable]
+    branches: [main, 2p-linkcable]
   workflow_dispatch:
 
 concurrency:
@@ -16,13 +16,28 @@ permissions:
   contents: read
 
 jobs:
+  sim:
+    name: Testbenches
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install nvc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nvc iverilog
+          nvc --version
+
+      - name: Run the testbench suite
+        run: ./sim/run_all_tb.sh
+
   build:
     name: Build ${{ matrix.revision }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        revision: [GBA, GBA2P]
+        revision: [GBA, GBA2P, GBA_MMS2]
     steps:
       - uses: actions/checkout@v4
 
