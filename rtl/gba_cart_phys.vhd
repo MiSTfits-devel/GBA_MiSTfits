@@ -143,7 +143,7 @@ architecture arch of gba_cart_phys is
    -- changing underneath it - which on a write corrupts the neighbouring byte.
 
    --                                      as ah tz rdN rdS rdh csh  wrs wr wrh  s2s s2a s2rec idle
-   constant TIMING_ACCURATE : t_timing := ( 5, 5, 3, 18, 14,  4,  4,   4, 24,  4,   5, 84,   80,  24);
+   constant TIMING_ACCURATE : t_timing := ( 3, 3, 3, 18, 14,  4,  3,   4, 24,  4,   5, 84,   80,  24);
    constant TIMING_TOLERANT : t_timing := ( 8, 8, 5, 30, 24,  6,  6,   6, 36,  6,   8,120,  120,  32);
 
    signal tm : t_timing := TIMING_ACCURATE;
