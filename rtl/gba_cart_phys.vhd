@@ -356,7 +356,7 @@ begin
 
                -- ---------------- ROM, address phase ----------------
                when ST_CSH =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      pin_ad_out   <= std_logic_vector(rom_ha(15 downto 0));
                      pin_a_out    <= std_logic_vector(rom_ha(23 downto 16));
                      pin_ad_drive <= '1';
@@ -367,14 +367,14 @@ begin
                   end if;
 
                when ST_ADDR =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      pin_cs_n <= '0';          -- A0..A15 latch here
                      state    <= ST_CSL;
                      delay    <= tm.t_ah;
                   end if;
 
                when ST_CSL =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      if (s_rnw = '1') then
                         pin_ad_drive <= '0';   -- turn AD0-15 around for the data
                         state        <= ST_TURN;
@@ -386,7 +386,7 @@ begin
                   end if;
 
                when ST_TURN =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      pin_rd_n <= '0';
                      state    <= ST_RDL;
                      delay    <= tm.t_rdacc_n;
@@ -394,7 +394,7 @@ begin
 
                -- ---------------- ROM, read beats ----------------
                when ST_RDL =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      if (beat_second = '1' or s_32 = '0') then
                         if (s_32 = '1') then
                            resp_data <= pin_ad_in & data_lo;
@@ -414,7 +414,7 @@ begin
                   end if;
 
                when ST_RDH =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      -- the latched counter is only 16 bits wide
                      if (cur_ha(15 downto 0) = x"FFFF") then
                         burst_valid <= '0';
@@ -437,7 +437,7 @@ begin
 
                -- ---------------- ROM, write beats ----------------
                when ST_WDATA =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      pin_ad_out <= wr_half;    -- AD0-15 stays driven for writes
                      pin_wr_n   <= '0';
                      state      <= ST_WRL;
@@ -445,14 +445,14 @@ begin
                   end if;
 
                when ST_WRL =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      pin_wr_n <= '1';          -- cartridge increments here too
                      state    <= ST_WRH;
                      delay    <= tm.t_wrh;
                   end if;
 
                when ST_WRH =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      -- the cartridge advanced its own counter on the /WR rising
                      -- edge, exactly as it does on /RD, so leave /CS low and let
                      -- the next sequential beat use it. ST_IDLE raises /CS again
@@ -479,7 +479,7 @@ begin
 
                -- ---------------- SRAM / FLASH via /CS2 ----------------
                when ST_S2ADDR =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      pin_ad_out   <= s_addr(15 downto 0);   -- held all cycle
                      pin_ad_drive <= '1';
                      if (s_rnw = '1') then
@@ -493,7 +493,7 @@ begin
                   end if;
 
                when ST_S2SEL =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      pin_cs2_n <= '0';
                      if (s_rnw = '1') then
                         pin_rd_n <= '0';
@@ -505,7 +505,7 @@ begin
                   end if;
 
                when ST_S2ACC =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      if (s_rnw = '1') then
                         resp_data <= x"000000" & pin_a_in;
                         pin_rd_n  <= '1';
@@ -519,14 +519,14 @@ begin
                   end if;
 
                when ST_S2END =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      pin_cs2_n <= '1';         -- only RC-rises, wait it out
                      state     <= ST_S2REC;
                      delay     <= tm.t_s2rec;
                   end if;
 
                when ST_S2REC =>
-                  if (delay = 0) then
+                  if (delay = 1) then
                      state <= ST_ACKWAIT;
                   end if;
 
