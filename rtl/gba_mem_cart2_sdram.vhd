@@ -153,7 +153,7 @@ architecture arch of gba_mem_cart2_sdram is
    signal req_pending : std_logic := '0';
    signal readdata_6x : std_logic_vector(31 downto 0) := (others => '0');
 
-   signal addr1_1     : std_logic := '0';
+   signal rom_upper_1 : std_logic := '0';
    signal c32_1       : std_logic := '0';
    signal ansdata      : std_logic_vector(31 downto 0) := (others => '0');
 
@@ -231,7 +231,7 @@ begin
 
                when IDLE1X =>
                   if (cart_ena = '1') then
-                     addr1_1 <= cart_addr(1);
+                     rom_upper_1 <= '0';
                      c32_1   <= cart_32;
                      if (cart_rnw = '0') then
                         case (cart_addr(27 downto 24)) is
@@ -257,6 +257,9 @@ begin
                         case (cart_addr(27 downto 24)) is
 
                            when x"8" | x"9" | x"A" | x"B" | x"C" =>
+                              -- Only ROM places a halfword in the upper lanes.
+                              -- The CPU mux always samples Flash/SRAM in bits 7:0.
+                              rom_upper_1 <= cart_addr(1);
                               if (specialmodule = '1' and unsigned(cart_addr(27 downto 0)) >= 16#80000C4# and unsigned(cart_addr(27 downto 0)) <= 16#80000C8#) then
                                  state1x      <= WAITGPIO;
                                  GPIO_readEna <= '1';
@@ -295,8 +298,10 @@ begin
                                        state1x <= ANSWER;
                                        if (cart_addr(7 downto 0) = x"00") then
                                           ansdata <= flashManufacturerID & flashManufacturerID & flashManufacturerID & flashManufacturerID;
-                                       else
+                                       elsif (cart_addr(7 downto 0) = x"01") then
                                           ansdata <= flashDeviceID & flashDeviceID & flashDeviceID & flashDeviceID;
+                                       else
+                                          ansdata <= (others => '0');
                                        end if;
                                     when FLASH_ERASE_COMPLETE =>
                                        flashState     <= FLASH_READ_ARRAY;
@@ -320,7 +325,7 @@ begin
                when ANSWER =>
                   state1x   <= IDLE1X;
                   cart_done <= '1';
-                  if (c32_1 = '0' and addr1_1 = '1') then
+                  if (c32_1 = '0' and rom_upper_1 = '1') then
                      cart_readdata <= ansdata(15 downto 0) & ansdata(31 downto 16);
                   else
                      cart_readdata <= ansdata;
@@ -333,7 +338,7 @@ begin
                      cart_done   <= '1';
                      if (c32_1 = '1') then
                         cart_readdata <= readdata_6x;
-                     elsif (addr1_1 = '1') then
+                     elsif (rom_upper_1 = '1') then
                         cart_readdata <= readdata_6x(15 downto 0) & x"0000";
                      else
                         cart_readdata <= x"0000" & readdata_6x(15 downto 0);

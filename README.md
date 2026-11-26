@@ -88,6 +88,7 @@ Titles restored in 1P or 2P:
   - backported fixes from GBA_MiSTer `accuracy` branch
   - solved memory issues
     - 1P and 2P consoles both load cart(s) from SDRAM if possible
+    - Player 2 Flash/SRAM byte reads work at every byte offset, including both banks of Flash1M.
   - *WIP: support for SNAC GB EXT adapter to trade with real hardware*
     - Choose **Multiplayer → SNAC Link Port** for either a physical GBA link
       cable or a physical AGB-015 Wireless Adapter. Plug position determines
@@ -101,6 +102,7 @@ Titles restored in 1P or 2P:
       SO=USER_IO[1].
   - *WIP: GBA Wireless Adapter emulation and ARM-hosted networking for RetroArch online crossplay*
 - **GBA1P(+2P) core** reorganization and **accuracy fixes**
+  - Cartridge loading preserves GDB Stub and other upper OSD settings.
   - **RTC/Clock fixes**
     - *now fixed in most Pokemon ROMhacks*
   - **video glitches**

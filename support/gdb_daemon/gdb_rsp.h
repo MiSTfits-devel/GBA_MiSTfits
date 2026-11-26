@@ -17,8 +17,8 @@
 #define GDB_G_BYTES     (16 * 4 + 8 * 12 + 4 + 4)   // 168
 #define GDB_REG_CPSR    25
 
-#define GDB_REPLY_MAX   (GDB_G_BYTES * 2 + 64)
-#define GDB_PKT_MAX     (GDB_DATA_MAX * 2 + 64)
+#define GDB_PKT_MAX     0x2000
+#define GDB_REPLY_MAX   (GDB_PKT_MAX + 1)
 
 struct gdb_bpslot {
     uint32_t addr;
@@ -30,11 +30,16 @@ struct gdb_rsp {
     struct gdb_mbox  *mb;
     int  running;       // target resumed, stop reply still owed to gdb
     int  detached;
+    int  continue_core; // -1 means whichever core is currently selected
+    // qRcmd text is sent as O packets before the final OK.
+    int  (*console)(void *ctx, const char *text);
+    void *console_ctx;
     struct gdb_bpslot bp[GDB_BP_COUNT];
     struct gdb_bpslot wp[GDB_WP_COUNT];
 };
 
 void gdb_rsp_init(struct gdb_rsp *s, struct gdb_mbox *mb);
+void gdb_rsp_disconnect(struct gdb_rsp *s);
 
 // Handle one packet body (no $ ... # framing). Writes a NUL-terminated reply
 // into `reply`. Returns the reply length, or 0 when no reply is owed yet

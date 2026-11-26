@@ -1,12 +1,13 @@
 # Host build:   make
 # MiSTer build: make mister        (static ARM binary, musl-cross)
+# Control CLI:  python3 gba_dbg.py --host <mister> --help
 # Tests:        make check
 CC      ?= cc
-CFLAGS  ?= -O2 -Wall -Wextra -std=gnu99
+CFLAGS  ?= -O2 -Wall -Wextra -std=c99
 OBJS     = gdb_daemon.o gdb_rsp.o gdb_mbox.o
 
 ARM_CC  ?= arm-linux-musleabihf-gcc
-ARM_CFLAGS ?= -O2 -Wall -Wextra -std=gnu99 -static -march=armv7-a -mfpu=neon -mfloat-abi=hard
+ARM_CFLAGS ?= -O2 -Wall -Wextra -std=c99 -static -march=armv7-a -mfpu=neon -mfloat-abi=hard
 
 all: gdb_daemon
 

@@ -7,6 +7,7 @@ set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) SyncFifoFa
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) memorymux_extern.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_mem_matrix.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_top.vhd ]
+set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_gdb.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_ctrl_pause.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) export.vhd ]
 set_global_assignment -name VHDL_FILE [file join $::quartus(qip_path) gba_memorymux.vhd ]

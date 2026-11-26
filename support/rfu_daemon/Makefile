@@ -4,9 +4,10 @@
 # rfu_daemon: ARM-side half of the AGB-015 Wireless Adapter emulation.
 #   make            host binary (for tests / running on a laptop)
 #   make mister     static ARM binary for the MiSTer HPS
-#   make check      command-layout checks + a real two-process UDP session
+#   make check      RFU semantics, UDP/TCP interop, UART framing regression
 CC      ?= cc
 CFLAGS  ?= -O2 -Wall -Wextra -std=gnu99
+PYTHON  ?= python3
 # musl-cross (brew install musl-cross) links statically, so the result needs
 # nothing from the MiSTer image. NOT arm-linux-gnueabihf (not installed here).
 ARM_CC  ?= arm-linux-musleabihf-gcc
@@ -39,12 +40,14 @@ tests/netplay_host_test: tests/netplay_host_test.c netplay_host.c rfu_core.c rfu
 tests/trade_window_test: tests/trade_window_test.c rfu_core.c $(HDRS)
 	$(CC) $(CFLAGS) -I. -o $@ tests/trade_window_test.c rfu_core.c
 
-check: tests/rfu_test tests/netplay_host_test tests/trade_window_test
+check: rfu_daemon tests/rfu_test tests/netplay_host_test tests/trade_window_test
 	@tests/run_tests.sh
 	@echo "== netplay host wire oracle =="
 	@tests/netplay_host_test
 	@echo "== trade window regression =="
 	@tests/trade_window_test
+	@echo "== UART framing and socket service =="
+	@$(PYTHON) tests/uart_test.py ./rfu_daemon
 
 clean:
 	rm -f rfu_daemon rfu_daemon.arm $(OBJS) tests/rfu_test tests/netplay_host_test tests/trade_window_test

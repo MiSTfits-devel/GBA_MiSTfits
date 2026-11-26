@@ -24,6 +24,7 @@
 #include "netplay_proto.h"
 #include "netplay_host.h"
 #include "rfu_proto.h"
+#include "rfu_core.h"
 
 // Host-provided hooks that rfu_core/rfu_net expect from the daemon.
 uint32_t rfu_now_ms(void)
@@ -74,8 +75,10 @@ static int xwrite(int fd, const void *buf, size_t len)
 static void pump(int times)
 {
     for (int i = 0; i < times; i++) {
-        netplay_host_poll();
-        usleep(2000);
+        struct pollfd fds[NETPLAY_HOST_MAX_CLIENTS + 1];
+        int n = netplay_host_pollfds(fds, NETPLAY_HOST_MAX_CLIENTS + 1);
+        if (poll(fds, n, 2) > 0)
+            netplay_host_poll(fds, n);
     }
 }
 
@@ -99,6 +102,8 @@ int main(void)
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     CHECK(connect(cfd, (struct sockaddr *)&sa, sizeof(sa)) == 0, "connect()");
     int one = 1; setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    struct timeval io_timeout = { .tv_sec = 1 };
+    setsockopt(cfd, SOL_SOCKET, SO_RCVTIMEO, &io_timeout, sizeof(io_timeout));
     pump(5);
 
     // ---- 1. connection header, 6 words, network order ----
@@ -241,6 +246,13 @@ int main(void)
     be_put32(out + 4, RFU1_CONNECT_ACK);
     be_put32(out + 8, 0x00010002);
     netplay_host_send(gotpeer >= 0 ? gotpeer : 0, out, sizeof(out));
+    be_put32(out + 8, 0x00030004);
+    netplay_host_send(gotpeer >= 0 ? gotpeer : 0, out, sizeof(out));
+    {
+        struct pollfd fds[NETPLAY_HOST_MAX_CLIENTS + 1];
+        int n = netplay_host_pollfds(fds, NETPLAY_HOST_MAX_CLIENTS + 1);
+        CHECK(n == 2 && (fds[1].events & POLLOUT), "queued TX did not request POLLOUT");
+    }
     pump(20);
 
     uint32_t rnp[3];
@@ -256,8 +268,62 @@ int main(void)
     CHECK(be_get32(rbody + 4) == RFU1_CONNECT_ACK, "downstream type %u",
           be_get32(rbody + 4));
     printf("downstream netpacket ok\n");
+    CHECK(be_get32(rbody + 8) == 0x00010002, "first queued frame was overwritten");
+    CHECK(xread(cfd, rnp, sizeof(rnp)) == 0 &&
+          xread(cfd, rbody, sizeof(rbody)) == 0 &&
+          be_get32(rbody + 8) == 0x00030004,
+          "queued netpackets did not drain in order");
+
+    // Join an actual RFU slot over this TCP peer, then build backpressure
+    // without draining or polling. Overflow must not block or leave a slot.
+    uint32_t resp[RFU_MAX_WORDS];
+    rfu_core_init();
+    CHECK(rfu_core_command(0x19, 0, NULL, resp) == 0, "could not start RFU host");
+    np[1] = htonl(sizeof(out));
+    np[2] = 0;
+    be_put32(out + 4, RFU1_CONNECT_REQ);
+    be_put32(out + 8, 0);
+    CHECK(xwrite(cfd, np, sizeof(np)) == 0 && xwrite(cfd, out, sizeof(out)) == 0,
+          "failed to send RFU connect request over TCP");
+    pump(10);
+    CHECK(rfu_core_command(0x11, 0, NULL, resp) == 1 && resp[0] == 0xFF,
+          "TCP peer did not occupy RFU slot 0");
+    CHECK(xread(cfd, rnp, sizeof(rnp)) == 0 &&
+          xread(cfd, rbody, sizeof(rbody)) == 0 &&
+          be_get32(rbody + 4) == RFU1_CONNECT_ACK,
+          "RFU connect ACK did not drain through TCP queue");
+    uint8_t large[RFU1_LEN_DATA] = {0};
+    uint32_t started = rfu_now_ms();
+    for (int i = 0; i < 256; i++)
+        netplay_host_send(gotpeer >= 0 ? gotpeer : 0, large, sizeof(large));
+    CHECK(rfu_now_ms() - started < 65, "TCP queue overflow blocked STWI");
+    CHECK(netplay_host_client_count() == 0 &&
+          rfu_core_command(0x11, 0, NULL, resp) == 1 && resp[0] == 0,
+          "slow TCP client was not disconnected from its RFU slot");
 
     close(cfd);
+
+    // A new socket may reuse that peer index; an orderly close must also
+    // remove the RFU slot rather than leaving it until the radio TTL.
+    cfd = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(cfd >= 0 && connect(cfd, (struct sockaddr *)&sa, sizeof(sa)) == 0,
+          "could not reconnect after overflow");
+    if (cfd >= 0) {
+        CHECK(xwrite(cfd, hdr, sizeof(hdr)) == 0 &&
+              xwrite(cfd, &nick, sizeof(nick)) == 0 &&
+              xwrite(cfd, &info, sizeof(info)) == 0 &&
+              xwrite(cfd, np, sizeof(np)) == 0 &&
+              xwrite(cfd, out, sizeof(out)) == 0,
+              "could not join RFU slot on replacement socket");
+        pump(10);
+        CHECK(netplay_host_client_count() == 1 && rfu_core_peer_live(),
+              "replacement TCP connection did not join RFU");
+        shutdown(cfd, SHUT_WR);
+        pump(10);
+        CHECK(netplay_host_client_count() == 0 && !rfu_core_peer_live(),
+              "TCP EOF did not release RFU slot");
+        close(cfd);
+    }
     netplay_host_close();
 
     if (failures) {

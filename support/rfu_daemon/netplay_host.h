@@ -12,6 +12,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <poll.h>
 
 #define NETPLAY_HOST_MAX_CLIENTS 8
 
@@ -20,20 +21,17 @@
 int  netplay_host_open(int port);
 void netplay_host_close(void);
 
-// Accepts connections, advances handshakes, and dispatches complete
-// netpackets to rfu_core_net_receive(). Non-blocking; call from the main loop.
-void netplay_host_poll(void);
+// Service the readiness returned by poll() on the slice filled below.
+void netplay_host_poll(const struct pollfd *fds, int count);
 
-// Sends RFU1 bytes to one peer, or to every playing peer when peer < 0.
+// Queues RFU1 bytes for a peer, or every playing peer when peer < 0.
 void netplay_host_send(int peer, const void *buf, size_t len);
 
 int  netplay_host_client_count(void);
 const char *netplay_host_client_name(int peer);
 
-// Fills fds[] with the listening socket plus every live client socket so the
-// daemon's poll() wakes on netplay traffic instead of waiting out its tick.
-// Returns how many were written (at most max).
-int  netplay_host_pollfds(int *fds, int max);
+// Fill the listener/client poll descriptors, including POLLOUT for queued TX.
+int netplay_host_pollfds(struct pollfd *fds, int max);
 
 // Test seam: reports the most recent netpacket handed to the RFU layer.
 // Returns 0 when one is available. Used by tests/netplay_host_test.c so the

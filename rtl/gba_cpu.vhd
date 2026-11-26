@@ -51,7 +51,26 @@ entity gba_cpu is
       
       IRQ_in           : in    std_logic;
       unhalt           : in    std_logic;
-      new_halt         : in    std_logic
+      new_halt         : in    std_logic;
+
+      dbg_arch_pc        : out unsigned(31 downto 0) := (others => '0');
+      dbg_fetch_instr_pc : out unsigned(31 downto 0) := (others => '0');
+      dbg_stall_instr_pc : out unsigned(31 downto 0) := (others => '0');
+      dbg_decode_load    : out std_logic := '0';
+      dbg_execute_stall  : out std_logic := '0';
+      dbg_decode_ready   : out std_logic := '0';
+      dbg_fetch_ready    : out std_logic := '0';
+      dbg_decode_opcode  : out std_logic_vector(31 downto 0) := (others => '0');
+      dbg_bus_state      : out std_logic_vector(1 downto 0) := (others => '0');
+      dbg_thumbmode      : out std_logic := '0';
+      dbg_cpu_mode       : out std_logic_vector(3 downto 0) := (others => '0');
+      dbg_pc_written     : out std_logic := '0';
+      dbg_cpu_done       : out std_logic := '0';
+      dbg_reg_wr         : in  std_logic := '0';
+      dbg_reg_idx        : in  unsigned(4 downto 0) := (others => '0');
+      dbg_reg_data       : in  std_logic_vector(31 downto 0) := (others => '0');
+      dbg_reg_rd_idx     : in  unsigned(4 downto 0) := (others => '0');
+      dbg_reg_rd_data    : out std_logic_vector(31 downto 0) := (others => '0')
    );
 end entity;
 
@@ -145,6 +164,16 @@ architecture arch of gba_cpu is
    signal fetch_data       : std_logic_vector(31 downto 0) := (others => '0');
    signal fetch_ready      : std_logic := '0';
    signal fetch_first      : std_logic := '0';
+
+   -- Debug instruction tags follow the fetch/decode data without driving the pipeline.
+   signal fetch_addr_q      : unsigned(31 downto 0) := (others => '0');
+   signal fetch_instr_PC    : unsigned(31 downto 0) := (others => '0');
+   signal decode_instr_PC_1 : unsigned(31 downto 0) := (others => '0');
+   signal decode_instr_PC   : unsigned(31 downto 0) := (others => '0');
+   signal decode_opcode_q   : std_logic_vector(31 downto 0) := (others => '0');
+   signal dbg_irq_take      : std_logic := '0';
+   signal dbg_arch_pc_sig   : unsigned(31 downto 0);
+   signal dbg_pc_aligned    : unsigned(31 downto 0);
    
    -- ############# Decode ##############
    type tFunctions is
@@ -433,6 +462,39 @@ begin
    PC_in_BIOS <= '1' when bus_AddrFetch(27 downto 24) = x"0" else '0';
    
    cpu_halt   <= decode_halt;
+
+   dbg_pc_aligned <= unsigned(dbg_reg_data(31 downto 2) & (dbg_reg_data(1) and thumbmode) & '0');
+
+   -- Mirror the decode process's IRQ override without adding to its control path.
+   dbg_irq_take <= '1' when (IRQ_in = '1' and IRQ_disable = '0' and
+                            (busState /= BUSSTATE_WAITFETCH or gb_bus_done = '1') and
+                            (decode_functions_detail /= IRQ or execute_now = '0') and
+                            (decode_unhalt = '1' or execute_done = '1' or
+                             (execute_now = '0' and execute_stall = '0'))) else '0';
+   dbg_decode_load <= '1' when (ce = '1' and decode_halt = '0' and fetch_ready = '1' and
+                               ((fetch_done = '1' and decode_ready = '0') or execute_done = '1') and
+                               execute_branch = '0' and dbg_irq_take = '0') else '0';
+   dbg_cpu_done <= '1' when (ce = '1' and execute_done = '1' and decode_functions_detail /= IRQ) else '0';
+
+   dbg_arch_pc_sig    <= decode_instr_PC when (decode_ready = '1') else
+                         fetch_instr_PC when (fetch_ready = '1') else fetch_PC;
+   dbg_arch_pc        <= dbg_arch_pc_sig;
+   dbg_fetch_instr_pc <= fetch_instr_PC;
+   dbg_stall_instr_pc <= decode_instr_PC_1;
+   dbg_execute_stall  <= execute_stall;
+   dbg_decode_ready   <= decode_ready;
+   dbg_fetch_ready    <= fetch_ready;
+   dbg_decode_opcode  <= decode_opcode_q;
+   dbg_thumbmode      <= thumbmode;
+   dbg_cpu_mode       <= cpu_mode;
+   dbg_bus_state      <= "00" when (busState = BUSSTATE_IDLE) else
+                         "01" when (busState = BUSSTATE_WAITFETCH) else "10";
+
+   dbg_reg_rd_data <= std_logic_vector(regs(to_integer(dbg_reg_rd_idx(3 downto 0)))) when dbg_reg_rd_idx < 15 else
+                      std_logic_vector(dbg_arch_pc_sig) when dbg_reg_rd_idx = 15 else
+                      std_logic_vector(CPSR) when dbg_reg_rd_idx = 16 else
+                      std_logic_vector(SPSR) when dbg_reg_rd_idx = 17 else
+                      (others => '0');
    
    -- savestates
    gSAVESTATE_REGS : for i in 0 to 15 generate
@@ -539,6 +601,7 @@ begin
       if (rising_edge(clk)) then
       
          dma_on_1 <= dma_on;
+         dbg_pc_written <= '0';
       
          if (reset = '1') then
          
@@ -594,6 +657,11 @@ begin
                gb_bus_saved <= '0';
             end if;
 
+         elsif (dbg_reg_wr = '1' and dbg_reg_idx = 15 and ce = '0' and reset = '0') then
+            busState       <= BUSSTATE_IDLE;
+            CPU_bus_idle   <= '1';
+            gb_bus_saved   <= '0';
+            dbg_pc_written <= '1';
          end if;
          
       end if;
@@ -647,6 +715,8 @@ begin
             fetch_PC    <= unsigned(SAVESTATE_PC_in);
             fetch_ready <= '0';
             fetch_first <= '1';
+            fetch_addr_q   <= unsigned(SAVESTATE_PC_in);
+            fetch_instr_PC <= unsigned(SAVESTATE_PC_in);
          
          elsif (ce = '1') then
             
@@ -654,6 +724,7 @@ begin
             
             --if (bus_accessFetch = '1' and gb_bus_ena = '1' and (busState = BUSSTATE_IDLE or gb_bus_done = '1')) then
             if (gb_bus_code = '1' and gb_bus_ena = '1') then
+               fetch_addr_q <= bus_AddrFetch;
                if (execute_nextIsthumb = '1') then
                   fetch_PC <= bus_AddrFetch + 2;
                else
@@ -662,6 +733,7 @@ begin
             end if;
             
             if (fetch_done = '1') then
+               fetch_instr_PC <= fetch_addr_q;
                fetch_data  <= gb_bus_din;
 -- synthesis translate_off
                if (thumbmode = '1') then
@@ -682,6 +754,12 @@ begin
                SAVESTATE_PC_out <= std_logic_vector(execute_branchPC_masked);
             end if;
 
+         elsif (dbg_reg_wr = '1' and dbg_reg_idx = 15 and ce = '0' and reset = '0') then
+            fetch_PC       <= dbg_pc_aligned;
+            fetch_addr_q   <= dbg_pc_aligned;
+            fetch_instr_PC <= dbg_pc_aligned;
+            fetch_ready    <= '0';
+            fetch_first    <= '1';
          end if;
          
       end if;
@@ -726,6 +804,9 @@ begin
             decode_ready   <= '0';
             decode_halt    <= SAVESTATE_HALT;
             decode_unhalt  <= '0';
+            decode_instr_PC   <= unsigned(SAVESTATE_PC_in);
+            decode_instr_PC_1 <= unsigned(SAVESTATE_PC_in);
+            decode_opcode_q   <= (others => '0');
          
          elsif (ce = '1') then
             
@@ -744,6 +825,7 @@ begin
             
             if (execute_done = '0' and fetch_done = '1') then
                decode_data_1 <= fetch_data;
+               decode_instr_PC_1 <= fetch_instr_PC;
             end if;
             
             if (decode_functions_detail = block_read or decode_functions_detail = block_write) then
@@ -783,6 +865,12 @@ begin
             if (decode_halt = '0' and fetch_ready = '1' and (((fetch_done = '1' and decode_ready = '0') or execute_done = '1'))) then
                decode_ready <= '1';
                decode_PC    <= fetch_PC;
+               if (execute_stall = '1') then
+                  decode_instr_PC <= decode_instr_PC_1;
+               else
+                  decode_instr_PC <= fetch_instr_PC;
+               end if;
+               decode_opcode_q <= decode_data;
             
                -- synthesis translate_off
                decode_opcode_export <= decode_data;
@@ -1562,6 +1650,12 @@ begin
                decode_ready <= '0';
             end if;
          
+         elsif (dbg_reg_wr = '1' and dbg_reg_idx = 15 and ce = '0' and reset = '0') then
+            decode_ready      <= '0';
+            decode_halt       <= '0';
+            decode_unhalt     <= '0';
+            decode_instr_PC   <= dbg_pc_aligned;
+            decode_instr_PC_1 <= dbg_pc_aligned;
          end if; -- ce
          
       end if; -- clk
@@ -2690,6 +2784,24 @@ begin
             
             end if;
          
+         elsif (dbg_reg_wr = '1' and ce = '0' and reset = '0') then
+            if (dbg_reg_idx < 15) then
+               regs(to_integer(dbg_reg_idx)) <= unsigned(dbg_reg_data);
+            elsif (dbg_reg_idx = 15) then
+               regs(15)          <= dbg_pc_aligned;
+               execute_stall     <= '0';
+               execute_RW_State  <= DATARW_IDLE;
+               execute_MUL_State <= MUL_IDLE;
+               alu_wait_shift    <= '0';
+            elsif (dbg_reg_idx = 16) then
+               Flag_Negative   <= dbg_reg_data(31);
+               Flag_Zero       <= dbg_reg_data(30);
+               Flag_Carry      <= dbg_reg_data(29);
+               Flag_V_Overflow <= dbg_reg_data(28);
+               IRQ_disable     <= dbg_reg_data(7);
+               FIQ_disable     <= dbg_reg_data(6);
+               thumbmode       <= dbg_reg_data(5);
+            end if;
          end if;
          
       end if;

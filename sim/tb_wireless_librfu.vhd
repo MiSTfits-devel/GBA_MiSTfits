@@ -86,8 +86,10 @@ architecture sim of tb_wireless_librfu is
    signal d_rx_data  : std_logic_vector(7 downto 0) := (others => '0');
    signal d_rx_valid : std_logic := '0';
 
-   signal ping_seen       : std_logic := '0';
+   signal ping_count      : natural := 0;
    signal login_done_seen : std_logic := '0';
+   signal reverse_ack_count : natural := 0;
+   signal watchdog_seen     : std_logic := '0';
 
    constant ADR_SIODATA32 : integer := 16#120#;
    constant ADR_SIOCNT    : integer := 16#128#;
@@ -235,8 +237,8 @@ begin
       hps_rx_valid => d_rx_valid
    );
 
-   -- passive daemon: consume and log the adapter's event bytes only.
-   -- The ID check never reaches command phase, so no ACKs are needed.
+   -- Model only the UART side. The stimulus below drives the actual SIO
+   -- roles and retail ISR handshakes through the serial registers.
    daemon : process
       variable ptype, b1, b2, junk : std_logic_vector(7 downto 0);
       variable nbytes : integer;
@@ -245,11 +247,25 @@ begin
       begin
          loop
             wait until rising_edge(clk);
-            if (d_tx_valid = '1') then
+            if d_tx_valid = '1' and d_tx_ready = '1' then
                d := d_tx_data;
                exit;
             end if;
          end loop;
+      end procedure;
+
+      procedure putbyte(d : std_logic_vector(7 downto 0)) is
+      begin
+         wait until falling_edge(clk);
+         d_rx_data  <= d;
+         d_rx_valid <= '1';
+         wait until rising_edge(clk);
+         d_rx_valid <= '0';
+      end procedure;
+
+      procedure header(kind, code, length : std_logic_vector(7 downto 0)) is
+      begin
+         putbyte(kind); putbyte(code); putbyte(length);
       end procedure;
    begin
       loop
@@ -257,21 +273,57 @@ begin
          getbyte(b1);
          getbyte(b2);
          nbytes := to_integer(unsigned(b2)) * 4;
+         assert ptype = x"01" or (ptype = x"04" and nbytes = 0)
+            report "adapter emitted malformed UART header" severity failure;
          for i in 1 to nbytes loop
             getbyte(junk);
+            if ptype = x"01" and b1 = x"16" then
+               assert nbytes = 4 and unsigned(junk) = 16#89# - 16#22# * i
+                  report "GPIO reset clobbered in-flight UART payload" severity failure;
+            end if;
          end loop;
          if (ptype = x"04") then
             case b1 is
                when x"00" =>
-                  ping_seen <= '1';
-                  report "adapter event: PING RESET (woke from PWRSAVE)";
+                  ping_count <= ping_count + 1;
+                  report "adapter event: PING RESET";
                when x"01" =>
                   login_done_seen <= '1';
                   report "adapter event: LOGIN COMPLETE";
+               when x"02" =>
+                  -- ACK is out of phase; only the following notify is valid.
+                  header(x"02", x"A7", x"00");
+                  header(x"03", x"28", x"00");
+               when x"03" =>
+                  reverse_ack_count <= reverse_ack_count + 1;
                when x"04" =>
+                  watchdog_seen <= '1';
                   report "adapter event: word watchdog fired";
                when others =>
                   report "adapter event: " & to_hstring(b1);
+            end case;
+         elsif ptype = x"01" then
+            case b1 is
+               when x"10" =>
+                  putbyte(x"FF"); -- not a frame type
+                  header(x"03", x"28", x"00"); -- notify is out of phase
+                  header(x"02", x"A7", x"00"); -- wrong forward ACK ID
+                  header(x"02", x"90", x"21"); -- oversized, drain without writing
+                  for i in 1 to 33 * 4 loop putbyte(x"02"); end loop;
+                  header(x"02", x"90", x"01"); -- lost body
+                  wait for 26 ms;
+                  header(x"02", x"90", x"00");
+               when x"16" =>
+                  assert nbytes = 4 report "GPIO reset clobbered in-flight UART header" severity failure;
+               when x"25" =>
+                  header(x"02", x"EE", x"01");
+                  putbyte(x"01"); putbyte(x"00"); putbyte(x"00"); putbyte(x"00");
+               when x"27" =>
+                  header(x"02", x"A7", x"00");
+               when x"26" =>
+                  header(x"02", x"A6", x"00");
+               when others =>
+                  assert false report "unexpected daemon request " & to_hstring(b1) severity failure;
             end case;
          end if;
       end loop;
@@ -293,18 +345,57 @@ begin
 
       -- one blocking Normal-32 master transfer at 256 kHz
       -- (SIOCNT: 32bit | irq | start | internal clock, bit1=0 => 256kHz)
-      procedure xfer32(d : in std_logic_vector(31 downto 0); variable res : out std_logic_vector(31 downto 0)) is
+      procedure xfer32(d : in std_logic_vector(31 downto 0);
+                       variable res : out std_logic_vector(31 downto 0);
+                       config : std_logic_vector(15 downto 0) := x"5081") is
       begin
          buswrite32(bus_g, ADR_SIODATA32, d);
          irq_clr <= '1';
          wait for 4 * CLK_PERIOD;
          irq_clr <= '0';
-         buswrite16(bus_g, ADR_SIOCNT, x"5081");
+         buswrite16(bus_g, ADR_SIOCNT, config);
          wait until irq_seen = '1' for 3 ms;
          assert irq_seen = '1'
             report "librfu: SIO transfer never completed -- the GBA side hung"
             severity failure;
          busread32(bus_g, wired_g, ADR_SIODATA32, res);
+      end procedure;
+
+      procedure wait_si(level : std_logic) is
+         constant deadline : time := now + 60 ms;
+         variable cnt : std_logic_vector(31 downto 0);
+      begin
+         loop
+            busread32(bus_g, wired_g, ADR_SIOCNT, cnt);
+            exit when cnt(2) = level;
+            assert now < deadline report "retail SI handshake timed out" severity failure;
+         end loop;
+      end procedure;
+
+      procedure handshake(master : boolean) is
+      begin
+         if master then
+            wait_si('1');
+            buswrite16(bus_g, ADR_SIOCNT, x"500B");
+            wait_si('0');
+            buswrite16(bus_g, ADR_SIOCNT, x"5003");
+         else
+            wait_si('0');
+            buswrite16(bus_g, ADR_SIOCNT, x"5008");
+            wait_si('1');
+            buswrite16(bus_g, ADR_SIOCNT, x"5000");
+         end if;
+      end procedure;
+
+      procedure send_request(req, ack : std_logic_vector(31 downto 0)) is
+         variable reply : std_logic_vector(31 downto 0);
+      begin
+         xfer32(req, reply, x"5083");
+         assert reply = x"80000000" report "bad forward REQ dummy" severity failure;
+         handshake(true);
+         xfer32(x"80000000", reply, x"5083");
+         assert reply = ack report "bad forward ACK: " & to_hstring(reply) severity failure;
+         handshake(true);
       end procedure;
    begin
       wait for 20 * CLK_PERIOD;
@@ -326,8 +417,8 @@ begin
       buswrite16(bus_g, ADR_RCNT, x"80A0"); -- SD low -> adapter must reset
       wait for 100 us;
 
-      wait until ping_seen = '1' for 1 ms;
-      assert ping_seen = '1'
+      if ping_count = 0 then wait until ping_count = 1 for 1 ms; end if;
+      assert ping_count = 1
          report "adapter never detected librfu's RCNT SD pulse -- it is still "
               & "in PWRSAVE and no Pokemon game could ever reach login"
          severity failure;
@@ -413,6 +504,54 @@ begin
          severity failure;
 
       report "LIBRFU ID CHECK PASSED: adapter returned RFU_ID 0x8001";
+      send_request(x"99660010", x"99660090");
+      send_request(x"99660025", x"996601EE");
+      xfer32(x"80000000", r32, x"5083");
+      assert r32 = x"00000001" report "forward rejection lost its reason" severity failure;
+      handshake(true);
+      assert a_sc_oe = '0' report "forward rejection gave the adapter the clock" severity failure;
+
+      send_request(x"99660027", x"996600A7");
+      xfer32(x"80000000", r32, x"5080");
+      assert r32 = x"99660028" report "bad reverse notification" severity failure;
+      handshake(false);
+      xfer32(x"996600A8", r32, x"5080");
+      assert r32 = x"80000000" report "bad reverse ACK clock word" severity failure;
+      handshake(false);
+      -- The retail ISR reconfigures SIO and calls the DataRx callback
+      -- immediately, without a dummy word or a wait for the UART event.
+      buswrite32(bus_g, ADR_SIODATA32, x"00000000");
+      buswrite16(bus_g, ADR_SIOCNT, x"0000");
+      buswrite16(bus_g, ADR_SIOCNT, x"5003");
+      assert a_sc_oe = '0' report "retail ISR raced adapter clock handback" severity failure;
+      send_request(x"99660026", x"996600A6");
+      assert reverse_ack_count = 1 report "missing/duplicate reverse ACK event" severity failure;
+
+      send_request(x"99660027", x"996600A7");
+      xfer32(x"80000000", r32, x"5080");
+      assert r32 = x"99660028" report "bad watchdog test notify" severity failure;
+      -- Leave SO low forever instead of acknowledging the first word.
+      wait until watchdog_seen = '1' for 101 ms;
+      assert watchdog_seen = '1' and a_sc_oe = '0'
+         report "stalled reverse handshake did not release SC" severity failure;
+      send_request(x"99660026", x"996600A6");
+
+      xfer32(x"99660116", r32, x"5083");
+      handshake(true);
+      xfer32(x"01234567", r32, x"5083");
+      wait until rising_edge(clk) and d_tx_valid = '1' for 1 ms;
+      assert d_tx_valid = '1' and d_tx_data = x"01" report "missing UART REQ type" severity failure;
+      d_tx_ready <= '0';
+      buswrite16(bus_g, ADR_RCNT, x"80A2");
+      wait for 1.13 ms;
+      buswrite16(bus_g, ADR_RCNT, x"80A0");
+      wait for 4 * CLK_PERIOD;
+      d_tx_ready <= '1';
+      wait until ping_count = 2 for 1 ms;
+      assert ping_count = 2 report "GPIO reset event lost behind stalled UART frame" severity failure;
+
+      report "LIBRFU COMMAND, FRAMING AND HANDBACK TESTS PASSED";
+
       done <= true;
       wait;
    end process;

@@ -77,7 +77,10 @@ entity gba_gpu is
       PALETTE_OAM_we       : in    std_logic_vector(3 downto 0);
       PALETTE_OAM_re       : in    std_logic_vector(3 downto 0);
       
-      DISPSTAT_debug       : out std_logic_vector(31 downto 0)
+      DISPSTAT_debug       : out std_logic_vector(31 downto 0);
+      dbg_vcount           : out std_logic_vector(7 downto 0) := (others => '0');
+      dbg_line_start       : out std_logic := '0';
+      dbg_hblank_start     : out std_logic := '0'
    );
 end entity;
 
@@ -156,7 +159,10 @@ begin
       linecounter_drawer           => linecounter_drawer, 
       linecounter_obj              => linecounter_obj, 
                                    
-      DISPSTAT_debug               => DISPSTAT_debug
+      DISPSTAT_debug               => DISPSTAT_debug,
+      dbg_vcount                   => dbg_vcount,
+      dbg_line_start               => dbg_line_start,
+      dbg_hblank_start             => dbg_hblank_start
    );
 
    igba_gpu_drawer : entity work.gba_gpu_drawer

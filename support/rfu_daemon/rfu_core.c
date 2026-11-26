@@ -4,6 +4,7 @@
 #include "rfu_net.h"
 #include "rfu_proto.h"
 
+#include <inttypes.h>
 #include <stdlib.h>
 
 #define MAX_CLIENTS      4
@@ -49,11 +50,21 @@ static struct {
     uint32_t data[6];
 } peer_bcst[RFU_NET_MAX_PEERS];
 
-static struct { uint32_t words[23]; uint8_t blen; } txbuf;
+static struct {
+    uint32_t words[23];
+    uint8_t blen;
+    uint8_t valid;
+    uint8_t targets, acked;  // host only: recipients of the current staged frame
+    uint8_t departed_acked; // ACKs received before a child withdrew, for this report only
+    uint8_t report_pending;  // a host transmission not yet reported to the GBA
+} txbuf;
 
 static int      wait_armed;
 static int      wait_reversed;   // GBA has actually handed us the clock
 static uint32_t wait_deadline, rtx_deadline;
+static uint16_t disconnect_param;
+
+enum { CID_ERASED = 0, LINK_LOST = 1 };
 
 static const char *state_names[] = { "IDLE", "HOST", "HOST-OPEN",
                                      "SEARCH", "CONNECTING", "CLIENT" };
@@ -71,6 +82,28 @@ static uint16_t new_devid(void)
 static int is_host(void)
 {
     return state == RFU_ST_HOST || state == RFU_ST_HOST_OPEN;
+}
+
+static unsigned host_slots(void)
+{
+    unsigned slots = 0;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+        if (host.clients[i].devid)
+            slots |= 1u << i;
+    return slots;
+}
+
+static int child_matches(int peer, int slot, uint16_t devid)
+{
+    return devid && host.clients[slot].devid == devid &&
+           host.clients[slot].peer == peer;
+}
+
+static void drop_child(int slot)
+{
+    memset(&host.clients[slot], 0, sizeof(host.clients[slot]));
+    txbuf.targets &= ~(1u << slot);
+    txbuf.acked &= ~(1u << slot);
 }
 
 // --- RFU1 packet emission (gpsp/rfu.c wire format) -----------------------
@@ -119,8 +152,8 @@ static void session_clear(void)
     client.host_peer = -1;
     memset(&txbuf, 0, sizeof(txbuf));
     state      = RFU_ST_IDLE;
-    wait_armed = 0;
-    wait_reversed = 0;
+    disconnect_param = LINK_LOST << 8;
+    rfu_core_wait_cancel();
 }
 
 void rfu_core_init(void)
@@ -160,18 +193,33 @@ static int data_avail(void)
 // this unit's own S<n> field for a child (docs/agb015_protocol.md 0x24).
 static int stage_tx(uint8_t len, const uint32_t *p)
 {
-    unsigned nw = len - 1u;
-    if (nw > sizeof(txbuf.words) / sizeof(txbuf.words[0]))
-        nw = sizeof(txbuf.words) / sizeof(txbuf.words[0]);
-
-    if (is_host())
-        txbuf.blen = p[0] & 0x7F;
-    else if (state == RFU_ST_CLIENT)
-        txbuf.blen = (p[0] >> (8 + client.clnum * 5)) & 0x1F;
-    else
+    unsigned blen, max_bytes;
+    if (is_host()) {
+        blen = p[0] & 0x7F;
+        max_bytes = 87;
+    } else if (state == RFU_ST_CLIENT) {
+        blen = (p[0] >> (8 + client.clnum * 5)) & 0x1F;
+        max_bytes = 16;
+    } else {
+        return -1;
+    }
+    unsigned nw = (blen + 3) / 4;
+    // Retail librfu writes a one-byte null LLSF (0xFF) but calls
+    // STWI_send_DataTx[AndChange]REQ with size 1, omitting the payload word.
+    int null_llsf = is_host() && len == 1 && p[0] == 1;
+    if (blen > max_bytes || (!null_llsf && nw > len - 1u))
         return -1;
 
-    memcpy(txbuf.words, &p[1], nw * sizeof(uint32_t));
+    txbuf.blen = (uint8_t)blen;
+    txbuf.valid = 1;
+    txbuf.targets = is_host() ? host_slots() : 0;
+    txbuf.acked = 0;
+    txbuf.departed_acked = 0;
+    txbuf.report_pending = 0;
+    if (null_llsf)
+        txbuf.words[0] = 0xFF;
+    else
+        memcpy(txbuf.words, &p[1], nw * sizeof(uint32_t));
     return 0;
 }
 
@@ -180,20 +228,20 @@ static int stage_tx(uint8_t len, const uint32_t *p)
 // DataTx, so both end up here.
 static int transmit_staged(void)
 {
-    int i;
+    if (!txbuf.valid)
+        return -1;
 
     if (is_host()) {
-        if (txbuf.blen <= 90)
-            for (i = 0; i < MAX_CLIENTS; i++)
-                if (host.clients[i].devid)
-                    net_data(host.clients[i].peer, RFU1_HOST_SEND,
-                             txbuf.blen, txbuf.words, txbuf.blen);
+        txbuf.report_pending = 1;
+        for (int i = 0; i < MAX_CLIENTS; i++)
+            if ((txbuf.targets & ~txbuf.acked) & (1u << i))
+                net_data(host.clients[i].peer, RFU1_HOST_SEND,
+                         txbuf.blen, txbuf.words, txbuf.blen);
     } else if (state == RFU_ST_CLIENT) {
-        if (txbuf.blen <= 16)
-            net_data(client.host_peer, RFU1_CLIENT_SEND,
-                     ((uint32_t)txbuf.blen << 24) |
-                     ((uint32_t)client.clnum << 16) | client.devid,
-                     txbuf.words, txbuf.blen);
+        net_data(client.host_peer, RFU1_CLIENT_SEND,
+                 ((uint32_t)txbuf.blen << 24) |
+                 ((uint32_t)client.clnum << 16) | client.devid,
+                 txbuf.words, txbuf.blen);
     } else {
         return -1;
     }
@@ -273,6 +321,7 @@ int rfu_core_command(uint8_t cmd, uint8_t len, const uint32_t *p, uint32_t *resp
         if (!is_host()) {
             host.devid = new_devid();
             memset(host.clients, 0, sizeof(host.clients));
+            memset(&txbuf, 0, sizeof(txbuf));
             rfu_log("hosting, device id %04x\n", host.devid);
         }
         state           = RFU_ST_HOST_OPEN;
@@ -349,9 +398,7 @@ int rfu_core_command(uint8_t cmd, uint8_t len, const uint32_t *p, uint32_t *resp
 
     case 0x24: // DataTx
     case 0x25: // DataTx & Change (reversal follows the ACK)
-        if (!len)
-            return 0;
-        if (stage_tx(len, p) < 0)
+        if (!len || stage_tx(len, p) < 0)
             return -1;
         return transmit_staged();
 
@@ -410,7 +457,7 @@ int rfu_core_command(uint8_t cmd, uint8_t len, const uint32_t *p, uint32_t *resp
                 if ((p[0] & (1u << i)) && host.clients[i].devid) {
                     net_cmd(host.clients[i].peer, RFU1_DISCONNECT,
                             host.clients[i].devid | ((uint32_t)i << 16));
-                    memset(&host.clients[i], 0, sizeof(host.clients[i]));
+                    drop_child(i);
                 }
         }
         return 0;
@@ -451,7 +498,7 @@ void rfu_core_frame(void)
             if (host.clients[i].devid &&
                 ++host.clients[i].ttl >= CLIENT_TTL_FR) {
                 rfu_log("child slot %d timed out\n", i);
-                memset(&host.clients[i], 0, sizeof(host.clients[i]));
+                drop_child(i);
             }
     }
 }
@@ -473,36 +520,37 @@ void rfu_core_wait_reversed(void)
     wait_reversed = 1;
 }
 
+void rfu_core_wait_cancel(void)
+{
+    wait_armed = 0;
+    wait_reversed = 0;
+}
+
 int rfu_core_peer_live(void)
 {
-    int i;
+    return is_host() ? host_slots() != 0 : state == RFU_ST_CLIENT;
+}
 
-    if (is_host()) {
-        for (i = 0; i < MAX_CLIENTS; i++)
-            if (host.clients[i].devid && host.clients[i].ttl < CLIENT_TTL_FR)
-                return 1;
-        return 0;
-    }
-    if (state == RFU_ST_CLIENT)
-        return 1;
-    return 0;
+static int host_rtx_done(unsigned active)
+{
+    // Don't treat the local radio's short retransmit window as proof that
+    // an attached NETPLAY/UDP peer failed to ACK; it may still be in flight.
+    return !active ||
+           (txbuf.report_pending && (txbuf.acked & active) == (txbuf.targets & active));
 }
 
 int rfu_core_wait_next_ms(void)
 {
-    uint32_t now = rfu_now_ms();
-    int32_t  a, b;
-
-    if (!wait_armed)
+    if (!wait_armed || !wait_reversed)
         return -1;
+    if (state == RFU_ST_IDLE)
+        return 0;
 
-    b = (int32_t)(wait_deadline - now);
-    // The retransmit window only matters when we would actually act on it,
-    // i.e. when there is no live peer to keep waiting for. With a peer
-    // attached we hold out for the real deadline instead, so waking early
-    // would just burn CPU.
-    if (is_host() && !rfu_core_peer_live()) {
-        a = (int32_t)(rtx_deadline - now);
+    uint32_t now = rfu_now_ms();
+    int32_t b = (int32_t)(wait_deadline - now);
+
+    if (is_host() && host_rtx_done(host_slots())) {
+        int32_t a = (int32_t)(rtx_deadline - now);
         if (a < b) b = a;
     }
     if (b < 0) b = 0;
@@ -511,46 +559,85 @@ int rfu_core_wait_next_ms(void)
 
 int rfu_core_wait_poll(uint8_t *cmd, uint8_t *nparams, uint32_t *params)
 {
+    // The notify can only go out after the FPGA says the GBA is clock slave.
+    if (!wait_armed || !wait_reversed)
+        return 0;
+
     uint32_t now = rfu_now_ms();
-
-    if (!wait_armed)
-        return 0;
-
-    // The GBA only listens once it has handed us the clock. gpSP guards this
-    // same edge; resolving earlier injects a notify into a GBA that is still
-    // master, which showed up in traces as the inject preceding the reversal.
-    if (!wait_reversed)
-        return 0;
+    int expired = (int32_t)(now - wait_deadline) >= 0;
+    int host_mode = is_host();
+    unsigned active = host_mode ? host_slots() :
+                      state == RFU_ST_CLIENT ? 1u << client.clnum : 0;
+    int reporting = host_mode && txbuf.report_pending;
+    unsigned targets = active & txbuf.targets;
+    unsigned acked = targets & txbuf.acked;
 
     if (state == RFU_ST_IDLE) {
-        // Nobody left to talk to: report the connection loss.
-        *cmd = 0x29; *nparams = 1; params[0] = 0x0F;
-    } else if (data_avail()) {
-        *cmd = 0x28; *nparams = 0;
-    } else if (is_host() && (int32_t)(now - rtx_deadline) >= 0 &&
-               !rfu_core_peer_live()) {
-        // The retransmit window elapsed and no peer is attached: this is the
-        // genuine "sent, nobody answered" case a real adapter reports.
-        //
-        // We deliberately do NOT report this merely because the window shut.
-        // That window (~11 ms) models a local radio's retransmit budget, but
-        // our peer is reached over TCP, where a reply routinely takes longer.
-        // Claiming "no child answered" about a peer we know is connected made
-        // Emerald abandon trades on their first exchange; we hold out for the
-        // real timeout instead, and let a late-but-valid reply count as data.
-        *cmd = 0x28; *nparams = 1; params[0] = 0x00000F0F;
-    } else if ((int32_t)(now - wait_deadline) >= 0) {
+        *cmd = 0x29;
+        *nparams = 1;
+        params[0] = disconnect_param;
+        disconnect_param = LINK_LOST << 8;
+    } else if ((data_avail() && (!reporting || acked == targets)) ||
+               (host_mode && host_rtx_done(active) &&
+                (int32_t)(now - rtx_deadline) >= 0) ||
+               (expired && reporting)) {
+        *cmd = 0x28;
+        unsigned departed_acked = txbuf.departed_acked;
+        txbuf.departed_acked = 0;
+        txbuf.report_pending = 0;
+        // An empty DRAC implies ACK from every connected child to librfu.
+        // Do not implicitly credit a new child that never received this Tx.
+        if (host_mode && (!active || (reporting && (acked != active || departed_acked)))) {
+            *nparams = 1;
+            acked |= departed_acked;
+            params[0] = ((reporting ? targets : active) << 8) | acked;
+            rfu_log("uart=notify cmd=0x28 words=1 param=0x%08" PRIX32
+                    " active=0x%X acked=0x%X state=%s\n",
+                    params[0], reporting ? targets : active, acked, rfu_core_state_name());
+        } else {
+            *nparams = 0;
+            rfu_log("uart=notify cmd=0x28 words=0 param=-"
+                    " active=0x%X acked=0x%X state=%s\n",
+                    active, acked, rfu_core_state_name());
+        }
+    } else if (expired) {
         *cmd = 0x27; *nparams = 0;   // MasterChangeTimer expiry
     } else {
         return 0;
     }
 
-    wait_armed    = 0;
-    wait_reversed = 0;
+    rfu_core_wait_cancel();
     return 1;
 }
 
 // --- inbound RFU1 --------------------------------------------------------
+
+static void lose_parent(unsigned reason)
+{
+    int armed = wait_armed, reversed = wait_reversed;
+    unsigned slot_mask = 1u << client.clnum;
+    session_clear();
+    wait_armed = armed;
+    wait_reversed = reversed;
+    disconnect_param = (uint16_t)((reason << 8) | slot_mask);
+}
+
+void rfu_core_peer_disconnected(int peer)
+{
+    if (peer < 0 || peer >= RFU_NET_MAX_PEERS)
+        return;
+    peer_bcst[peer].valid = 0;
+    if (state == RFU_ST_CLIENT && client.host_peer == peer) {
+        rfu_log("host peer %d disconnected\n", peer);
+        lose_parent(LINK_LOST);
+    } else if (is_host()) {
+        for (int i = 0; i < MAX_CLIENTS; i++)
+            if (host.clients[i].devid && host.clients[i].peer == peer) {
+                rfu_log("child slot %d disconnected (peer %d)\n", i, peer);
+                drop_child(i);
+            }
+    }
+}
 
 void rfu_core_net_receive(int peer, const void *buf, size_t len)
 {
@@ -589,6 +676,7 @@ void rfu_core_net_receive(int peer, const void *buf, size_t len)
                 host.clients[i].devid = new_devid();
                 host.clients[i].peer  = peer;
                 host.clients[i].ttl   = 0;
+                txbuf.departed_acked &= ~(1u << i); // don't credit a replacement CID
                 rfu_log("child joined slot %d as %04x (peer %d)\n",
                         i, host.clients[i].devid, peer);
                 net_cmd(peer, RFU1_CONNECT_ACK,
@@ -602,6 +690,7 @@ void rfu_core_net_receive(int peer, const void *buf, size_t len)
         if (state != RFU_ST_CONNECTING)
             return;
         memset(&client, 0, sizeof(client));
+        memset(&txbuf, 0, sizeof(txbuf));
         client.devid     = h & 0xffff;
         client.clnum     = (h >> 16) & 3;
         client.host_peer = peer;
@@ -617,22 +706,28 @@ void rfu_core_net_receive(int peer, const void *buf, size_t len)
     case RFU1_DISCONNECT:
         if (is_host()) {
             int slot = (h >> 16) & 3;
-            if (host.clients[slot].devid == (h & 0xffff)) {
+            if (child_matches(peer, slot, h & 0xffff)) {
                 rfu_log("child slot %d left\n", slot);
-                memset(&host.clients[slot], 0, sizeof(host.clients[slot]));
+                // gpSP can ACK the final frame and then send Disconnect in the
+                // same TCP read. Report the ACK once, but never retry to this slot.
+                if (txbuf.report_pending)
+                    txbuf.departed_acked |= txbuf.acked & (1u << slot);
+                drop_child(slot);
             }
-        } else if (state == RFU_ST_CLIENT) {
+        } else if (state == RFU_ST_CLIENT && client.host_peer == peer) {
             rfu_log("host dropped us\n");
-            session_clear();
+            lose_parent(CID_ERASED);
         }
         break;
 
     case RFU1_HOST_SEND: {
         unsigned blen = h & 0x7f;
-        if (state != RFU_ST_CLIENT || len < blen + 12 || blen > 128)
+        if (state != RFU_ST_CLIENT || client.host_peer != peer || len < blen + 12)
             return;
         net_cmd(peer, RFU1_CLIENT_ACK,
                 client.devid | ((uint32_t)client.clnum << 16));
+        if (state != RFU_ST_CLIENT) // TCP TX overflow can drop this peer
+            return;
         for (i = 0; i < MAX_PKTS; i++)
             if (!client.pkts[i].len) {
                 memcpy(client.pkts[i].data, &b[12], blen);
@@ -655,7 +750,7 @@ void rfu_core_net_receive(int peer, const void *buf, size_t len)
         int slot = (h >> 16) & 3;
         if (!is_host() || len < blen + 12 || blen > 16)
             return;
-        if (host.clients[slot].devid != (h & 0xffff))
+        if (!child_matches(peer, slot, h & 0xffff))
             return;
         host.clients[slot].ttl = 0;
         for (i = 0; i < MAX_PKTS; i++)
@@ -674,8 +769,12 @@ void rfu_core_net_receive(int peer, const void *buf, size_t len)
 
     case RFU1_CLIENT_ACK: {
         int slot = (h >> 16) & 3;
-        if (is_host() && host.clients[slot].devid == (h & 0xffff))
+        if (is_host() && child_matches(peer, slot, h & 0xffff)) {
             host.clients[slot].ttl = 0;
+            // RFU1 ACKs have no frame sequence number. Attribute them to
+            // the latest staged transmission to this child, not its data.
+            txbuf.acked |= txbuf.targets & (1u << slot);
+        }
         break; }
     }
 }

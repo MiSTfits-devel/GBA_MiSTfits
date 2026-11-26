@@ -47,7 +47,10 @@ entity gba_gpu_timing is
       linecounter_drawer   : out unsigned(7 downto 0);
       linecounter_obj      : out unsigned(7 downto 0);
       
-      DISPSTAT_debug       : out std_logic_vector(31 downto 0)
+      DISPSTAT_debug       : out std_logic_vector(31 downto 0);
+      dbg_vcount           : out std_logic_vector(7 downto 0) := (others => '0');
+      dbg_line_start       : out std_logic := '0';
+      dbg_hblank_start     : out std_logic := '0'
    );
 end entity;
 
@@ -118,6 +121,7 @@ begin
    wired_done <= '0' when (reg_wired_done = 0) else '1';
    
    linecounter_drawer <= linecounter;
+   dbg_vcount <= std_logic_vector(linecounter);
    
    REG_VCOUNT(23 downto 16) <= std_logic_vector(linecounter);
    REG_VCOUNT(31 downto 24) <= (others => '0');
@@ -129,8 +133,6 @@ begin
    begin
       if rising_edge(clk) then
       
-         IRP_VBlank      <= '0';
-                     
          drawline        <= '0';
          drawObj         <= '0';
          refpoint_update <= '0';
@@ -138,6 +140,8 @@ begin
          hblank_trigger  <= '0';
          vblank_trigger  <= '0';
          newline_invsync <= '0';
+         dbg_line_start   <= '0';
+         dbg_hblank_start <= '0';
          
          videodma_start  <= '0';
          videodma_stop   <= '0';
@@ -163,6 +167,7 @@ begin
                                 REG_DISPSTAT_V_Blank_flag;
 
          if (reset = '1') then
+            IRP_VBlank <= '0';
          
             gpustate    <= tGPUState'VAL(to_integer(unsigned(SAVESTATE_GPU(21 downto 20))));
             cycles      <= unsigned(SAVESTATE_GPU(11 downto 0));
@@ -173,6 +178,8 @@ begin
             REG_DISPSTAT_V_Blank_flag   <= SAVESTATE_GPU(24 downto 24);
             
          elsif (ce = '1') then
+            -- Keep a pending IRQ until the core can sample it on an enabled edge.
+            IRP_VBlank <= '0';
          
             -- really required?
             -- if (forcedblank && !new_forcedblank) then
@@ -209,6 +216,7 @@ begin
                      gpustate                  <= HBLANK;
                      REG_DISPSTAT_H_Blank_flag <= "1";
                      hblank_trigger            <= '1';
+                     dbg_hblank_start          <= '1';
                      if (linecounter >= 2) then
                         videodma_start  <= '1';
                      end if;
@@ -218,6 +226,7 @@ begin
                   if (cycles >= 224) then
                      cycles          <= (others => '0');
                      linecounter     <= linecounter + 1;
+                     dbg_line_start  <= '1';
    
                      REG_DISPSTAT_H_Blank_flag <= "0";
                      if ((linecounter + 1) < 160) then
@@ -245,6 +254,7 @@ begin
                      gpustate                   <= VBLANKHBLANK;
                      REG_DISPSTAT_H_Blank_flag  <= "1";
                      newline_invsync            <= '1';
+                     dbg_hblank_start           <= '1';
                      -- don't do hblank for dma here!
                      if (linecounter < 162) then
                         videodma_start <= '1';
@@ -258,6 +268,7 @@ begin
                   if (cycles >= 224) then
                      cycles      <= (others => '0');
                      linecounter <= linecounter + 1;
+                     dbg_line_start <= '1';
                      
                      REG_DISPSTAT_H_Blank_flag <= "0";
                      line_trigger <= '1';

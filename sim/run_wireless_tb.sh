@@ -8,4 +8,4 @@ cd "$(git rev-parse --show-toplevel)"
 W=sim/nvc_work
 nvc --work=work:$W -a --relaxed rtl/proc_bus_gba.vhd rtl/reggba_serial.vhd rtl/gba_serial.vhd rtl/gba_linkport.vhd rtl/gba_wireless.vhd rtl/gba_wireless_uart.vhd sim/tb_wireless.vhd
 nvc --work=work:$W -e --jit tb_wireless
-nvc --work=work:$W -r tb_wireless --stop-time=100ms --exit-severity=failure
+nvc --work=work:$W -r tb_wireless --stop-time=350ms --exit-severity=failure

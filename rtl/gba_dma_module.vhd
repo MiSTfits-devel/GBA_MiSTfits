@@ -71,7 +71,8 @@ entity gba_dma_module is
       dma_bus_done        : in     std_logic;
       dma_bus_unread      : in     std_logic;
                                    
-      is_idle             : out    std_logic
+      is_idle             : out    std_logic;
+      ce                  : in     std_logic := '1'
    );
 end entity;
 
@@ -90,6 +91,8 @@ architecture arch of gba_dma_module is
    signal CNT_H_DMA_Enable         : std_logic_vector(Reg_CNT_H_DMA_Enable        .upper downto Reg_CNT_H_DMA_Enable        .lower) := (others => '0');
                                                                                                                                                    
    signal CNT_H_DMA_Enable_written           : std_logic;   
+   signal dma_enable_write_pending : std_logic := '0';
+   signal dma_enable_written       : std_logic;
 
    type t_reg_wired_or is array(0 to 10) of std_logic_vector(31 downto 0);
    signal reg_wired_or    : t_reg_wired_or;   
@@ -216,10 +219,12 @@ begin
    dma_bus_norom <= '1' when (addr_source(27) = '0' and addr_target(27) = '0') else '0';
    
    dma_bus_rnw <= '1' when (state = READING) else '0';
+
+   dma_enable_written <= CNT_H_DMA_Enable_written or dma_enable_write_pending;
    
-   dma_bus_ena <= '1' when (state = READING and allow_on = '1' and (dma_bus_done = '1' or req_next = '1')) else
-                  '1' when (state = WRITING and dma_bus_done = '1') else
-                  '0'; 
+   dma_bus_ena <= ce when ((state = READING and allow_on = '1' and (dma_bus_done = '1' or req_next = '1')) or
+                           (state = WRITING and dma_bus_done = '1')) else
+                  '0';
                  
    dma_bus_seq <= '1' when (first = '0') else '0';
    
@@ -231,11 +236,10 @@ begin
    begin
       if rising_edge(clk) then
       
-         IRP_DMA       <= '0';
-         
-         last_dma_valid   <= '0';
-         
          if (reset = '1') then
+            IRP_DMA            <= '0';
+            last_dma_valid     <= '0';
+            dma_enable_write_pending <= '0';
             addr_source        <= unsigned(SAVESTATE_DMASOURCE);
             addr_target        <= unsigned(SAVESTATE_DMATARGET);
             count              <= unsigned(SAVESTATE_DMAMIXED(16 downto 0));
@@ -252,10 +256,13 @@ begin
             dmaon              <= SAVESTATE_DMAMIXED(30);
          
             state              <= IDLE;
-         else
+         elsif (ce = '1') then
+            IRP_DMA                  <= '0';
+            last_dma_valid           <= '0';
+            dma_enable_write_pending <= '0';
       
             -- dma init
-            if (CNT_H_DMA_Enable_written = '1' and loading_savestate = '0') then
+            if (dma_enable_written = '1' and loading_savestate = '0') then
             
                Enable <= CNT_H_DMA_Enable;
                
@@ -358,10 +365,10 @@ begin
                      when IDLE =>
                         dma_soon <= '1';
                         req_next <= '1';
-                        if (CPU_bus_idle = '1' and CNT_H_DMA_Enable_written = '0') then
+                        if (CPU_bus_idle = '1' and dma_enable_written = '0') then
                            state <= READING;
                         end if;
-                        if (CNT_H_DMA_Enable_written = '1' and CNT_H_DMA_Enable = "0") then
+                        if (dma_enable_written = '1' and CNT_H_DMA_Enable = "0") then
                            req_next <= '0';
                            dma_soon <= '0';
                         end if;
@@ -474,6 +481,9 @@ begin
                end if;
             end if;
             
+         elsif (CNT_H_DMA_Enable_written = '1' and loading_savestate = '0') then
+            -- The live MMIO register can report a write just as CE falls.
+            dma_enable_write_pending <= '1';
          end if;
       
       end if;

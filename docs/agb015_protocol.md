@@ -165,6 +165,8 @@ interval **< 64.8 ms** [MAN B-5]; the adapter's own clock-drift timeout is
 packet state machine and waits for a fresh REQ header (it does NOT reset the
 session). Implement the same: a per-word timeout (~100 ms) that re-arms the
 "expect 0x9966 header" state.
+The word timeout is disarmed after the final ACK word's handshake: idle
+between commands is not a stalled transfer, even during long Flash writes.
 
 ---
 
@@ -289,6 +291,11 @@ bits 27:23  S3_DataLength     "     slot 3
 4 (client, 16 B). ACK has no payload. The adapter queues this for RF transmission
 to the peer(s). 0x25 additionally performs the §5 role reversal after the ACK.
 
+Retail Emerald's parent keepalive is an exception: its one parameter is
+`0x00000001`, declaring one byte but omitting the payload word. Its librfu
+intended to send a one-byte null frame (`0xFF`). Reconstruct that byte for
+both commands; the child receiver ignores frames shorter than an LLSF header.
+
 ### 0x26 DataRx — 0 params
 Response: empty (0 words) if nothing received, else the same header word (length
 fields describe *who sent what*: P_DataLength for data from the parent, Sn for data
@@ -313,9 +320,10 @@ still exists) — but Emerald will then drop to a link error rather than resume.
 
 ## 5. Clock reversal (adapter becomes SPI master)
 
-Commands **0x25 (DataTx&Change), 0x27 (MS_Change), 0x37** ACK normally, and then
-the roles flip: the GBA reconfigures as SIO slave (external clock) with
-`SIODATA32 = 0x80000000` armed and SO low; the adapter must now generate the clock
+On a successful ACK to **0x25 (DataTx&Change), 0x27 (MS_Change), 0x35, or 0x37**
+the roles flip. An `0xEE` rejection does not reverse the clock. On success the
+GBA reconfigures as SIO slave (external clock) with `SIODATA32 = 0x80000000`
+armed and SO low; the adapter must now generate the clock
 and issue its own REQ packet when it has something to report. [MAN B-31/§3.3,
 LRW `wait`/`sendDataAndWait` + `receiveCommandFromAdapter`, RFU clock-slave ISR]
 
@@ -323,11 +331,14 @@ Adapter-issued commands (same 0x9966 framing, directions swapped):
 
 - **0x28 DataReady&Change** — new data arrived (or send verified). 0 params
   normally; 1 param when MaxMframe retransmissions expired without all children
-  ACKing: `byte0 = ACKinfo bitmap (slots that ACKed), byte2 = ActiveSlot bitmap
-  (slots still being retried; a child silent > 1 s is dropped from ActiveSlot)`.
+  ACKing: `bits 3:0 = ACKinfo` (slots that ACKed), `bits 11:8 = ActiveSlot`
+  (slots still participating in the transmission). [MAN B-32]
+  An ACK received just before an RFU1 peer disconnects still belongs to that
+  transmission, so ACKinfo can include a slot no longer in ActiveSlot. Report
+  it once; the disconnected slot must not receive subsequent retransmissions.
 - **0x29 Disconnected&Change** — connection lost (child side). 1 param:
-  `byte0 = reason (0 = own CID erased by parent, 1 = link lost),
-  byte2 = bitmap of disconnected slots`.
+  `bits 3:0 = SlotNo` (bitmap of disconnected slots);
+  `bits 15:8 = Reason` (0 = own CID erased by parent, 1 = link lost). [MAN B-33]
 - **0x27 MS_Change** — issued by the adapter only when SystemConfig's
   MasterChangeTimer expires (deadline for the GBA being clock slave); afska calls
   this outcome "EVENT_WAIT_TIMEOUT". 0 params.
@@ -337,22 +348,18 @@ Wire sequence, adapter as master (each word followed by the reversed handshake i
 §5.1):
 
 ```
-adapter clocks:  0x9966_PPCC      (PP params, CC ∈ {0x27,0x28,0x29})   GBA returns 0x80000000
+adapter clocks:  0x9966_PPCC      (PP params, CC ∈ {0x27,0x28,0x29,0x36})   GBA returns 0x80000000
 adapter clocks:  param words       (GBA returns 0x80000000 each)
-adapter clocks:  0x80000000        ← GBA returns 0x9966_00(CC+0x80)  (the GBA's ACK)
-adapter clocks:  0x80000000        ← GBA returns 0x80000000  (final; then GBA
-                                      switches back to master 2 Mbps)
+adapter clocks:  0x80000000        ← GBA returns 0x9966_LL(CC+0x80) (ACK header)
+adapter clocks:  0x80000000 × LL   ← GBA returns LL ACK parameters, if any
 ```
 
-The GBA validates the header (must be 0x9966), collects params, replies with the
-ACK packet, and expects the adapter's final word to be exactly `0x80000000`
-[LRW `receiveCommandFromAdapter`]. After this exchange **the GBA is clock master
-again** and continues issuing commands (typically 0x26 DataRx right away).
-
-librfu behaves identically but accepts only 0x27/0x28/0x29/0x36 as remote commands
-(anything else gets the 0x9966_01EE rejection, sent by the GBA as slave!) [RFU
-`sio32intr_clock_slave`]. It also accepts a remote 0x28 with parameters (1 param
-case above).
+**There is no trailing dummy transfer.** For the ordinary `LL=0` ACK, retail
+librfu switches to 2 Mbps master in the ACK-header ISR and can issue `0x26`
+DataRx from its callback immediately. The adapter releases SC as soon as that
+word's handshake completes. If the GBA returns `0x9966_01EE`, the adapter
+clocks its rejection reason and keeps SC ownership: librfu remains slave.
+[MAN B-3, B-32; RFU `sio32intr_clock_slave`]
 
 ### 5.1 Reversed handshake (adapter = master, GBA = slave)
 
@@ -362,11 +369,11 @@ After each adapter-clocked word [LRW `reverseAcknowledge`, RFU slave ISR]:
 1. ADAPTER: drive SO LOW after the word completes.
 2. GBA: sees SI low → drives SO HIGH ("word consumed, processing").
 3. ADAPTER: sees SI high → drive SO HIGH.
-4. GBA: sees SI high → waits ≥ 40 µs, loads its reply data, drives SO LOW
-   and arms the slave transfer.
-5. ADAPTER: sees SI low → may start clocking the next word, but MUST wait
-   ≥ 40 µs after step 3/4 (GBA IRQ latency; afska waits ~2 scanlines ≈ 120 µs
-   and marks this wait "VERY important to avoid desyncs").
+4. GBA: sees SI high → drives SO LOW and arms the slave transfer if another
+   word is expected, or changes roles immediately after a successful final ACK.
+5. ADAPTER: sees SI low → releases SC after the final successful ACK.
+   If another word follows, wait ≥ 40 µs before clocking it (IRQ latency;
+   afska waits ~2 scanlines ≈ 120 µs). The gap is not part of clock handback.
 ```
 
 Between role flip and the adapter's first word there is no upper time bound from

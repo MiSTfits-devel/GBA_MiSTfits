@@ -33,8 +33,9 @@ int  rfu_core_command(uint8_t cmd, uint8_t len, const uint32_t *p, uint32_t *res
 
 void rfu_core_frame(void);      // ~60 Hz housekeeping
 void rfu_core_net_receive(int peer, const void *buf, size_t len);
+void rfu_core_peer_disconnected(int peer);
 
-// Clock-reversal wait: armed when the GBA issues 0x25/0x27/0x37, then polled
+// Clock-reversal wait: armed on a successful clock-change ACK, then polled
 // until it yields the adapter-initiated command to inject.
 void rfu_core_wait_begin(void);
 
@@ -43,6 +44,7 @@ void rfu_core_wait_begin(void);
 // wait!"): until this lands, resolving the wait would inject a notify the GBA
 // is not yet listening for.
 void rfu_core_wait_reversed(void);
+void rfu_core_wait_cancel(void);  // STWI watchdog released the clock
 
 int  rfu_core_wait_poll(uint8_t *cmd, uint8_t *nparams, uint32_t *params);
 
@@ -52,10 +54,8 @@ int  rfu_core_wait_poll(uint8_t *cmd, uint8_t *nparams, uint32_t *params);
 // merely waiting on a network round trip.
 int  rfu_core_peer_live(void);
 
-// Milliseconds until the reversal wait needs a decision, or -1 when no wait is
-// armed. The daemon must not sleep past this: the retransmit window is ~11 ms,
-// shorter than a 16 ms frame tick, so polling only on the tick makes us report
-// "no child answered" while the peer's reply is still in flight.
+// Milliseconds until the reversal wait needs a decision, or -1 until the
+// GBA has reversed the clock. This can be shorter than a 16 ms frame tick.
 int  rfu_core_wait_next_ms(void);
 
 int  rfu_core_state(void);

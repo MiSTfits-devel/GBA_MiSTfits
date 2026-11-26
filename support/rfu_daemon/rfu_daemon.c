@@ -14,16 +14,18 @@
 //   0x02 CC LL <LL words LE>  -> FPGA: ACK (CC already |0x80, or 0xEE)
 //   0x03 CC PP <PP words LE>  -> FPGA: adapter-initiated cmd (reversal)
 //   0x04 EV 00                <- FPGA: event (0 ping, 1 login, 2 reversal
-//                                entered, 3 GBA acked notify, 4 watchdog)
+//                                entered, 3 reverse ACK header, 4 watchdog)
 //
 // Command semantics per docs/agb015_protocol.md.
 #include "rfu_core.h"
 #include "rfu_net.h"
+#include "rfu_proto.h"
 #include "netplay_host.h"
 #include "netplay_proto.h"
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <poll.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -39,17 +41,40 @@
 #endif
 
 #define RFU_UDP_PORT 55440
+#define UART_FRAME_MAX (3 + 4 * RFU_MAX_WORDS)
+// A maximum-length packet takes <12 ms even at the 115200 baud fallback.
+#define UART_FRAME_TIMEOUT_MS 25
 
 static int uart    = -1;
 static int verbose = 0;
 
+// The FPGA waits for each REQ's ACK. Keep one outbound frame intact across
+// short writes, and defer dispatching any buffered requests until it drains.
+static struct {
+    uint8_t frame[UART_FRAME_MAX];
+    size_t off, len;
+} tx;
+
+static struct {
+    uint8_t frame[UART_FRAME_MAX];
+    size_t have, need;
+    uint32_t deadline;
+    uint8_t input[512];
+    size_t off, len;
+} rx = { .need = 3 };
+
 // --- hooks required by rfu_core.h ----------------------------------------
 
-uint32_t rfu_now_ms(void)
+static uint64_t monotonic_ms(void)
 {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)(ts.tv_sec * 1000u + ts.tv_nsec / 1000000u);
+    return (uint64_t)ts.tv_sec * 1000u + ts.tv_nsec / 1000000u;
+}
+
+uint32_t rfu_now_ms(void)
+{
+    return (uint32_t)monotonic_ms();
 }
 
 void rfu_log(const char *fmt, ...)
@@ -58,70 +83,79 @@ void rfu_log(const char *fmt, ...)
     if (!verbose)
         return;
     va_start(ap, fmt);
-    fprintf(stderr, "rfu: ");
+    fprintf(stderr, "rfu: t_ms=%" PRIu64 " ", monotonic_ms());
     vfprintf(stderr, fmt, ap);
     va_end(ap);
 }
 
 // --- UART ----------------------------------------------------------------
 
-static int uart_write_all(const uint8_t *b, size_t n)
+static void log_packet(const char *dir, uint8_t cmd, uint8_t words,
+                       const uint32_t *p)
 {
-    while (n) {
-        ssize_t w = write(uart, b, n);
-        if (w < 0) {
-            if (errno == EINTR)
-                continue;
-            perror("uart write");
-            return -1;
-        }
-        b += w;
-        n -= (size_t)w;
+    if (!verbose)
+        return;
+    char first[22] = "-";
+    if (words > 1)
+        snprintf(first, sizeof(first), "%08" PRIX32 ",%08" PRIX32, p[0], p[1]);
+    else if (words)
+        snprintf(first, sizeof(first), "%08" PRIX32, p[0]);
+    rfu_log("uart=%s cmd=0x%02X words=%u first=%s state=%s\n",
+            dir, cmd, words, first, rfu_core_state_name());
+}
+
+static int uart_flush(void)
+{
+    ssize_t n = write(uart, tx.frame + tx.off, tx.len - tx.off);
+    if (n > 0) {
+        tx.off += (size_t)n;
+        if (tx.off == tx.len)
+            tx.off = tx.len = 0;
+        return 0;
     }
-    return 0;
+    if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+        return 0;  // resume at the same offset on POLLOUT
+    if (n == 0)
+        errno = EIO;
+    perror("uart write");
+    return -1;
 }
 
 // 0x02 ACK / 0x03 adapter-initiated command, payload little endian
 static int send_packet(uint8_t type, uint8_t cc, uint8_t nwords, const uint32_t *w)
 {
-    uint8_t buf[3 + 4 * RFU_MAX_WORDS];
-    size_t  n = 0;
-
-    if (nwords > RFU_MAX_WORDS)
+    if (nwords > RFU_MAX_WORDS) {
+        fprintf(stderr, "invalid UART transmit length: %u words\n", nwords);
         return -1;
-    buf[n++] = type;
-    buf[n++] = cc;
-    buf[n++] = nwords;
-    for (int i = 0; i < nwords; i++) {
-        buf[n++] = (uint8_t)(w[i]);
-        buf[n++] = (uint8_t)(w[i] >> 8);
-        buf[n++] = (uint8_t)(w[i] >> 16);
-        buf[n++] = (uint8_t)(w[i] >> 24);
     }
-    return uart_write_all(buf, n);
+    tx.frame[0] = type;
+    tx.frame[1] = cc;
+    tx.frame[2] = nwords;
+    for (int i = 0; i < nwords; i++)
+        le_put32(tx.frame + 3 + 4 * i, w[i]);
+    tx.len = 3 + 4u * nwords;
+    return uart_flush();
 }
 
-static void handle_req(uint8_t cmd, uint8_t len, const uint32_t *p)
+static int handle_req(uint8_t cmd, uint8_t len, const uint32_t *p)
 {
     uint32_t resp[RFU_MAX_WORDS];
-    int      n = rfu_core_command(cmd, len, p, resp);
+    log_packet("req", cmd, len, p);
+    int n = rfu_core_command(cmd, len, p, resp);
 
     if (n < 0) {
         // rejection: the FPGA expects the 0xEE command with one reason word
         uint32_t reason = (uint32_t)(-n);
-        rfu_log("req %02X len %u -> reject %u\n", cmd, len, reason);
-        send_packet(0x02, 0xEE, 1, &reason);
-        return;
+        log_packet("reject", 0xEE, 1, &reason);
+        return send_packet(0x02, 0xEE, 1, &reason);
     }
 
-    rfu_log("req %02X len %u -> ack %d word(s) [%s]\n",
-            cmd, len, n, rfu_core_state_name());
-    send_packet(0x02, (uint8_t)(cmd | 0x80), (uint8_t)n, resp);
+    log_packet("ack", (uint8_t)(cmd | 0x80), (uint8_t)n, resp);
 
-    // 0x25/0x27/0x37 hand the clock to us; arm the wait so the frame loop
-    // can inject 0x28/0x29/0x27 once there is something to report.
-    if (cmd == 0x25 || cmd == 0x27 || cmd == 0x37)
+    // Arm on a successful clock-change ACK. The FPGA reports the handoff.
+    if (cmd == 0x25 || cmd == 0x27 || cmd == 0x35 || cmd == 0x37)
         rfu_core_wait_begin();
+    return send_packet(0x02, (uint8_t)(cmd | 0x80), (uint8_t)n, resp);
 }
 
 static void handle_event(uint8_t ev)
@@ -141,15 +175,114 @@ static void handle_event(uint8_t ev)
         rfu_core_wait_reversed();
         break;
     case 0x03:
-        rfu_log("event: GBA acked our notify\n");
+        rfu_log("event: received GBA notify ACK header\n");
         break;
     case 0x04:
         rfu_log("event: word watchdog fired\n");
+        rfu_core_wait_cancel();
         break;
     default:
         rfu_log("event: unknown %02X\n", ev);
         break;
     }
+}
+
+static int is_uart_sync(uint8_t b)
+{
+    return b == 0x01 || b == 0x04;
+}
+
+static void uart_rx_reset(void)
+{
+    rx.have = 0;
+    rx.need = 3;
+}
+
+static void uart_rx_expire(uint32_t now)
+{
+    if (rx.have && (int32_t)(now - rx.deadline) >= 0) {
+        rfu_log("uart=rx drop=timeout have=%zu need=%zu\n", rx.have, rx.need);
+        // The UART format has no checksum or escaped sync bytes. Payload
+        // cannot be scanned for headers; recover at the next frame boundary.
+        uart_rx_reset();
+    }
+}
+
+static int uart_dispatch(uint32_t now)
+{
+    while (rx.off < rx.len && !tx.len) {
+        if (!rx.have) {
+            uint8_t b = rx.input[rx.off++];
+            if (!is_uart_sync(b))
+                continue;
+            rx.frame[rx.have++] = b;
+            rx.deadline = now + UART_FRAME_TIMEOUT_MS;
+        }
+
+        size_t n = rx.need - rx.have;
+        if (n > rx.len - rx.off)
+            n = rx.len - rx.off;
+        if (n) {
+            memcpy(rx.frame + rx.have, rx.input + rx.off, n);
+            rx.have += n;
+            rx.off += n;
+        }
+        if (rx.have != rx.need)
+            break;
+
+        uint8_t type = rx.frame[0], cmd = rx.frame[1], words = rx.frame[2];
+        if (rx.need == 3) {
+            if (words > RFU_MAX_WORDS || (type == 0x04 && words != 0)) {
+                rfu_log("uart=rx drop=bad_header type=0x%02X cmd=0x%02X words=%u\n",
+                        type, cmd, words);
+                uart_rx_reset();
+                // Keep any suffix that can start a new header.
+                if (is_uart_sync(cmd)) {
+                    rx.frame[0] = cmd;
+                    rx.frame[1] = words;
+                    rx.have = 2;
+                } else if (is_uart_sync(words)) {
+                    rx.frame[0] = words;
+                    rx.have = 1;
+                }
+                rx.deadline = now + UART_FRAME_TIMEOUT_MS;
+                continue;
+            }
+            if (words) {
+                rx.need += 4u * words;
+                continue;
+            }
+        }
+
+        uart_rx_reset();
+        if (type == 0x04) {
+            handle_event(cmd);
+        } else {
+            uint32_t w[RFU_MAX_WORDS];
+            for (int i = 0; i < words; i++)
+                w[i] = le_get32(rx.frame + 3 + 4 * i);
+            if (handle_req(cmd, words, w) < 0)
+                return -1;
+        }
+    }
+    return 0;
+}
+
+static int uart_read_input(void)
+{
+    ssize_t n = read(uart, rx.input, sizeof(rx.input));
+    if (n > 0) {
+        rx.off = 0;
+        rx.len = (size_t)n;
+        return 0;
+    }
+    if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+        return 0;
+    if (n == 0)
+        fprintf(stderr, "uart eof\n");
+    else
+        perror("uart read");
+    return -1;
 }
 
 static void usage(const char *argv0)
@@ -190,7 +323,7 @@ int main(int argc, char **argv)
         else { usage(argv[0]); return 2; }
     }
 
-    uart = open(dev, O_RDWR | O_NOCTTY);
+    uart = open(dev, O_RDWR | O_NOCTTY | O_NONBLOCK);
     if (uart < 0) { perror(dev); return 1; }
 
     struct termios tio;
@@ -228,41 +361,31 @@ int main(int argc, char **argv)
     // tick drives session timeouts and, while the clock is reversed, decides
     // when to inject the adapter-initiated notify the GBA is parked waiting
     // for -- so it must keep running even when the UART is silent.
-    uint8_t  hdr[3];
-    size_t   hgot = 0;
-    uint8_t  raw[4 * RFU_MAX_WORDS];
-    size_t   rgot = 0, rneed = 0;
-    int      in_body = 0;
     uint32_t next_frame = rfu_now_ms();
 
     for (;;) {
         struct pollfd fds[2 + NETPLAY_HOST_MAX_CLIENTS + 1];
-        fds[0].fd = uart;          fds[0].events = POLLIN; fds[0].revents = 0;
+        fds[0].fd = uart;
+        fds[0].events = tx.len ? POLLOUT : POLLIN;
+        fds[0].revents = 0;
         fds[1].fd = rfu_net_fd();  fds[1].events = POLLIN; fds[1].revents = 0;
         int nfds = 2;
 
-        if (np_port > 0) {
-            int nplist[NETPLAY_HOST_MAX_CLIENTS + 1];
-            int nnp = netplay_host_pollfds(nplist,
-                          (int)(sizeof(nplist) / sizeof(nplist[0])));
-            for (int i = 0; i < nnp; i++) {
-                fds[nfds].fd = nplist[i];
-                fds[nfds].events = POLLIN;
-                fds[nfds].revents = 0;
-                nfds++;
-            }
+        if (np_port > 0)
+            nfds += netplay_host_pollfds(fds + nfds, NETPLAY_HOST_MAX_CLIENTS + 1);
+
+        uint32_t now = rfu_now_ms();
+        int timeout = (int32_t)(next_frame - now);
+        if (rx.have) {
+            int rx_ms = (int32_t)(rx.deadline - now);
+            if (rx_ms < timeout)
+                timeout = rx_ms;
         }
+        if (timeout < 0 || (!tx.len && rx.off < rx.len))
+            timeout = 0;
 
-        int timeout = (int)(int32_t)(next_frame - rfu_now_ms());
-        if (timeout < 0) timeout = 0;
-
-        // A reversal wait has its own, much shorter deadline: the retransmit
-        // window is ~11 ms against a 16 ms frame tick. Sleeping the full tick
-        // makes us decide the wait only after that window shut, so a peer's
-        // reply that genuinely arrived in time gets reported to the GBA as
-        // "no child answered" -- which ends a Pokemon trade in
-        // "Communication error". Never sleep past the nearer deadline.
-        int wait_ms = rfu_core_wait_next_ms();
+        // A reversal can be due before the next housekeeping tick.
+        int wait_ms = tx.len ? -1 : rfu_core_wait_next_ms();
         if (wait_ms >= 0 && wait_ms < timeout)
             timeout = wait_ms;
 
@@ -272,53 +395,29 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        if (fds[0].revents & POLLIN) {
-            if (!in_body) {
-                ssize_t n = read(uart, hdr + hgot, 3 - hgot);
-                if (n <= 0) { perror("uart read"); return 1; }
-                hgot += (size_t)n;
-                if (hgot == 3) {
-                    hgot = 0;
-                    if (hdr[2] > RFU_MAX_WORDS) {
-                        fprintf(stderr, "rfu_daemon: bad length %u\n", hdr[2]);
-                    } else {
-                        rneed = 4u * hdr[2];
-                        rgot  = 0;
-                        in_body = 1;
-                    }
-                }
-            }
-            if (in_body) {
-                while (rgot < rneed) {
-                    ssize_t n = read(uart, raw + rgot, rneed - rgot);
-                    if (n < 0) {
-                        if (errno == EINTR) continue;
-                        if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-                        perror("uart read");
-                        return 1;
-                    }
-                    if (n == 0) { fprintf(stderr, "uart eof\n"); return 1; }
-                    rgot += (size_t)n;
-                }
-                if (rgot == rneed) {
-                    in_body = 0;
-                    uint32_t w[RFU_MAX_WORDS];
-                    for (int i = 0; i < hdr[2]; i++)
-                        w[i] = (uint32_t)raw[4*i]
-                             | ((uint32_t)raw[4*i+1] << 8)
-                             | ((uint32_t)raw[4*i+2] << 16)
-                             | ((uint32_t)raw[4*i+3] << 24);
-                    if (hdr[0] == 0x01)      handle_req(hdr[1], hdr[2], w);
-                    else if (hdr[0] == 0x04) handle_event(hdr[1]);
-                }
-            }
+        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            fprintf(stderr, "uart poll error: revents=0x%X\n", fds[0].revents);
+            return 1;
+        }
+        now = rfu_now_ms();
+        uart_rx_expire(now);
+        if ((fds[0].revents & POLLOUT) && uart_flush() < 0)
+            return 1;
+        // At most one bounded read per iteration; even a continuously ready
+        // UART must give the UDP/TCP sockets and housekeeping their turn.
+        if (!tx.len) {
+            if (rx.off == rx.len && (fds[0].revents & POLLIN) &&
+                uart_read_input() < 0)
+                return 1;
+            if (uart_dispatch(now) < 0)
+                return 1;
         }
 
         if (fds[1].revents & POLLIN)
             rfu_net_poll();
 
         if (np_port > 0)
-            netplay_host_poll();
+            netplay_host_poll(fds + 2, nfds - 2);
 
         if ((int32_t)(rfu_now_ms() - next_frame) >= 0) {
             next_frame += 16;                       // ~60 Hz
@@ -332,12 +431,14 @@ int main(int argc, char **argv)
         // retransmit window is shorter than a tick, and gpSP likewise force-
         // polls the network inside its wait ("otherwise we need to wait a
         // full frame!"). Checking this only at 60 Hz loses trades.
-        {
+        if (!tx.len) {
             uint8_t  cmd = 0, nparams = 0;
             uint32_t params[RFU_MAX_WORDS];
             if (rfu_core_wait_poll(&cmd, &nparams, params)) {
-                rfu_log("inject %02X (%u param words)\n", cmd, nparams);
-                send_packet(0x03, cmd, nparams, params);
+                if (cmd != 0x28) // the core logs this notify with its bitmaps
+                    log_packet("notify", cmd, nparams, params);
+                if (send_packet(0x03, cmd, nparams, params) < 0)
+                    return 1;
             }
         }
     }

@@ -8,11 +8,12 @@ use IEEE.numeric_std.all;
 
 package pDDR3 is
 
-   constant DDR3MUXCOUNT : integer := 3;
+   constant DDR3MUXCOUNT : integer := 4;
    
-   constant DDR3MUX_VIDEOOUT : integer := 0;
-   constant DDR3MUX_SS       : integer := 1;
-   constant DDR3MUX_ROMCOPY  : integer := 2;
+   constant DDR3MUX_GDB      : integer := 0;
+   constant DDR3MUX_VIDEOOUT : integer := 1;
+   constant DDR3MUX_SS       : integer := 2;
+   constant DDR3MUX_ROMCOPY  : integer := 3;
    
    type tDDDR3Single     is array(0 to DDR3MUXCOUNT - 1) of std_logic;
    type tDDDR3ReqAddr    is array(0 to DDR3MUXCOUNT - 1) of unsigned(27 downto 0);
@@ -28,6 +29,7 @@ end package;
 
 -- 234...256 Mbyte = Savestates                          (E000000)
 -- 218...220 Mbyte = Border(320x240x4)                   (D000000)
+-- 200..200.008 Mbyte = GDB Mailbox                     (C800000)
 -- 128.5..129 Mbyte = 4 Framebuffers core 2 (2P profile) (8080000)
 -- 128..128.5 Mbyte = 4 Framebuffers(240x160x2)          (8000000)
 -- 0.5..64.5 Mbyte = Game ROM                            (0080000)
@@ -180,8 +182,9 @@ begin
             end if;
          end loop;
         
-        for i in 0 to DDR3MUXCOUNT - 1 loop
-            if (req_latched(i) = '1') then
+         -- A latched GDB request also yields to a fresh non-debug request.
+         for i in 0 to DDR3MUXCOUNT - 1 loop
+            if (req_latched(i) = '1' and (i /= DDR3MUX_GDB or activeRequest = '0')) then
                activeRequest := '1';
                activeIndex   := i;
             end if;

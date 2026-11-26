@@ -1,572 +1,697 @@
 library IEEE;
 use IEEE.std_logic_1164.all;
 use IEEE.numeric_std.all;
-use STD.textio.all;
 
+-- Shared by the engine-only and full-core benches. Mailbox indices are qwords;
+-- the simulated DDR3 master still uses the byte addresses from gdb_proto.h.
+package gdb_tb_mailbox is
+   constant MB_BASE    : natural := 16#C800000#;
+   constant OFF_CMD    : natural := 16#000# / 8;
+   constant OFF_ADDR   : natural := 16#008# / 8;
+   constant OFF_LEN    : natural := 16#010# / 8;
+   constant OFF_ACK    : natural := 16#018# / 8;
+   constant OFF_STATE  : natural := 16#020# / 8;
+   constant OFF_CYCLES : natural := 16#028# / 8;
+   constant OFF_DATA   : natural := 16#100# / 8;
+
+   constant CMD_HALT        : natural := 1;
+   constant CMD_CONT        : natural := 2;
+   constant CMD_STEP        : natural := 3;
+   constant CMD_RDMEM       : natural := 4;
+   constant CMD_WRMEM       : natural := 5;
+   constant CMD_RDREGS      : natural := 6;
+   constant CMD_WRREG       : natural := 7;
+   constant CMD_SETBP       : natural := 8;
+   constant CMD_SETWP       : natural := 9;
+   constant CMD_STEP_CYCLES : natural := 10;
+   constant CMD_STEP_FRAMES : natural := 11;
+   constant CMD_STEP_LINE   : natural := 12;
+   constant CMD_BREAK_CYCLE : natural := 13;
+   constant CMD_BREAK_EVENT : natural := 14;
+   constant CMD_RDSTATE     : natural := 15;
+   constant CMD_SET_CORE    : natural := 16;
+   constant CMD_SET_INPUT   : natural := 17;
+   constant CMD_RESET       : natural := 18;
+   constant CMD_RD_TRACE    : natural := 19;
+
+   constant STOP_HOST        : natural := 1;
+   constant STOP_BP          : natural := 2;
+   constant STOP_STEP        : natural := 3;
+   constant STOP_WP          : natural := 4;
+   constant STOP_STEP_CYCLE  : natural := 5;
+   constant STOP_STEP_FRAME  : natural := 6;
+   constant STOP_STEP_LINE   : natural := 7;
+   constant STOP_BREAK_CYCLE : natural := 8;
+   constant STOP_BREAK_EVENT : natural := 9;
+   constant STOP_RESET_HALT  : natural := 10;
+
+   subtype word32 is std_logic_vector(31 downto 0);
+   subtype qword is std_logic_vector(63 downto 0);
+   subtype mailbox_index is natural range 0 to OFF_DATA + 4096 / 8 - 1;
+   type mailbox_words is array (mailbox_index) of qword;
+   type host_write is record
+      ena : boolean;
+      idx : mailbox_index;
+      data : qword;
+   end record;
+   constant HOST_IDLE : host_write := (false, 0, (others => '0'));
+   type ddr_request is record
+      ena, rnw : std_logic;
+      addr : unsigned(27 downto 0);
+      burst : unsigned(9 downto 0);
+      mask : std_logic_vector(7 downto 0);
+      data : qword;
+   end record;
+   type ddr_response is record
+      granted, done : std_logic;
+      data : qword;
+   end record;
+
+   function u32(n : natural) return word32;
+   function u64(n : natural) return qword;
+   function command_word(op, seq, arg : natural) return qword;
+   function ok_ack(seq : natural) return qword;
+   function data_word(mbox : mailbox_words; idx : natural) return word32;
+   procedure ticks(signal clk : in std_logic; n : natural := 1);
+   procedure put_word(signal clk : in std_logic; signal host : out host_write;
+                      idx : mailbox_index; data : qword);
+   procedure post_cmd(signal clk : in std_logic; signal host : out host_write;
+                      op, seq : natural; arg, adr, len : natural := 0);
+   procedure await_ack(signal clk : in std_logic; signal mbox : in mailbox_words;
+                       seq : natural; status : natural := 0);
+   procedure await_stop(signal clk : in std_logic; signal mbox : in mailbox_words;
+                        reason : natural; slot : natural := 0);
+end package;
+
+package body gdb_tb_mailbox is
+   function u32(n : natural) return word32 is
+   begin
+      return std_logic_vector(to_unsigned(n, 32));
+   end function;
+
+   function u64(n : natural) return qword is
+   begin
+      return std_logic_vector(to_unsigned(n, 64));
+   end function;
+
+   function command_word(op, seq, arg : natural) return qword is
+   begin
+      return u32(arg) & x"0000" & std_logic_vector(to_unsigned(seq, 8)) &
+             std_logic_vector(to_unsigned(op, 8));
+   end function;
+
+   function ok_ack(seq : natural) return qword is
+   begin
+      return x"47424432000200" & std_logic_vector(to_unsigned(seq, 8));
+   end function;
+
+   function data_word(mbox : mailbox_words; idx : natural) return word32 is
+   begin
+      if idx mod 2 = 0 then
+         return mbox(OFF_DATA + idx / 2)(31 downto 0);
+      end if;
+      return mbox(OFF_DATA + idx / 2)(63 downto 32);
+   end function;
+
+   procedure ticks(signal clk : in std_logic; n : natural := 1) is
+   begin
+      for i in 1 to n loop
+         wait until falling_edge(clk);
+      end loop;
+   end procedure;
+
+   procedure put_word(signal clk : in std_logic; signal host : out host_write;
+                      idx : mailbox_index; data : qword) is
+   begin
+      host <= (true, idx, data);
+      ticks(clk);
+      host <= HOST_IDLE;
+   end procedure;
+
+   procedure post_cmd(signal clk : in std_logic; signal host : out host_write;
+                      op, seq : natural; arg, adr, len : natural := 0) is
+   begin
+      put_word(clk, host, OFF_ADDR, u64(adr));
+      put_word(clk, host, OFF_LEN, u64(len));
+      put_word(clk, host, OFF_CMD, command_word(op, seq, arg));
+   end procedure;
+
+   procedure await_ack(signal clk : in std_logic; signal mbox : in mailbox_words;
+                       seq : natural; status : natural := 0) is
+      variable expected : qword := ok_ack(seq);
+   begin
+      expected(15 downto 8) := std_logic_vector(to_unsigned(status, 8));
+      for i in 0 to 8192 loop
+         if mbox(OFF_ACK)(7 downto 0) = std_logic_vector(to_unsigned(seq, 8)) then
+            assert mbox(OFF_ACK) = expected
+               report "unexpected ACK: " & to_hstring(mbox(OFF_ACK)) severity failure;
+            return;
+         end if;
+         ticks(clk);
+      end loop;
+      assert false report "mailbox ACK timed out for seq " & natural'image(seq) severity failure;
+   end procedure;
+
+   procedure await_stop(signal clk : in std_logic; signal mbox : in mailbox_words;
+                        reason : natural; slot : natural := 0) is
+   begin
+      for i in 0 to 8192 loop
+         if mbox(OFF_STATE)(0) = '1' then
+            assert unsigned(mbox(OFF_STATE)(7 downto 4)) = reason and
+                   unsigned(mbox(OFF_STATE)(11 downto 8)) = slot
+               report "unexpected stop: " & to_hstring(mbox(OFF_STATE)) severity failure;
+            return;
+         end if;
+         ticks(clk);
+      end loop;
+      assert false report "debug stop timed out for reason " & natural'image(reason) severity failure;
+   end procedure;
+end package body;
+
+library IEEE;
+use IEEE.std_logic_1164.all;
+use IEEE.numeric_std.all;
+use work.gdb_tb_mailbox.all;
+
+entity gdb_tb_ddr3 is
+   port (
+      clk  : in std_logic;
+      host : in host_write;
+      req  : in ddr_request;
+      rsp  : out ddr_response := ('0', '0', (others => '0'));
+      mbox : out mailbox_words := (others => (others => '0'))
+   );
+end entity;
+
+architecture sim of gdb_tb_ddr3 is
+begin
+   process (clk)
+      variable lat : natural := 0;
+      variable idx : mailbox_index := 0;
+      variable txn : ddr_request;
+   begin
+      if rising_edge(clk) then
+         rsp.granted <= '0';
+         rsp.done <= '0';
+         if host.ena then
+            mbox(host.idx) <= host.data;
+         end if;
+         if req.ena = '1' then
+            assert lat = 0 and req.burst = 1 and req.addr(2 downto 0) = 0 and
+                   req.addr >= MB_BASE and req.addr < MB_BASE + 8 * mbox'length
+               report "invalid DDR3 mailbox request" severity failure;
+            idx := (to_integer(req.addr) - MB_BASE) / 8;
+            txn := req;
+            lat := 3;
+            rsp.granted <= req.rnw;
+         elsif lat /= 0 then
+            lat := lat - 1;
+            if lat = 0 then
+               if txn.rnw = '1' then
+                  rsp.data <= mbox(idx);
+               else
+                  assert txn.mask = x"FF" report "partial DDR3 mailbox write" severity failure;
+                  mbox(idx) <= txn.data;
+               end if;
+               rsp.done <= '1';
+            end if;
+         end if;
+      end if;
+   end process;
+end architecture;
+
+library IEEE;
+use IEEE.std_logic_1164.all;
+use IEEE.numeric_std.all;
 use work.pProc_bus_gba.all;
-
--- Unit test for the gdb debug engine (rtl/gba_gdb.vhd).
---
--- Models the four things the engine talks to: the DDR3 mailbox, the savestate
--- register bus, the GBA memory bus, and enough of the CPU and pause controller
--- to exercise halting. The stimulus drives the mailbox exactly the way
--- support/gdb_daemon does, so what passes here is the same handshake the
--- daemon will run against real fabric.
+use work.gdb_tb_mailbox.all;
 
 entity tb_gdb is
 end entity;
 
-architecture arch of tb_gdb is
+architecture sim of tb_gdb is
+   constant CLK_PERIOD : time := 10 ns;
+   constant MEM_BASE   : natural := 16#03000000#;
+   constant ROM_BASE   : natural := 16#08000000#;
+   constant BP_PC      : natural := ROM_BASE + 16#100#;
+   constant STALE_SEQ  : natural := 16#A5#;
+   constant SENTINEL   : qword := x"123456789ABCDEF0";
+   constant IRQ_FLAGS  : std_logic_vector(15 downto 0) := x"2468";
 
-   constant CLKPER   : time    := 29.8 ns;   -- 16.777216 MHz
-   constant MB_BASE  : integer := 16#C800000#;
+   signal clk, reset : std_logic := '0';
+   signal host : host_write := HOST_IDLE;
+   signal ddr3_req : ddr_request;
+   signal ddr3_rsp : ddr_response;
+   signal mbox : mailbox_words;
 
-   constant OFF_CMD   : integer := 16#000#;
-   constant OFF_ADDR  : integer := 16#008#;
-   constant OFF_LEN   : integer := 16#010#;
-   constant OFF_ACK   : integer := 16#018#;
-   constant OFF_STATE : integer := 16#020#;
-   constant OFF_DATA  : integer := 16#100#;
+   signal ss_bus : proc_bus_gb_type;
+   signal ss_req, ss_done : std_logic;
+   signal ss_data : word32;
+   signal bus_addr : std_logic_vector(27 downto 0);
+   signal bus_rnw, bus_written, bus_done, memaccess : std_logic := '0';
+   signal bus_acc : std_logic_vector(1 downto 0);
+   signal bus_wdata, bus_rdata : word32 := (others => '0');
+   signal mem_ready : std_logic := '1';
+   signal mem_reads, mem_writes : natural := 0;
 
-   constant CMD_HALT   : integer := 1;
-   constant CMD_CONT   : integer := 2;
-   constant CMD_STEP   : integer := 3;
-   constant CMD_RDMEM  : integer := 4;
-   constant CMD_WRMEM  : integer := 5;
-   constant CMD_RDREGS : integer := 6;
-   constant CMD_WRREG  : integer := 7;
-   constant CMD_SETBP  : integer := 8;
-
-   constant STOP_HOST : integer := 1;
-   constant STOP_BP   : integer := 2;
-   constant STOP_STEP : integer := 3;
-
-   signal clk        : std_logic := '0';
-   signal reset      : std_logic := '1';
-   signal gdb_enable : std_logic := '1';
-   signal sim_done   : boolean   := false;
-
-   -- ddr3
-   signal ddr3_request   : std_logic;
-   signal ddr3_rnw       : std_logic;
-   signal ddr3_address   : unsigned(27 downto 0);
-   signal ddr3_writeMask : std_logic_vector(7 downto 0);
-   signal ddr3_dataWrite : std_logic_vector(63 downto 0);
-   signal ddr3_granted   : std_logic := '0';
-   signal ddr3_done      : std_logic := '0';
-   signal ddr3_dataRead  : std_logic_vector(63 downto 0) := (others => '0');
-
-   -- savestate register bus
-   signal ss_bus       : proc_bus_gb_type;
-   signal ss_bus_req   : std_logic;
-   signal ss_wired_out : std_logic_vector(31 downto 0) := (others => '0');
-   signal ss_wired_done: std_logic := '0';
-
-   -- gba memory bus
-   signal bus_addr   : std_logic_vector(27 downto 0);
-   signal bus_rnw    : std_logic;
-   signal bus_acc    : std_logic_vector(1 downto 0);
-   signal bus_wdata  : std_logic_vector(31 downto 0);
-   signal bus_written: std_logic;
-   signal bus_rdata  : std_logic_vector(31 downto 0) := (others => '0');
-   signal bus_done   : std_logic := '0';
-   signal memaccess  : std_logic;
-
-   -- cpu
-   signal cpu_PC       : unsigned(31 downto 0) := x"08000000";
-   signal cpu_dec_rdy  : std_logic := '1';
-   signal cpu_halt     : std_logic := '0';
-   signal cpu_done     : std_logic := '0';
-   signal cpu_inhibit  : std_logic;
-   signal cpu_new_halt : std_logic;
-   signal cpu_unhalt   : std_logic;
-   signal instr_count  : integer := 0;
-
-   signal cpu_bus_Adr : std_logic_vector(31 downto 0) := (others => '0');
-   signal cpu_bus_ena : std_logic := '0';
+   signal dbg_hold, dbg_step, dbg_stop_now, dbg_reset_req, gdb_halted : std_logic;
+   signal dbg_reg_wr, active_core : std_logic;
+   signal dbg_reg_idx : std_logic_vector(4 downto 0);
+   signal dbg_reg_data : word32;
+   signal mask0, val0, mask1, val1 : std_logic_vector(9 downto 0);
+   signal cycle_count, insn_count, step_pulses, reg_pulses, reset_ticks : natural := 0;
+   signal ce, decode_load, cpu_done : std_logic := '0';
+   signal arch_pc, fetch_pc : unsigned(31 downto 0) := to_unsigned(ROM_BASE, 32);
+   signal cpu_bus_addr : word32 := (others => '0');
+   signal cpu_bus_ena, cpu_bus_code : std_logic := '0';
    signal cpu_bus_rnw : std_logic := '1';
+   signal vblank, hblank, line_trigger, dma_on : std_logic := '0';
+   signal dispstat : word32 := x"002A0040";
 
-   -- pause
-   signal gdb_pause    : std_logic;
-   signal pause_active : std_logic := '0';
-   signal gdb_halted   : std_logic;
+   signal r0 : word32 := x"00001000";
 
-   -- ddr3 backing store, one qword per entry, covering the mailbox
-   type t_mbox is array(0 to 127) of std_logic_vector(63 downto 0);
-   shared variable mbox : t_mbox := (others => (others => '0'));
-
-   -- gba memory model, word addressed from GBA_MEM_BASE
-   constant GBA_MEM_BASE : integer := 16#3000000#;
-   type t_gbamem is array(0 to 63) of std_logic_vector(31 downto 0);
-   shared variable gbamem : t_gbamem := (others => (others => '0'));
-
-   -- the register file the engine reads over the savestate bus
-   type t_regs is array(0 to 17) of std_logic_vector(31 downto 0);
-   shared variable regfile : t_regs := (others => (others => '0'));
-
-   signal errors : integer := 0;
-
-   procedure check(cond : boolean; msg : string; signal errs : inout integer) is
+   function ss_word(adr, core : natural) return word32 is
    begin
-      if not cond then
-         report "FAIL: " & msg severity error;
-         errs <= errs + 1;
+      if adr >= 1 and adr <= 16 then
+         return u32(16#1000# + adr - 1 + core * 16#100#);
+      elsif adr = 17 then
+         return x"6000001F";
+      else
+         return u32(16#20000000# + adr + core * 16#100#);
       end if;
-   end procedure;
-
+   end function;
 begin
+   clk <= not clk after CLK_PERIOD / 2;
 
-   clk <= not clk after CLKPER / 2 when not sim_done else '0';
+   mailbox : entity work.gdb_tb_ddr3 port map (clk, host, ddr3_req, ddr3_rsp, mbox);
 
    igdb : entity work.gba_gdb
-   generic map
-   (
-      MAILBOX_ADDR => MB_BASE
-   )
-   port map
-   (
-      clk1x            => clk,
-      reset            => reset,
-      gdb_enable       => gdb_enable,
-
-      ddr3_request     => ddr3_request,
-      ddr3_rnw         => ddr3_rnw,
-      ddr3_address     => ddr3_address,
-      ddr3_burstcount  => open,
-      ddr3_writeMask   => ddr3_writeMask,
-      ddr3_dataWrite   => ddr3_dataWrite,
-      ddr3_granted     => ddr3_granted,
-      ddr3_done        => ddr3_done,
-      ddr3_dataRead    => ddr3_dataRead,
-
-      ss_bus_out       => ss_bus,
-      ss_bus_req       => ss_bus_req,
-      ss_wired_out     => ss_wired_out,
-      ss_wired_done    => ss_wired_done,
-
-      GBA_BusAddr      => bus_addr,
-      GBA_BusRnW       => bus_rnw,
-      GBA_BusACC       => bus_acc,
-      GBA_BusWriteData => bus_wdata,
-      GBA_Bus_written  => bus_written,
-      GBA_BusReadData  => bus_rdata,
-      GBA_BusReadDone  => bus_done,
-      gdb_memaccess    => memaccess,
-
-      cpu_PC           => cpu_PC,
-      cpu_decode_ready => cpu_dec_rdy,
-      cpu_halt         => cpu_halt,
-      cpu_done         => cpu_done,
-      cpu_inhibit      => cpu_inhibit,
-      cpu_new_halt     => cpu_new_halt,
-      cpu_unhalt       => cpu_unhalt,
-
-      cpu_bus_Adr      => cpu_bus_Adr,
-      cpu_bus_ena      => cpu_bus_ena,
-      cpu_bus_rnw      => cpu_bus_rnw,
-
-      gdb_pause        => gdb_pause,
-      pause_active     => pause_active,
-      gdb_halted       => gdb_halted
+   generic map (MAILBOX_ADDR => MB_BASE, BP_COUNT => 2, WP_COUNT => 1, DUAL_CORE => '1')
+   port map (
+      clk1x => clk, reset => reset, gdb_enable => '1',
+      ddr3_request => ddr3_req.ena, ddr3_rnw => ddr3_req.rnw,
+      ddr3_address => ddr3_req.addr, ddr3_burstcount => ddr3_req.burst,
+      ddr3_writeMask => ddr3_req.mask, ddr3_dataWrite => ddr3_req.data,
+      ddr3_granted => ddr3_rsp.granted, ddr3_done => ddr3_rsp.done,
+      ddr3_dataRead => ddr3_rsp.data,
+      ss_bus_out => ss_bus, ss_bus_req => ss_req,
+      ss_wired_out => ss_data, ss_wired_done => ss_done,
+      GBA_BusAddr => bus_addr, GBA_BusRnW => bus_rnw, GBA_BusACC => bus_acc,
+      GBA_BusWriteData => bus_wdata, GBA_Bus_written => bus_written,
+      GBA_BusReadData => bus_rdata, GBA_BusReadDone => bus_done,
+      gdb_memaccess => memaccess, mem_dbg_ready => mem_ready,
+      dbg_reg_wr => dbg_reg_wr, dbg_reg_idx => dbg_reg_idx, dbg_reg_data => dbg_reg_data,
+      dbg_hold => dbg_hold, dbg_step => dbg_step, dbg_stop_now => dbg_stop_now,
+      dbg_reset_req => dbg_reset_req, gdb_halted => gdb_halted, active_core_out => active_core,
+      joy_ov_mask_c0 => mask0, joy_ov_val_c0 => val0,
+      joy_ov_mask_c1 => mask1, joy_ov_val_c1 => val1,
+      c0_ce => ce, c0_arch_pc => arch_pc, c0_fetch_instr_pc => fetch_pc,
+      c0_stall_instr_pc => x"0800A000", c0_decode_opcode => x"E3A00001",
+      c0_decode_load => decode_load, c0_cpu_done => cpu_done,
+      c0_cpu_bus_adr => cpu_bus_addr, c0_cpu_bus_ena => cpu_bus_ena,
+      c0_cpu_bus_rnw => cpu_bus_rnw, c0_cpu_bus_code => cpu_bus_code,
+      c0_dma_on => dma_on, c0_vblank => vblank, c0_hblank => hblank,
+      c0_line_trigger => line_trigger, c0_dispstat => dispstat, c0_irq_if => IRQ_FLAGS,
+      c1_arch_pc => x"08001234", c1_fetch_instr_pc => x"08001238",
+      wireless_debug_state => x"AB"
    );
 
-   ------------------------------------------------------------------
-   -- DDR3 model: latches a single cycle request, answers a few cycles later
-   ------------------------------------------------------------------
-   process (clk)
-      variable busy   : std_logic := '0';
-      variable lat    : integer := 0;
-      variable adr    : unsigned(27 downto 0);
-      variable rnw    : std_logic;
-      variable wdata  : std_logic_vector(63 downto 0);
-      variable idx    : integer;
-   begin
-      if rising_edge(clk) then
-         ddr3_granted <= '0';
-         ddr3_done    <= '0';
-
-         if (busy = '0') then
-            if (ddr3_request = '1') then
-               busy  := '1';
-               lat   := 3;
-               adr   := ddr3_address;
-               rnw   := ddr3_rnw;
-               wdata := ddr3_dataWrite;
-               if (ddr3_rnw = '1') then
-                  ddr3_granted <= '1';
-               end if;
-            end if;
-         else
-            if (lat > 0) then
-               lat := lat - 1;
-            else
-               busy := '0';
-               idx  := (to_integer(adr) - MB_BASE) / 8;
-               assert idx >= 0 and idx <= 127
-                  report "ddr3 access outside the modelled mailbox" severity failure;
-               if (rnw = '1') then
-                  ddr3_dataRead <= mbox(idx);
-               else
-                  mbox(idx) := wdata;
-               end if;
-               ddr3_done <= '1';
-            end if;
-         end if;
-      end if;
-   end process;
-
-   ------------------------------------------------------------------
-   -- savestate register file, combinational on the address like eProcReg
-   ------------------------------------------------------------------
+   ss_done <= ss_req and ss_bus.ena;
    process (all)
-      variable a : integer;
+      variable adr : natural;
    begin
-      a := to_integer(unsigned(ss_bus.adr));
-      if (a >= 1 and a <= 18) then
-         ss_wired_out  <= regfile(a - 1);
-         ss_wired_done <= '1';
-      else
-         ss_wired_out  <= (others => '0');
-         ss_wired_done <= '0';
-      end if;
-   end process;
-
-   -- register writes land on the same bus
-   process (clk)
-      variable a : integer;
-   begin
-      if rising_edge(clk) then
-         if (ss_bus.ena = '1' and ss_bus.rnw = '0') then
-            a := to_integer(unsigned(ss_bus.adr));
-            if (a >= 1 and a <= 18) then
-               regfile(a - 1) := ss_bus.Din;
-            end if;
+      ss_data <= (others => '0');
+      if ss_req = '1' and ss_bus.ena = '1' then
+         adr := to_integer(unsigned(ss_bus.Adr));
+         if active_core = '1' then
+            ss_data <= ss_word(adr, 1);
+         elsif adr = 1 then
+            ss_data <= r0;
+         else
+            ss_data <= ss_word(adr, 0);
          end if;
       end if;
    end process;
 
-   ------------------------------------------------------------------
-   -- GBA memory model
-   ------------------------------------------------------------------
+   -- Registered CE: a stop edge still loads Decode but admits no following
+   -- Execute edge. Stimulus controls the CPU strobes independently of CE.
    process (clk)
-      variable pend : integer := 0;
-      variable adr  : integer;
-      variable rnw  : std_logic;
-      variable wdat : std_logic_vector(31 downto 0);
-      variable idx  : integer;
+   begin
+      if rising_edge(clk) then
+         if reset = '1' or dbg_hold = '1' or dbg_stop_now = '1' then
+            ce <= dbg_step and not reset;
+         else
+            ce <= '1';
+         end if;
+         if ce = '1' and reset = '0' then
+            cycle_count <= cycle_count + 1;
+            if decode_load = '1' then arch_pc <= fetch_pc; end if;
+            if cpu_done = '1' then insn_count <= insn_count + 1; end if;
+         end if;
+         if dbg_step = '1' then
+            assert dbg_hold = '1' report "single-cycle pulse released hold" severity failure;
+            step_pulses <= step_pulses + 1;
+         end if;
+         if dbg_reset_req = '1' then
+            assert dbg_hold = '1' report "reset did not hold CPU" severity failure;
+            reset_ticks <= reset_ticks + 1;
+         end if;
+         if dbg_reg_wr = '1' then
+            assert dbg_hold = '1' and dbg_reg_idx = "00000"
+               report "invalid live register write" severity failure;
+            r0 <= dbg_reg_data;
+            reg_pulses <= reg_pulses + 1;
+         end if;
+      end if;
+   end process;
+
+   process (clk)
+      type words is array (0 to 15) of word32;
+      variable ram : words := (others => x"CAFEF00D");
+      variable delay_left : natural := 0;
+      variable rd, access_prev : std_logic := '0';
+      variable idx : natural := 0;
+      variable data : word32;
    begin
       if rising_edge(clk) then
          bus_done <= '0';
-
-         if (bus_written = '1') then
-            pend := 3;
-            adr  := to_integer(unsigned(bus_addr));
-            rnw  := bus_rnw;
-            wdat := bus_wdata;
-            assert bus_acc = ACCESS_32BIT
-               report "debug bus access was not 32 bit" severity error;
-         elsif (pend > 0) then
-            pend := pend - 1;
-            if (pend = 0) then
-               idx := (adr - GBA_MEM_BASE) / 4;
-               assert idx >= 0 and idx <= 63
-                  report "gba bus access outside the modelled memory" severity failure;
-               if (rnw = '1') then
-                  bus_rdata <= gbamem(idx);
+         if bus_written = '1' then
+            assert access_prev = '1' and memaccess = '1' and mem_ready = '1' and
+                   bus_acc = ACCESS_32BIT and delay_left = 0
+               report "debug bus request without ready/entry cycle" severity failure;
+            assert unsigned(bus_addr) >= MEM_BASE and unsigned(bus_addr) < MEM_BASE + 64
+               report "debug bus address out of bounds" severity failure;
+            delay_left := 3;
+            idx := (to_integer(unsigned(bus_addr)) - MEM_BASE) / 4;
+            rd := bus_rnw;
+            data := bus_wdata;
+         elsif delay_left /= 0 then
+            delay_left := delay_left - 1;
+            if delay_left = 0 then
+               assert memaccess = '1' report "debug access ended before bus done" severity failure;
+               if rd = '1' then
+                  bus_rdata <= ram(idx);
+                  mem_reads <= mem_reads + 1;
                else
-                  gbamem(idx) := wdat;
+                  ram(idx) := data;
+                  mem_writes <= mem_writes + 1;
                end if;
                bus_done <= '1';
             end if;
          end if;
+         access_prev := memaccess;
       end if;
    end process;
 
-   ------------------------------------------------------------------
-   -- CPU model: retires one instruction every 4 cycles unless halted or
-   -- inhibited, and honours the engine's halt/unhalt exactly as gba_cpu does
-   ------------------------------------------------------------------
-   process (clk)
-      variable tick : integer := 0;
-   begin
-      if rising_edge(clk) then
-         cpu_done <= '0';
-
-         if (reset = '1') then
-            cpu_halt <= '0';
-            cpu_PC   <= x"08000000";
-         else
-            -- decode_halt: set by new_halt, cleared by unhalt
-            if (cpu_new_halt = '1') then
-               cpu_halt <= '1';
-            elsif (cpu_halt = '1' and cpu_unhalt = '1') then
-               cpu_halt <= '0';
-            end if;
-
-            -- execute_now is gated by both decode_halt and the combinational
-            -- inhibit, and the whole core stops when the pause takes effect
-            if (cpu_halt = '0' and cpu_inhibit = '0' and pause_active = '0') then
-               tick := tick + 1;
-               if (tick = 4) then
-                  tick        := 0;
-                  cpu_PC      <= cpu_PC + 4;
-                  cpu_done    <= '1';
-                  instr_count <= instr_count + 1;
-               end if;
-            end if;
-         end if;
-
-         -- regs(15) is what the engine reports as the stop PC, so keep the
-         -- model register file consistent with the model CPU
-         regfile(15) := std_logic_vector(cpu_PC);
-      end if;
-   end process;
-
-   ------------------------------------------------------------------
-   -- pause controller model
-   ------------------------------------------------------------------
-   process (clk)
-      variable dly : integer := 0;
-   begin
-      if rising_edge(clk) then
-         if (gdb_pause = '1' and pause_active = '0') then
-            dly := dly + 1;
-            if (dly >= 4) then
-               pause_active <= '1';
-               dly := 0;
-            end if;
-         elsif (gdb_pause = '0' and pause_active = '1') then
-            dly := dly + 1;
-            if (dly >= 4) then
-               pause_active <= '0';
-               dly := 0;
-            end if;
-         else
-            dly := 0;
-         end if;
-      end if;
-   end process;
-
-   ------------------------------------------------------------------
-   -- stimulus
-   ------------------------------------------------------------------
-   process
-      variable seq : integer := 0;
-
-      procedure wait_clk(n : integer) is
-      begin
-         for i in 1 to n loop
-            wait until rising_edge(clk);
-         end loop;
-      end procedure;
-
-      -- drive one mailbox command and block until the engine acknowledges,
-      -- the same handshake gdb_mbox_cmd() performs
-      procedure send_cmd(op : integer; arg : integer; adr : integer; len : integer) is
-         variable guard : integer := 0;
+   stimulus : process
+      variable seq : natural := STALE_SEQ;
+      variable before_cycles, before_insns, before_reads : natural;
+      variable trace_entry : qword;
+      procedure post(op : natural; arg, adr, len : natural := 0) is
       begin
          seq := seq + 1;
-         if (seq > 255) then seq := 1; end if;
-         mbox(OFF_ADDR / 8) := std_logic_vector(to_unsigned(adr, 64));
-         mbox(OFF_LEN  / 8) := std_logic_vector(to_unsigned(len, 64));
-         -- [7:0] opcode, [15:8] sequence, [63:32] argument
-         mbox(OFF_CMD  / 8) := std_logic_vector(to_unsigned(arg, 32)) &
-                               x"0000" &
-                               std_logic_vector(to_unsigned(seq, 8)) &
-                               std_logic_vector(to_unsigned(op, 8));
-         loop
-            wait until rising_edge(clk);
-            guard := guard + 1;
-            assert guard < 200000 report "mailbox command timed out" severity failure;
-            exit when to_integer(unsigned(mbox(OFF_ACK / 8)(7 downto 0))) = seq;
+         post_cmd(clk, host, op, seq, arg, adr, len);
+      end procedure;
+      procedure send(op : natural; arg, adr, len : natural := 0; status : natural := 0) is
+      begin
+         post(op, arg, adr, len);
+         await_ack(clk, mbox, seq, status);
+      end procedure;
+      procedure stop_at(reason, pc : natural; slot : natural := 0) is
+      begin
+         await_stop(clk, mbox, reason, slot);
+         assert mbox(OFF_STATE)(63 downto 32) = u32(pc) and
+                arch_pc = pc and gdb_halted = '1' and ce = '0'
+            report "stop did not freeze at architectural PC " & to_hstring(u32(pc)) severity failure;
+      end procedure;
+      procedure retire is
+      begin
+         cpu_done <= '1';
+         ticks(clk);
+         cpu_done <= '0';
+      end procedure;
+      procedure decode(pc : natural; expect_stop : boolean) is
+      begin
+         fetch_pc <= to_unsigned(pc, 32);
+         decode_load <= '1';
+         wait for CLK_PERIOD / 4;
+         assert (dbg_stop_now = '1') = expect_stop and gdb_halted = '0' and ce = '1'
+            report "wrong combinational stop at Decode" severity failure;
+         ticks(clk);
+         decode_load <= '0';
+         assert (ce = '0') = expect_stop
+            report "Decode stop did not prevent the subsequent Execute edge" severity failure;
+      end procedure;
+      procedure poison_data(n : natural) is
+      begin
+         for i in 0 to n loop
+            put_word(clk, host, OFF_DATA + i, SENTINEL);
          end loop;
-         -- let the engine publish any state change the command caused
-         wait_clk(80);
       end procedure;
-
-      impure function state_halted return boolean is
-      begin
-         return mbox(OFF_STATE / 8)(0) = '1';
-      end function;
-
-      impure function state_reason return integer is
-      begin
-         return to_integer(unsigned(mbox(OFF_STATE / 8)(7 downto 4)));
-      end function;
-
-      impure function state_pc return unsigned is
-      begin
-         return unsigned(mbox(OFF_STATE / 8)(63 downto 32));
-      end function;
-
-      impure function data_word(i : integer) return std_logic_vector is
-         variable qw : std_logic_vector(63 downto 0);
-      begin
-         qw := mbox(OFF_DATA / 8 + i / 2);
-         if (i mod 2) = 0 then
-            return qw(31 downto 0);
-         else
-            return qw(63 downto 32);
-         end if;
-      end function;
-
-      procedure set_data_word(i : integer; v : std_logic_vector(31 downto 0)) is
-         variable qw : std_logic_vector(63 downto 0);
-      begin
-         qw := mbox(OFF_DATA / 8 + i / 2);
-         if (i mod 2) = 0 then
-            qw(31 downto 0) := v;
-         else
-            qw(63 downto 32) := v;
-         end if;
-         mbox(OFF_DATA / 8 + i / 2) := qw;
-      end procedure;
-
-      variable pc_at_halt : unsigned(31 downto 0);
-      variable n_before   : integer;
-
    begin
-      -- seed the register file and memory
-      for i in 0 to 14 loop
-         regfile(i) := std_logic_vector(to_unsigned(16#1000# + i, 32));
-      end loop;
-      regfile(16) := x"6000001F";      -- CPSR
-      for i in 0 to 15 loop
-         gbamem(i) := std_logic_vector(to_unsigned(16#20000000# + i, 32));
-      end loop;
-
-      wait_clk(10);
+      reset <= '1';
+      ticks(clk);
+      put_word(clk, host, OFF_CMD, command_word(CMD_HALT, STALE_SEQ, 0));
       reset <= '0';
-      wait_clk(20);
+      await_ack(clk, mbox, STALE_SEQ);
+      -- Span a full running poll so stale HALT would be observed.
+      ticks(clk, 4200);
+      assert gdb_halted = '0' and ce = '1' and mbox(OFF_STATE)(2 downto 0) = "100"
+         report "INIT_SYNC executed stale OFF_CMD or published wrong mode" severity failure;
+      decode(ROM_BASE, false);
 
-      report "--- 1. core runs freely with the stub idle";
-      n_before := instr_count;
-      wait_clk(200);
-      check(instr_count > n_before, "cpu should be running before any halt", errors);
+      send(CMD_HALT);
+      stop_at(STOP_HOST, ROM_BASE);
+      before_cycles := cycle_count;
+      ticks(clk, 10);
+      assert cycle_count = before_cycles and unsigned(mbox(OFF_CYCLES)) = before_cycles
+         report "host halt did not freeze cycles" severity failure;
 
-      report "--- 2. host halt request";
-      send_cmd(CMD_HALT, 0, 0, 0);
-      check(state_halted, "STATE should report halted after CMD_HALT", errors);
-      check(state_reason = STOP_HOST, "stop reason should be host request", errors);
-      check(gdb_halted = '1', "gdb_halted should be asserted", errors);
-      check(pause_active = '1', "whole core should be frozen once halted", errors);
-
-      pc_at_halt := state_pc;
-      n_before   := instr_count;
-      wait_clk(300);
-      check(instr_count = n_before, "cpu must not retire while halted", errors);
-
-      report "--- 3. register read over the savestate bus";
-      send_cmd(CMD_RDREGS, 0, 0, 0);
-      check(data_word(0) = x"00001000", "r0 mismatch: " &
-            to_hstring(data_word(0)), errors);
-      check(data_word(14) = x"0000100E", "r14 mismatch: " &
-            to_hstring(data_word(14)), errors);
-      check(unsigned(data_word(15)) = pc_at_halt, "r15 should equal the stop PC",
-            errors);
-      check(data_word(16) = x"6000001F", "cpsr mismatch: " &
-            to_hstring(data_word(16)), errors);
-
-      report "--- 4. register write";
-      send_cmd(CMD_WRREG, 16#5EADBEEF#, 0, 0);
-      check(regfile(0) = x"5EADBEEF", "r0 write did not land: " &
-            to_hstring(regfile(0)), errors);
-
-      report "--- 5. memory read, 8 words";
-      send_cmd(CMD_RDMEM, 0, GBA_MEM_BASE, 32);
-      for i in 0 to 7 loop
-         check(data_word(i) = std_logic_vector(to_unsigned(16#20000000# + i, 32)),
-               "memory read word " & integer'image(i) & " = " &
-               to_hstring(data_word(i)), errors);
+      send(CMD_RDREGS);
+      for i in 0 to 16 loop
+         if i = 15 then
+            assert data_word(mbox, i) = u32(ROM_BASE) report "r15 was not true arch_pc" severity failure;
+         else
+            assert data_word(mbox, i) = ss_word(i + 1, 0)
+               report "RDREGS mismatch at slot " & natural'image(i) severity failure;
+         end if;
       end loop;
+      send(CMD_WRREG, 16#5EADBEEF#);
+      assert reg_pulses = 1 and r0 = x"5EADBEEF" report "WRREG pulse/value mismatch" severity failure;
+      send(CMD_RDREGS);
+      assert data_word(mbox, 0) = x"5EADBEEF" and reg_pulses = 1
+         report "live register write did not persist or pulsed again" severity failure;
 
-      report "--- 6. memory write, whole words";
-      set_data_word(0, x"11223344");
-      set_data_word(1, x"55667788");
-      send_cmd(CMD_WRMEM, 0, GBA_MEM_BASE + 16#20#, 8);
-      check(gbamem(8) = x"11223344", "word write 0 = " & to_hstring(gbamem(8)),
-            errors);
-      check(gbamem(9) = x"55667788", "word write 1 = " & to_hstring(gbamem(9)),
-            errors);
+      put_word(clk, host, OFF_DATA, x"5566778811223344");
+      mem_ready <= '0';
+      post(CMD_WRMEM, adr => MEM_BASE, len => 8);
+      ticks(clk, 200);
+      assert mbox(OFF_ACK) = ok_ack(seq - 1) and memaccess = '0' and mem_writes = 0
+         report "WRMEM did not wait for mem_dbg_ready" severity failure;
+      mem_ready <= '1';
+      await_ack(clk, mbox, seq);
+      assert mem_writes = 2 and mem_reads = 0 report "whole write used unexpected bus cycles" severity failure;
 
-      report "--- 7. ragged tail write must read-modify-write the last word";
-      gbamem(13) := x"CAFEF00D";   -- only its low half is inside the request
-      set_data_word(0, x"AABBCCDD");
-      set_data_word(1, x"0000EEFF");   -- only the low 2 bytes are in range
-      send_cmd(CMD_WRMEM, 0, GBA_MEM_BASE + 16#30#, 6);
-      check(gbamem(12) = x"AABBCCDD", "full word of the ragged write = " &
-            to_hstring(gbamem(12)), errors);
-      check(gbamem(13)(15 downto 0) = x"EEFF", "tail bytes written = " &
-            to_hstring(gbamem(13)), errors);
-      check(gbamem(13)(31 downto 16) = x"CAFE", "tail RMW clobbered the " &
-            "bytes past the request: " & to_hstring(gbamem(13)), errors);
+      mem_ready <= '0';
+      post(CMD_RDMEM, adr => MEM_BASE, len => 8);
+      ticks(clk, 200);
+      assert mbox(OFF_ACK) = ok_ack(seq - 1) and memaccess = '0' and mem_reads = 0
+         report "RDMEM did not wait for mem_dbg_ready" severity failure;
+      mem_ready <= '1';
+      await_ack(clk, mbox, seq);
+      assert mbox(OFF_DATA) = x"5566778811223344" report "whole readback mismatch" severity failure;
 
-      report "--- 8. resume";
-      n_before := instr_count;
-      send_cmd(CMD_CONT, 0, 0, 0);
-      wait_clk(200);
-      check(not state_halted, "STATE should clear halted after CMD_CONT", errors);
-      check(instr_count > n_before, "cpu should retire again after resume",
-            errors);
+      before_reads := mem_reads;
+      put_word(clk, host, OFF_DATA, x"0000EEFFAABBCCDD");
+      send(CMD_WRMEM, adr => MEM_BASE + 8, len => 6);
+      assert mem_reads = before_reads + 1 and mem_writes = 4
+         report "ragged write did not RMW only the tail" severity failure;
+      put_word(clk, host, OFF_DATA + 1, SENTINEL);
+      send(CMD_RDMEM, adr => MEM_BASE + 8, len => 9);
+      assert mbox(OFF_DATA) = x"CAFEEEFFAABBCCDD" and mbox(OFF_DATA + 1) = x"00000000CAFEF00D"
+         report "ragged RMW/odd-word readback mismatch" severity failure;
+      assert cycle_count = before_cycles report "debug memory commands ran the core" severity failure;
 
-      report "--- 9. single step retires exactly one instruction";
-      send_cmd(CMD_HALT, 0, 0, 0);
-      n_before := instr_count;
-      send_cmd(CMD_STEP, 0, 0, 0);
-      check(state_halted, "step should leave the core halted", errors);
-      check(state_reason = STOP_STEP, "stop reason should be step", errors);
-      check(instr_count = n_before + 1,
-            "step retired " & integer'image(instr_count - n_before) &
-            " instructions, want 1", errors);
+      send(CMD_STEP_CYCLES, 1);
+      stop_at(STOP_STEP_CYCLE, ROM_BASE);
+      assert step_pulses = 1 and cycle_count = before_cycles + 1 and
+             unsigned(mbox(OFF_CYCLES)) = before_cycles + 1
+         report "N=1 did not inject one cycle" severity failure;
+      send(CMD_STEP_CYCLES, 5);
+      stop_at(STOP_STEP_CYCLE, ROM_BASE);
+      assert step_pulses = 1 and cycle_count = before_cycles + 6 and
+             unsigned(mbox(OFF_CYCLES)) = before_cycles + 6
+         report "N=5 countdown was not exact" severity failure;
 
-      report "--- 10. breakpoint stops before the instruction executes";
-      -- arm a comparator a little ahead of where we are, then run
-      pc_at_halt := state_pc;
-      send_cmd(CMD_SETBP, 16#11#, to_integer(pc_at_halt) + 16#20#, 0);
-      send_cmd(CMD_CONT, 0, 0, 0);
+      before_insns := insn_count;
+      send(CMD_STEP);
+      retire;
+      ticks(clk, 3);
+      assert gdb_halted = '0' and dbg_stop_now = '0' and insn_count = before_insns + 1
+         report "step must retire once and wait for Decode" severity failure;
+      decode(ROM_BASE + 4, true);
+      stop_at(STOP_STEP, ROM_BASE + 4);
 
-      for i in 1 to 4000 loop
-         wait until rising_edge(clk);
-         exit when state_halted;
+      send(CMD_SETBP, 16#12#, BP_PC + 4, status => 3);
+      send(CMD_SETBP, 16#11#, BP_PC);
+      fetch_pc <= to_unsigned(BP_PC, 32);
+      send(CMD_CONT);
+      assert gdb_halted = '0' and dbg_stop_now = '0'
+         report "fetch match without Decode incorrectly stopped" severity failure;
+      decode(BP_PC, true);
+      retire; -- would be the Execute edge if the comparator failed to stop CE
+      stop_at(STOP_BP, BP_PC, 1);
+      assert insn_count = before_insns + 1 report "breakpoint instruction executed" severity failure;
+
+      send(CMD_STEP, 1);
+      retire;
+      decode(BP_PC + 4, true);
+      stop_at(STOP_STEP, BP_PC + 4);
+      assert insn_count = before_insns + 2 report "step-off re-triggered breakpoint" severity failure;
+      send(CMD_SETBP, 1, BP_PC);
+      send(CMD_CONT);
+      decode(BP_PC, false);
+      retire;
+      send(CMD_HALT);
+      stop_at(STOP_HOST, BP_PC);
+      assert insn_count = before_insns + 3 report "disarmed breakpoint prevented execution" severity failure;
+
+      poison_data(65);
+      send(CMD_RD_TRACE);
+      assert mbox(OFF_DATA) = u64(16#0303#) report "trace head count/pointer mismatch" severity failure;
+      for i in 1 to 3 loop
+         trace_entry := mbox(OFF_DATA + i);
+         assert trace_entry(63 downto 40) = IRQ_FLAGS & x"2A" and
+                trace_entry(39 downto 32) /= x"00"
+            report "trace context/delta mismatch" severity failure;
+         if i = 1 then
+            assert trace_entry(39 downto 32) = x"FF" and trace_entry(31 downto 0) = u32(ROM_BASE)
+               report "first retirement PC or saturated delta mismatch" severity failure;
+         else
+            assert trace_entry(31 downto 0) = u32(BP_PC)
+               report "trace did not report retired PC in order" severity failure;
+         end if;
       end loop;
-      check(state_halted, "breakpoint never fired", errors);
-      check(state_reason = STOP_BP, "stop reason should be breakpoint", errors);
-      check(state_pc = pc_at_halt + 16#20#,
-            "stopped at " & to_hstring(state_pc) & ", want " &
-            to_hstring(pc_at_halt + 16#20#), errors);
-      -- the breakpointed instruction must NOT have retired
-      check(cpu_PC = pc_at_halt + 16#20#,
-            "cpu ran past the breakpoint to " & to_hstring(cpu_PC), errors);
+      for i in 4 to 64 loop
+         assert mbox(OFF_DATA + i) = u64(0) report "unused trace entry not cleared" severity failure;
+      end loop;
+      assert mbox(OFF_DATA + 65) = SENTINEL report "trace exceeded 65 qwords" severity failure;
 
-      report "--- 11. stepping off a breakpoint does not re-trigger it";
-      n_before := instr_count;
-      send_cmd(CMD_STEP, 0, 0, 0);
-      check(instr_count = n_before + 1,
-            "could not step off the breakpoint (retired " &
-            integer'image(instr_count - n_before) & ")", errors);
-      check(state_reason = STOP_STEP,
-            "step off a breakpoint should report a step, not a breakpoint",
-            errors);
+      send(CMD_SETWP, 16#31#, MEM_BASE + 4, status => 3);
+      send(CMD_SETWP, 16#30#, MEM_BASE);
+      send(CMD_CONT);
+      cpu_bus_addr <= u32(MEM_BASE + 2);
+      cpu_bus_code <= '1';
+      cpu_bus_ena <= '1';
+      ticks(clk, 3);
+      assert gdb_halted = '0' and dbg_stop_now = '0' report "watchpoint matched a fetch" severity failure;
+      cpu_bus_code <= '0';
+      cpu_bus_rnw <= '0';
+      ticks(clk, 3);
+      assert gdb_halted = '0' and dbg_stop_now = '0' report "read watchpoint matched a write" severity failure;
+      cpu_bus_rnw <= '1';
+      ticks(clk);
+      cpu_bus_ena <= '0';
+      cpu_bus_addr <= u32(MEM_BASE + 16);
+      stop_at(STOP_WP, BP_PC, 0);
 
-      report "--- 12. disarming the comparator lets the core run past it";
-      send_cmd(CMD_SETBP, 16#01#, to_integer(pc_at_halt) + 16#20#, 0);
-      n_before := instr_count;
-      send_cmd(CMD_CONT, 0, 0, 0);
-      wait_clk(1000);
-      check(not state_halted, "core should still be running with the bp off",
-            errors);
-      check(instr_count > n_before + 20,
-            "core did not run freely after the breakpoint was cleared", errors);
+      send(CMD_SET_INPUT, 16#03150101#);
+      send(CMD_SET_CORE, 1);
+      assert active_core = '1' and mbox(OFF_STATE)(2 downto 0) = "111" and mbox(OFF_STATE)(12) = '0'
+         report "core select also changed stop core or was not published" severity failure;
+      send(CMD_SET_INPUT, 16#020A0202#);
+      assert unsigned(mask0) = 16#315# and unsigned(val0) = 16#101# and
+             unsigned(mask1) = 16#20A# and unsigned(val1) = 16#202#
+         report "2P input masks/values not independent" severity failure;
+      send(CMD_RDREGS);
+      assert data_word(mbox, 0) = x"00001100" and data_word(mbox, 15) = x"08001234"
+         report "RDREGS did not follow selected core" severity failure;
 
-      wait_clk(20);
-      if (errors = 0) then
-         report "ALL GDB ENGINE TESTS PASSED";
-      else
-         report integer'image(errors) & " CHECK(S) FAILED" severity failure;
-      end if;
+      poison_data(51);
+      send(CMD_RDSTATE);
+      assert mbox(OFF_DATA) = mbox(OFF_STATE) and mbox(OFF_DATA + 1) = mbox(OFF_CYCLES) and
+             mbox(OFF_DATA + 2) = u64(before_insns + 3) and mbox(OFF_DATA + 3) = u64(0) and
+             mbox(OFF_DATA + 4) = u32(MEM_BASE + 2) & u32(0)
+         report "state header/counters/latched watch address mismatch" severity failure;
+      assert mbox(OFF_DATA + 5) = u32(BP_PC) & u32(BP_PC) and
+             mbox(OFF_DATA + 6) = x"E3A000010800A000" and
+             mbox(OFF_DATA + 7) = dispstat & u32(MEM_BASE + 16) and
+             mbox(OFF_DATA + 8) = x"000000000000" & IRQ_FLAGS and
+             mbox(OFF_DATA + 9) = u64(0) and
+             mbox(OFF_DATA + 10) = x"02AC008000000000"
+         report "core 0 telemetry mismatch" severity failure;
+      assert mbox(OFF_DATA + 11) = x"0800123808001234" report "core 1 PC telemetry mismatch" severity failure;
+      for i in 12 to 16 loop
+         assert mbox(OFF_DATA + i) = u64(0) report "core 1 telemetry mismatch" severity failure;
+      end loop;
+      for i in 0 to 33 loop
+         assert mbox(OFF_DATA + 17 + i) = ss_word(2 * i + 1, 1) & ss_word(2 * i, 1)
+            report "RDSTATE savestate pair mismatch at " & natural'image(i) severity failure;
+      end loop;
+      assert mbox(OFF_DATA + 51) = SENTINEL report "state exceeded 51 qwords" severity failure;
+      send(CMD_SET_CORE);
+      send(CMD_SET_INPUT);
+      assert active_core = '0' and unsigned(mask0) = 0 and unsigned(val0) = 0 and unsigned(mask1) = 16#20A#
+         report "clearing core 0 override affected core 1" severity failure;
 
-      sim_done <= true;
-      wait;
+      send(CMD_STEP_FRAMES, 2);
+      vblank <= '1';
+      ticks(clk);
+      vblank <= '0';
+      ticks(clk, 2);
+      assert gdb_halted = '0' report "frame-step stopped after first VBlank" severity failure;
+      vblank <= '1';
+      ticks(clk);
+      vblank <= '0';
+      stop_at(STOP_STEP_FRAME, BP_PC);
+
+      send(CMD_STEP_LINE, 42);
+      dispstat <= x"00290040";
+      line_trigger <= '1';
+      ticks(clk);
+      line_trigger <= '0';
+      dispstat <= x"002A0040";
+      hblank <= '1';
+      ticks(clk);
+      hblank <= '0';
+      assert gdb_halted = '0' report "line-step accepted wrong line/edge" severity failure;
+      line_trigger <= '1';
+      ticks(clk);
+      line_trigger <= '0';
+      stop_at(STOP_STEP_LINE, BP_PC);
+      send(CMD_STEP_LINE, 16#12A#);
+      line_trigger <= '1';
+      ticks(clk);
+      line_trigger <= '0';
+      assert gdb_halted = '0' report "HBlank line-step accepted line start" severity failure;
+      hblank <= '1';
+      ticks(clk);
+      hblank <= '0';
+      stop_at(STOP_STEP_LINE, BP_PC);
+
+      before_cycles := cycle_count;
+      send(CMD_BREAK_CYCLE, adr => before_cycles + 5);
+      send(CMD_CONT);
+      stop_at(STOP_BREAK_CYCLE, BP_PC);
+      assert cycle_count = before_cycles + 5 and unsigned(mbox(OFF_CYCLES)) = before_cycles + 5
+         report "absolute cycle break was off by a cycle" severity failure;
+      send(CMD_BREAK_EVENT, 4); -- DMA start only
+      send(CMD_CONT);
+      hblank <= '1';
+      ticks(clk);
+      hblank <= '0';
+      assert gdb_halted = '0' report "event mask accepted unrelated HBlank" severity failure;
+      dma_on <= '1';
+      ticks(clk);
+      dma_on <= '0';
+      stop_at(STOP_BREAK_EVENT, BP_PC);
+      send(CMD_BREAK_EVENT);
+
+      send(CMD_RESET, 1);
+      stop_at(STOP_RESET_HALT, BP_PC);
+      assert reset_ticks = 16 and dbg_reset_req = '0' and unsigned(mbox(OFF_CYCLES)) = 0
+         report "reset pulse width, hold or cycle clear mismatch" severity failure;
+      report "ALL GDB ENGINE TESTS PASSED";
+      std.env.finish;
    end process;
-
 end architecture;

@@ -17,6 +17,8 @@ use work.pProc_bus_gba.all;
 --   3) SystemStatus (0x13): 1-word payload arrives intact
 --   4) wait (0x27) -> clock reversal -> daemon notify 0x28 arrives as an
 --      adapter-mastered command, GBA ACKs, clock returns to the GBA
+--   5) DataRx (0x26) and StopMode (0x3D) can idle beyond the word deadline,
+--      but an incomplete request still times out and resynchronizes
 --
 -- run: sim/run_wireless_tb.sh
 entity tb_wireless is
@@ -60,6 +62,7 @@ architecture sim of tb_wireless is
    signal req_hello_seen  : std_logic := '0';
    signal req_sstat_seen  : std_logic := '0';
    signal req_wait_seen   : std_logic := '0';
+   signal watchdog_events : natural := 0;
 
    constant ADR_SIODATA32 : integer := 16#120#;
    constant ADR_SIOCNT    : integer := 16#128#;
@@ -266,6 +269,8 @@ begin
                putbyte(x"03"); putbyte(x"28"); putbyte(x"00");
             elsif (b1 = x"03") then
                gbaack_seen <= '1';
+            elsif (b1 = x"04") then
+               watchdog_events <= watchdog_events + 1;
             end if;
          elsif (ptype = x"01") then
             -- REQ from the GBA: answer like the real daemon
@@ -281,6 +286,11 @@ begin
                when x"27" =>
                   req_wait_seen <= '1';
                   putbyte(x"02"); putbyte(x"A7"); putbyte(x"00");
+               when x"26" =>
+                  putbyte(x"02"); putbyte(x"A6"); putbyte(x"01");
+                  putbyte(x"00"); putbyte(x"09"); putbyte(x"00"); putbyte(x"00");
+               when x"3D" =>
+                  putbyte(x"02"); putbyte(x"BD"); putbyte(x"00");
                when x"11" =>
                   putbyte(x"02"); putbyte(x"91"); putbyte(x"00");
                when others =>
@@ -414,10 +424,9 @@ begin
       wait until reversal_seen = '1' for 1 ms;
       assert reversal_seen = '1' report "adapter never entered reversal" severity failure;
 
-      -- GBA side: become slave, receive the adapter's command
-      -- (LinkRawWireless::receiveCommandFromAdapter)
-      -- word 1: adapter header; we answer 0x80000000
-      for w in 0 to 2 loop
+      -- GBA side: receive the notify header, then return its ACK header.
+      -- There is no extra dummy transfer after a zero-parameter ACK.
+      for w in 0 to 1 loop
          buswrite32(bus_g, ADR_SIODATA32, x"80000000");
          if (w = 1) then
             -- word 2 carries our ACK to the notify
@@ -449,7 +458,7 @@ begin
          buswrite16(bus_g, ADR_SIOCNT, x"5000"); -- SO low
       end loop;
 
-      wait until gbaack_seen = '1' for 1 ms;
+      if gbaack_seen = '0' then wait until gbaack_seen = '1' for 1 ms; end if;
       assert gbaack_seen = '1' report "adapter never reported our ACK" severity failure;
 
       -- clock is ours again: a plain command must work
@@ -457,8 +466,39 @@ begin
       assert r32 = x"99660091" report "post-reversal command broken: " & to_hstring(r32) severity failure;
       report "test 4 passed";
 
+      ------------------------------------------------------------------
+      report "test 5: word watchdog distinguishes idle from a stalled request";
+      sendcmd(x"26", r32);
+      assert r32 = x"996601A6" report "DataRx ACK wrong" severity failure;
+      xfer32(x"80000000", '1', r32);
+      assert r32 = x"00000900" report "DataRx payload wrong" severity failure;
+      hshake('1');
+      wait for 101 ms;
+      assert watchdog_events = 0 report "watchdog fired while idle after DataRx" severity failure;
+
+      xfer32(x"99660116", '1', r32); -- start a request but withhold its parameter
+      assert r32 = x"80000000" report "adapter did not accept the next request" severity failure;
+      hshake('1');
+      wait for 99 ms;
+      assert watchdog_events = 0 report "watchdog fired before its deadline" severity failure;
+      wait for 2 ms;
+      assert watchdog_events = 1 report "no watchdog for a stalled request" severity failure;
+
+      sendcmd(x"3D", r32); -- also verifies that timeout returns to header framing
+      assert r32 = x"996600BD" report "StopMode ACK wrong after timeout recovery" severity failure;
+      wait for 101 ms;
+      assert watchdog_events = 1 report "watchdog fired while idle after StopMode" severity failure;
+      report "test 5 passed";
+
       report "ALL WIRELESS TESTS PASSED";
       done <= true;
+      wait;
+   end process;
+
+   process
+   begin
+      wait for 340 ms;
+      assert done report "wireless bench did not complete" severity failure;
       wait;
    end process;
 

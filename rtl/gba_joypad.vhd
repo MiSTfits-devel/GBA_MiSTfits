@@ -25,7 +25,8 @@ entity gba_joypad is
       KeyR       : in std_logic;
       KeyL       : in std_logic;
       
-      cpu_done   : in std_logic
+      cpu_done   : in std_logic;
+      ce         : in std_logic := '1'
    );
 end entity;
 
@@ -67,11 +68,6 @@ begin
    begin
       if rising_edge(clk100) then
 
-         IRP_Joypad <= '0';
-         
-         Keys_1       <= Keys;
-         REG_KEYCNT_1 <= REG_KEYCNT;
-         
          Keys(0) <= not KeyA; 
          Keys(1) <= not KeyB;
          Keys(2) <= not KeySelect;
@@ -84,15 +80,21 @@ begin
          Keys(9) <= not KeyL;
          Keys(KEYINPUT.upper downto 10) <= (others => '0');
          
-         if (Keys_1 /= Keys or REG_KEYCNT_1 /= REG_KEYCNT) then
-            if (REG_KEYCNT(30) = '1') then
-               if (REG_KEYCNT(31) = '1') then -- logical and
-                  if ((not Keys(9 downto 0)) = REG_KEYCNT(25 downto 16)) then
-                     IRP_Joypad <= '1';
-                  end if;
-               else -- logical or
-                  if (unsigned((not Keys(9 downto 0)) and REG_KEYCNT(25 downto 16)) /= 0) then
-                     IRP_Joypad <= '1';
+         if (ce = '1') then
+            IRP_Joypad   <= '0';
+            Keys_1       <= Keys;
+            REG_KEYCNT_1 <= REG_KEYCNT;
+
+            if (Keys_1 /= Keys or REG_KEYCNT_1 /= REG_KEYCNT) then
+               if (REG_KEYCNT(30) = '1') then
+                  if (REG_KEYCNT(31) = '1') then -- logical and
+                     if ((not Keys(9 downto 0)) = REG_KEYCNT(25 downto 16)) then
+                        IRP_Joypad <= '1';
+                     end if;
+                  else -- logical or
+                     if (unsigned((not Keys(9 downto 0)) and REG_KEYCNT(25 downto 16)) /= 0) then
+                        IRP_Joypad <= '1';
+                     end if;
                   end if;
                end if;
             end if;

@@ -12,6 +12,9 @@
 
 source GBA.qsf
 
+# Keep the proven fitter seed for the Multisystem2 profile (GBA.qsf picks a different one).
+set_global_assignment -name SEED 0
+
 set_global_assignment -name VERILOG_MACRO "MISTER_MMS2=1"
 
 # ---- Multisystem2 expansion bus ----

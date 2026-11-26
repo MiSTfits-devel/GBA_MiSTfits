@@ -26,7 +26,11 @@ entity gba_ctrl_pause is
       KeyPause            : in  std_logic;
 
       ce                  : out std_logic := '0';
-      pause_active        : out std_logic := '0'
+      pause_active        : out std_logic := '0';
+
+      dbg_hold            : in  std_logic := '0';
+      dbg_step            : in  std_logic := '0';
+      dbg_stop_now        : in  std_logic := '0'
    );
 end entity;
 
@@ -50,8 +54,7 @@ begin
    begin
       if rising_edge(clk1x) then
 
-         ce            <= '0';
-         pause_active  <= '0';
+         ce <= '0';
 
          lfsr(22 downto 1) <= lfsr(21 downto 0);
          lfsr(0) <= not(lfsr(22) xor lfsr(18));
@@ -59,7 +62,11 @@ begin
          if (gbaon = '0' or savestate_loadstate = '1') then
             state    <= PAUSING;
             pauseCnt <= (others => '0');
+            pause_active <= '0';
+         elsif (dbg_hold = '1') then
+            ce <= dbg_step;
          else
+            pause_active <= '0';
 
             case (state) is
 
@@ -96,6 +103,10 @@ begin
                   end if;
 
             end case;
+
+            if (dbg_stop_now = '1') then
+               ce <= '0';
+            end if;
 
          end if;
 

@@ -248,7 +248,9 @@ entity gba_wrap is
       debug_cpu_mixed       : out    std_logic_vector(31 downto 0);
       debug_irq             : out    std_logic_vector(31 downto 0);
       debug_dma             : out    std_logic_vector(31 downto 0);
-      debug_mem             : out    std_logic_vector(31 downto 0)  
+      debug_mem             : out    std_logic_vector(31 downto 0);
+      gdb_enable            : in     std_logic := '0';
+      gdb_halted            : out    std_logic := '0'
    );
 end entity;
 
@@ -441,6 +443,66 @@ architecture arch of gba_wrap is
    signal rdram_done       : tDDDR3Single;
    signal rdram_ready      : tDDDR3Single;
    signal rdram_dataRead   : std_logic_vector(63 downto 0);
+
+   -- Both cores stop together; only the selected core receives transactions.
+   signal dbg_hold, dbg_step, dbg_stop_now, dbg_reset_req : std_logic;
+   signal active_core_out, gdb_select_c1                 : std_logic;
+   signal gdb_memaccess, c0_gdb_memaccess, c1_gdb_memaccess : std_logic;
+   signal gdb_ss_req                : std_logic;
+   signal gdb_ss_bus                : proc_bus_gb_type;
+   signal gdb_ss_out, c0_ss_out, c1_ss_out : std_logic_vector(proc_buswidth-1 downto 0);
+   signal gdb_ss_done, c0_ss_done, c1_ss_done : std_logic;
+   signal gdb_mem_ready, c0_mem_ready, c1_mem_ready : std_logic;
+   signal gdb_bus_addr, c0_bus_addr  : std_logic_vector(27 downto 0);
+   signal gdb_bus_rnw, c0_bus_rnw    : std_logic;
+   signal gdb_bus_acc, c0_bus_acc    : std_logic_vector(1 downto 0);
+   signal gdb_bus_write_data, c0_bus_write_data : std_logic_vector(31 downto 0);
+   signal gdb_bus_written, c0_bus_written : std_logic;
+   signal gdb_bus_read_data, c0_bus_read_data, c1_bus_read_data : std_logic_vector(31 downto 0);
+   signal gdb_bus_read_done, c0_bus_read_done, c1_bus_read_done : std_logic;
+   signal dbg_reg_wr                : std_logic;
+   signal dbg_reg_idx               : std_logic_vector(4 downto 0);
+   signal dbg_reg_data              : std_logic_vector(31 downto 0);
+   signal dbg_reg_rd_idx             : std_logic_vector(4 downto 0);
+   signal dbg_reg_rd_data, c0_reg_rd_data, c1_reg_rd_data : std_logic_vector(31 downto 0);
+
+   signal joy_ov_mask_c0, joy_ov_val_c0 : std_logic_vector(9 downto 0);
+   signal joy_ov_mask_c1, joy_ov_val_c1 : std_logic_vector(9 downto 0);
+   signal dbg_keys_c0                : std_logic_vector(9 downto 0);
+   signal wl_debug_state             : std_logic_vector(7 downto 0);
+
+   signal c0_ce, c1_ce                         : std_logic;
+   signal c0_arch_pc, c1_arch_pc               : unsigned(31 downto 0);
+   signal c0_fetch_instr_pc, c1_fetch_instr_pc : unsigned(31 downto 0);
+   signal c0_stall_instr_pc, c1_stall_instr_pc : unsigned(31 downto 0);
+   signal c0_decode_load, c1_decode_load       : std_logic;
+   signal c0_execute_stall, c1_execute_stall   : std_logic;
+   signal c0_decode_ready, c1_decode_ready     : std_logic;
+   signal c0_fetch_ready, c1_fetch_ready       : std_logic;
+   signal c0_decode_opcode, c1_decode_opcode   : std_logic_vector(31 downto 0);
+   signal c0_bus_state, c1_bus_state           : std_logic_vector(1 downto 0);
+   signal c0_thumbmode, c1_thumbmode           : std_logic;
+   signal c0_cpu_mode, c1_cpu_mode             : std_logic_vector(3 downto 0);
+   signal c0_cpu_done, c1_cpu_done             : std_logic;
+   signal c0_cpu_halt, c1_cpu_halt             : std_logic;
+   signal c0_cpu_bus_adr, c1_cpu_bus_adr       : std_logic_vector(31 downto 0);
+   signal c0_cpu_bus_ena, c1_cpu_bus_ena       : std_logic;
+   signal c0_cpu_bus_rnw, c1_cpu_bus_rnw       : std_logic;
+   signal c0_cpu_bus_acc, c1_cpu_bus_acc       : std_logic_vector(1 downto 0);
+   signal c0_cpu_bus_seq, c1_cpu_bus_seq       : std_logic;
+   signal c0_cpu_bus_code, c1_cpu_bus_code     : std_logic;
+   signal c0_dma_on, c1_dma_on                 : std_logic;
+   signal c0_vblank, c1_vblank                 : std_logic;
+   signal c0_hblank, c1_hblank                 : std_logic;
+   signal c0_line_trigger, c1_line_trigger     : std_logic;
+   signal c0_dispstat, c1_dispstat             : std_logic_vector(31 downto 0);
+   signal c0_irq_if, c1_irq_if                 : std_logic_vector(15 downto 0);
+   signal c0_irq_ie, c1_irq_ie                 : std_logic_vector(15 downto 0);
+   signal c0_irq_ime, c1_irq_ime               : std_logic;
+   signal c0_cpu_irq, c1_cpu_irq               : std_logic;
+   signal c0_haltcnt, c1_haltcnt               : std_logic_vector(7 downto 0);
+   signal c0_mem_info, c1_mem_info             : std_logic_vector(31 downto 0);
+   signal c0_link_pins, c1_link_pins           : std_logic_vector(7 downto 0);
    
    signal gpufifo_reset    : std_logic;
    signal gpufifo_Din      : std_logic_vector(33 downto 0); -- 16bit data + 18 bit address
@@ -596,6 +658,12 @@ architecture arch of gba_wrap is
    signal GBA_on1X_2 : std_logic := '0';
    signal romcopy_target_core2 : std_logic := '0'; -- latched at romcopy_start: this copy is destined for core 2's independent window
 
+   function gdb_slot_count(single_count, dual_count : positive; dual_core : std_logic) return positive is
+   begin
+      if dual_core = '1' then return dual_count; end if;
+      return single_count;
+   end function;
+
    -- Temporary hardware diagnostic: hex nibble -> ASCII, see the link debug
    -- overlay below. Remove once the real-hardware link-establishment bug
    -- is root-caused.
@@ -610,6 +678,29 @@ architecture arch of gba_wrap is
 
 begin
 
+   gdb_select_c1 <= second_core and active_core_out;
+   c0_gdb_memaccess <= gdb_memaccess and not gdb_select_c1;
+   c1_gdb_memaccess <= gdb_memaccess and gdb_select_c1;
+
+   -- The legacy wrapper bus still addresses player 1 when GDB isn't using it.
+   c0_bus_addr       <= gdb_bus_addr       when c0_gdb_memaccess = '1' else GBA_BusAddr;
+   c0_bus_rnw        <= gdb_bus_rnw        when c0_gdb_memaccess = '1' else GBA_BusRnW;
+   c0_bus_acc        <= gdb_bus_acc        when c0_gdb_memaccess = '1' else GBA_BusACC;
+   c0_bus_write_data <= gdb_bus_write_data when c0_gdb_memaccess = '1' else GBA_BusWriteData;
+   c0_bus_written    <= gdb_bus_written    when c0_gdb_memaccess = '1' else GBA_Bus_written;
+   GBA_BusReadData   <= c0_bus_read_data;
+
+   gdb_bus_read_data <= c1_bus_read_data when gdb_select_c1 = '1' else c0_bus_read_data;
+   gdb_bus_read_done <= c1_bus_read_done when gdb_select_c1 = '1' else c0_bus_read_done;
+   gdb_mem_ready     <= c1_mem_ready     when gdb_select_c1 = '1' else c0_mem_ready;
+   gdb_ss_out        <= c1_ss_out        when gdb_select_c1 = '1' else c0_ss_out;
+   gdb_ss_done       <= c1_ss_done       when gdb_select_c1 = '1' else c0_ss_done;
+   dbg_reg_rd_data   <= c1_reg_rd_data   when gdb_select_c1 = '1' else c0_reg_rd_data;
+
+   dbg_keys_c0 <= ((KeyL & KeyR & KeyDown & KeyUp & KeyLeft & KeyRight & KeyStart & KeySelect & KeyB & KeyA) and not joy_ov_mask_c0)
+                  or (joy_ov_val_c0 and joy_ov_mask_c0);
+   c0_link_pins <= "0000" & c1_link_sd_in & c1_link_si_in & c1_so_level & c1_link_clk_in;
+
    igba_top : entity work.gba_top
    generic map
    (
@@ -622,7 +713,8 @@ begin
       strip_savestates         => strip_savestates        ,
       strip_cheats             => strip_cheats            ,
       ewram_in_sdram           => ewram_in_sdram          ,
-      turbosound               => turbosound
+      turbosound               => turbosound,
+      legacy_sim_ss_debug      => '0'
    )
    port map
    (
@@ -705,16 +797,16 @@ begin
       -- save memory used                           
       load_done             => load_done            ,
       -- Keys                                       
-      KeyA                  => KeyA                 ,
-      KeyB                  => KeyB                 ,
-      KeySelect             => KeySelect            ,
-      KeyStart              => KeyStart             ,
-      KeyRight              => KeyRight             ,
-      KeyLeft               => KeyLeft              ,
-      KeyUp                 => KeyUp                ,
-      KeyDown               => KeyDown              ,
-      KeyR                  => KeyR                 ,
-      KeyL                  => KeyL                 ,
+      KeyA                  => dbg_keys_c0(0),
+      KeyB                  => dbg_keys_c0(1),
+      KeySelect             => dbg_keys_c0(2),
+      KeyStart              => dbg_keys_c0(3),
+      KeyRight              => dbg_keys_c0(4),
+      KeyLeft               => dbg_keys_c0(5),
+      KeyUp                 => dbg_keys_c0(6),
+      KeyDown               => dbg_keys_c0(7),
+      KeyR                  => dbg_keys_c0(8),
+      KeyL                  => dbg_keys_c0(9),
       KeyPause              => KeyPause             ,
       -- link port
       link_enable           => link_enable          ,
@@ -729,12 +821,58 @@ begin
       link_sd_in            => c1_link_sd_in        ,
       debug_link_state      => c1_debug_link_state  ,
       -- debug interface
-      GBA_BusAddr           => GBA_BusAddr          ,
-      GBA_BusRnW            => GBA_BusRnW           ,
-      GBA_BusACC            => GBA_BusACC           ,
-      GBA_BusWriteData      => GBA_BusWriteData     ,
-      GBA_BusReadData       => GBA_BusReadData      ,
-      GBA_Bus_written       => GBA_Bus_written      ,
+      GBA_BusAddr           => c0_bus_addr,
+      GBA_BusRnW            => c0_bus_rnw,
+      GBA_BusACC            => c0_bus_acc,
+      GBA_BusWriteData      => c0_bus_write_data,
+      GBA_BusReadData       => c0_bus_read_data,
+      GBA_Bus_written       => c0_bus_written,
+      GBA_BusReadDone       => c0_bus_read_done,
+      gdb_memaccess         => c0_gdb_memaccess,
+      dbg_mem_ready         => c0_mem_ready,
+      ss_bus_gdb_req        => gdb_ss_req and not gdb_select_c1,
+      ss_bus_gdb_in         => gdb_ss_bus,
+      ss_wired_out_dbg      => c0_ss_out,
+      ss_wired_done_dbg     => c0_ss_done,
+      dbg_reg_wr            => dbg_reg_wr and not gdb_select_c1,
+      dbg_reg_idx           => dbg_reg_idx,
+      dbg_reg_data          => dbg_reg_data,
+      dbg_reg_rd_idx        => dbg_reg_rd_idx,
+      dbg_reg_rd_data       => c0_reg_rd_data,
+      dbg_hold              => dbg_hold,
+      dbg_step              => dbg_step,
+      dbg_stop_now          => dbg_stop_now,
+      dbg_ce                => c0_ce,
+      dbg_arch_pc           => c0_arch_pc,
+      dbg_fetch_instr_pc    => c0_fetch_instr_pc,
+      dbg_stall_instr_pc    => c0_stall_instr_pc,
+      dbg_decode_load       => c0_decode_load,
+      dbg_execute_stall     => c0_execute_stall,
+      dbg_decode_ready      => c0_decode_ready,
+      dbg_fetch_ready       => c0_fetch_ready,
+      dbg_decode_opcode     => c0_decode_opcode,
+      dbg_bus_state         => c0_bus_state,
+      dbg_thumbmode         => c0_thumbmode,
+      dbg_cpu_mode          => c0_cpu_mode,
+      dbg_cpu_done          => c0_cpu_done,
+      dbg_cpu_halt          => c0_cpu_halt,
+      dbg_cpu_bus_adr       => c0_cpu_bus_adr,
+      dbg_cpu_bus_ena       => c0_cpu_bus_ena,
+      dbg_cpu_bus_rnw       => c0_cpu_bus_rnw,
+      dbg_cpu_bus_acc       => c0_cpu_bus_acc,
+      dbg_cpu_bus_seq       => c0_cpu_bus_seq,
+      dbg_cpu_bus_code      => c0_cpu_bus_code,
+      dbg_dma_on            => c0_dma_on,
+      dbg_vblank            => c0_vblank,
+      dbg_hblank            => c0_hblank,
+      dbg_line_trigger      => c0_line_trigger,
+      dbg_dispstat          => c0_dispstat,
+      dbg_irq_if            => c0_irq_if,
+      dbg_irq_ie            => c0_irq_ie,
+      dbg_irq_ime           => c0_irq_ime,
+      dbg_cpu_irq           => c0_cpu_irq,
+      dbg_haltcnt           => c0_haltcnt,
+      dbg_mem_info          => c0_mem_info,
       -- display data                               
       pixel_out_x           => pixel_core_x         ,
       pixel_out_y           => pixel_core_y         ,
@@ -1053,21 +1191,36 @@ begin
       signal l2_sd            : std_logic := '1'; -- SD bus, both ends
       signal l2_si_c1         : std_logic := '1'; -- core 2 SO -> core 1 SI (cable crosses SO/SI)
       signal l2_si_c2         : std_logic := '1'; -- core 1 SO -> core 2 SI
-      constant zero_pbus      : std_logic_vector(proc_buswidth-1 downto 0) := (others => '0');
-      -- core 2's GPIO device (2P profile): same 6-wire bus memorymux_extern
-      -- exposes for core 1, driving a second gba_gpioRTCSolarGyro instance.
-      -- No savestate bus exists here (strip_savestates='1' whenever
-      -- second_core='1'), so the instance gets a benign zeroed bus instead
-      -- of gba_top2's stripped-open savestate_bus_ext -- matches
-      -- gba_savestates_stub's own tied-off default exactly.
+      signal dbg_keys_c1         : std_logic_vector(9 downto 0);
+      signal c2_savestate_bus    : proc_bus_gb_type;
+      constant zero_savestate_bus : proc_bus_gb_type :=
+         ((others => '0'), (others => '0'), '0', '0', "00", "0000", '0');
+      signal c2_gpio_savestate_bus : proc_bus_gb_type;
+      signal c2_ss_wired_out_ext : std_logic_vector(proc_buswidth-1 downto 0);
+      signal c2_ss_wired_done_ext : std_logic;
+      signal c2_ss_gpio_done     : std_logic;
+      signal c2_ss_eeprom_done   : std_logic;
+      -- GPIO is the only external device with savestate data on core 2.
       signal c2_GPIO_readEna  : std_logic;
       signal c2_GPIO_done     : std_logic;
       signal c2_GPIO_Din      : std_logic_vector(3 downto 0);
       signal c2_GPIO_Dout     : std_logic_vector(3 downto 0);
       signal c2_GPIO_writeEna : std_logic;
       signal c2_GPIO_addr     : std_logic_vector(1 downto 0);
-      constant zero_savestate_bus : proc_bus_gb_type := ((others => '0'), (others => '0'), '0', '0', "00", "0000", '0');
    begin
+      dbg_keys_c1 <= ((Key2L & Key2R & Key2Down & Key2Up & Key2Left & Key2Right & Key2Start & Key2Select & Key2B & Key2A) and not joy_ov_mask_c1)
+                     or (joy_ov_val_c1 and joy_ov_mask_c1);
+      c1_link_pins <= "0000" & c2_link_sd_in & c2_link_si_in & c2_so_level & c2_link_clk_in;
+
+      c2_gpio_savestate_bus <= zero_savestate_bus when strip_savestates = '1' else c2_savestate_bus;
+
+      -- RDSTATE reads the entire shared word map, including the vacant
+      -- EEPROM slot. The second cartridge channel has no EEPROM device.
+      iNoEepromState : entity work.eProcReg_gba
+      generic map (REG_SAVESTATE_EEPROM)
+      port map (clk1x, c2_gpio_savestate_bus, open, c2_ss_eeprom_done, (others => '0'), open);
+
+      c2_ss_wired_done_ext <= c2_ss_gpio_done or c2_ss_eeprom_done;
 
       igba_top2 : entity work.gba_top
       generic map
@@ -1081,7 +1234,8 @@ begin
          strip_savestates         => strip_savestates        ,
          strip_cheats             => strip_cheats            ,
          ewram_in_sdram           => ewram_in_sdram          ,
-         turbosound               => turbosound
+         turbosound               => turbosound,
+         legacy_sim_ss_debug      => '0'
       )
       port map
       (
@@ -1150,25 +1304,25 @@ begin
          SAVE_fifo_Din         => open,
          SAVE_fifo_Wr          => open,
          SAVE_fifo_NearFull    => '0',
-         savestate_bus_ext     => open,
-         ss_wired_out_ext      => zero_pbus,
-         ss_wired_done_ext     => '0',
+         savestate_bus_ext     => c2_savestate_bus,
+         ss_wired_out_ext      => c2_ss_wired_out_ext,
+         ss_wired_done_ext     => c2_ss_wired_done_ext,
          -- Write to BIOS: same download as core 1, BIOS is duplicated for now
          bios_wraddr           => bios_wraddr,
          bios_wrdata           => bios_wrdata,
          bios_wr               => bios_wr,
          load_done             => open,
          -- Keys: player 2
-         KeyA                  => Key2A,
-         KeyB                  => Key2B,
-         KeySelect             => Key2Select,
-         KeyStart              => Key2Start,
-         KeyRight              => Key2Right,
-         KeyLeft               => Key2Left,
-         KeyUp                 => Key2Up,
-         KeyDown               => Key2Down,
-         KeyR                  => Key2R,
-         KeyL                  => Key2L,
+         KeyA                  => dbg_keys_c1(0),
+         KeyB                  => dbg_keys_c1(1),
+         KeySelect             => dbg_keys_c1(2),
+         KeyStart              => dbg_keys_c1(3),
+         KeyRight              => dbg_keys_c1(4),
+         KeyLeft               => dbg_keys_c1(5),
+         KeyUp                 => dbg_keys_c1(6),
+         KeyDown               => dbg_keys_c1(7),
+         KeyR                  => dbg_keys_c1(8),
+         KeyL                  => dbg_keys_c1(9),
          KeyPause              => '0',
          -- link port: internal cable only; core 2 sits in the cable's 2P
          -- position (its SI hangs off core 1's SO), so per the real cable
@@ -1185,12 +1339,58 @@ begin
          link_sd_in            => c2_link_sd_in,
          debug_link_state      => c2_debug_link_state,
          -- debug interface
-         GBA_BusAddr           => 28x"0",
-         GBA_BusRnW            => '1',
-         GBA_BusACC            => "00",
-         GBA_BusWriteData      => 32x"0",
-         GBA_BusReadData       => open,
-         GBA_Bus_written       => '0',
+         GBA_BusAddr           => gdb_bus_addr,
+         GBA_BusRnW            => gdb_bus_rnw,
+         GBA_BusACC            => gdb_bus_acc,
+         GBA_BusWriteData      => gdb_bus_write_data,
+         GBA_BusReadData       => c1_bus_read_data,
+         GBA_Bus_written       => gdb_bus_written and c1_gdb_memaccess,
+         GBA_BusReadDone       => c1_bus_read_done,
+         gdb_memaccess         => c1_gdb_memaccess,
+         dbg_mem_ready         => c1_mem_ready,
+         ss_bus_gdb_req        => gdb_ss_req and gdb_select_c1,
+         ss_bus_gdb_in         => gdb_ss_bus,
+         ss_wired_out_dbg      => c1_ss_out,
+         ss_wired_done_dbg     => c1_ss_done,
+         dbg_reg_wr            => dbg_reg_wr and gdb_select_c1,
+         dbg_reg_idx           => dbg_reg_idx,
+         dbg_reg_data          => dbg_reg_data,
+         dbg_reg_rd_idx        => dbg_reg_rd_idx,
+         dbg_reg_rd_data       => c1_reg_rd_data,
+         dbg_hold              => dbg_hold,
+         dbg_step              => dbg_step,
+         dbg_stop_now          => dbg_stop_now,
+         dbg_ce                => c1_ce,
+         dbg_arch_pc           => c1_arch_pc,
+         dbg_fetch_instr_pc    => c1_fetch_instr_pc,
+         dbg_stall_instr_pc    => c1_stall_instr_pc,
+         dbg_decode_load       => c1_decode_load,
+         dbg_execute_stall     => c1_execute_stall,
+         dbg_decode_ready      => c1_decode_ready,
+         dbg_fetch_ready       => c1_fetch_ready,
+         dbg_decode_opcode     => c1_decode_opcode,
+         dbg_bus_state         => c1_bus_state,
+         dbg_thumbmode         => c1_thumbmode,
+         dbg_cpu_mode          => c1_cpu_mode,
+         dbg_cpu_done          => c1_cpu_done,
+         dbg_cpu_halt          => c1_cpu_halt,
+         dbg_cpu_bus_adr       => c1_cpu_bus_adr,
+         dbg_cpu_bus_ena       => c1_cpu_bus_ena,
+         dbg_cpu_bus_rnw       => c1_cpu_bus_rnw,
+         dbg_cpu_bus_acc       => c1_cpu_bus_acc,
+         dbg_cpu_bus_seq       => c1_cpu_bus_seq,
+         dbg_cpu_bus_code      => c1_cpu_bus_code,
+         dbg_dma_on            => c1_dma_on,
+         dbg_vblank            => c1_vblank,
+         dbg_hblank            => c1_hblank,
+         dbg_line_trigger      => c1_line_trigger,
+         dbg_dispstat          => c1_dispstat,
+         dbg_irq_if            => c1_irq_if,
+         dbg_irq_ie            => c1_irq_ie,
+         dbg_irq_ime           => c1_irq_ime,
+         dbg_cpu_irq           => c1_cpu_irq,
+         dbg_haltcnt           => c1_haltcnt,
+         dbg_mem_info          => c1_mem_info,
          -- display data: composed onto the right half of the shared screen
          pixel_out_x           => c2_pixel_x,
          pixel_out_y           => c2_pixel_y,
@@ -1312,9 +1512,9 @@ begin
          GBA_on               => GBA_on,
          rtc_noselect_quirk   => rtc_noselect_quirk2,
 
-         savestate_bus        => zero_savestate_bus,
-         ss_wired_out         => open,
-         ss_wired_done        => open,
+         savestate_bus        => c2_gpio_savestate_bus,
+         ss_wired_out         => c2_ss_wired_out_ext,
+         ss_wired_done        => c2_ss_gpio_done,
 
          GPIO_readEna         => c2_GPIO_readEna,
          GPIO_done            => c2_GPIO_done,
@@ -1443,6 +1643,46 @@ begin
       c1_link_clk_in <= wl_sc_line when (link_wireless = '1') else link_clk_in;
       c1_link_si_in  <= wl_si_c1   when (link_wireless = '1') else link_si_in;
       c1_link_sd_in  <= '1'        when (link_wireless = '1') else link_sd_in;
+
+      c1_bus_read_data <= (others => '0');
+      c1_bus_read_done <= '0';
+      c1_mem_ready     <= '1';
+      c1_ss_out        <= (others => '0');
+      c1_ss_done       <= '0';
+      c1_reg_rd_data   <= (others => '0');
+      c1_ce            <= '0';
+      c1_arch_pc       <= (others => '0');
+      c1_fetch_instr_pc <= (others => '0');
+      c1_stall_instr_pc <= (others => '0');
+      c1_decode_load   <= '0';
+      c1_execute_stall <= '0';
+      c1_decode_ready  <= '0';
+      c1_fetch_ready   <= '0';
+      c1_decode_opcode <= (others => '0');
+      c1_bus_state     <= (others => '0');
+      c1_thumbmode     <= '0';
+      c1_cpu_mode      <= (others => '0');
+      c1_cpu_done      <= '0';
+      c1_cpu_halt      <= '0';
+      c1_cpu_bus_adr   <= (others => '0');
+      c1_cpu_bus_ena   <= '0';
+      c1_cpu_bus_rnw   <= '0';
+      c1_cpu_bus_acc   <= (others => '0');
+      c1_cpu_bus_seq   <= '0';
+      c1_cpu_bus_code  <= '0';
+      c1_dma_on        <= '0';
+      c1_vblank        <= '0';
+      c1_hblank        <= '0';
+      c1_line_trigger  <= '0';
+      c1_dispstat      <= (others => '0');
+      c1_irq_if        <= (others => '0');
+      c1_irq_ie        <= (others => '0');
+      c1_irq_ime       <= '0';
+      c1_cpu_irq       <= '0';
+      c1_haltcnt       <= (others => '0');
+      c1_mem_info      <= (others => '0');
+      c1_link_pins     <= (others => '0');
+      c2_debug_link_state <= (others => '0');
 
       ew2_active    <= '0';
       ew2_busy      <= '0';
@@ -1818,83 +2058,100 @@ begin
    c2_multitext <= x"32" & x"3A" & c2_ch_M23 & c2_ch_M22 & c2_ch_M21 & c2_ch_M20 & x"20" &
                    x"33" & x"3A" & c2_ch_M33 & c2_ch_M32 & c2_ch_M31 & c2_ch_M30;
 
-   ioverlayLink1 : entity work.overlay generic map (30, 2, 20, 15x"03E0", 15x"0000")
-   port map
-   (
-      clk                    => clk1x,
-      ce                     => '1',
-      ena                    => linkdebugEna,
-      i_pixel_out_x          => pixel_out_x,
-      i_pixel_out_y          => pixel_out_y,
-      o_pixel_out_data       => overlay_link1_data,
-      o_pixel_out_ena        => overlay_link1_ena,
-      textstring             => c1_linktext
-   );
+   gLinkDebugOverlays : if second_core = '0' generate
+      ioverlayLink1 : entity work.overlay generic map (30, 2, 20, 15x"03E0", 15x"0000")
+      port map
+      (
+         clk                    => clk1x,
+         ce                     => '1',
+         ena                    => linkdebugEna,
+         i_pixel_out_x          => pixel_out_x,
+         i_pixel_out_y          => pixel_out_y,
+         o_pixel_out_data       => overlay_link1_data,
+         o_pixel_out_ena        => overlay_link1_ena,
+         textstring             => c1_linktext
+      );
 
-   ioverlayLinkData1 : entity work.overlay generic map (13, 2, 40, 15x"03E0", 15x"0000")
-   port map
-   (
-      clk                    => clk1x,
-      ce                     => '1',
-      ena                    => linkdebugEna,
-      i_pixel_out_x          => pixel_out_x,
-      i_pixel_out_y          => pixel_out_y,
-      o_pixel_out_data       => overlay_data1_data,
-      o_pixel_out_ena        => overlay_data1_ena,
-      textstring             => c1_datatext
-   );
+      ioverlayLinkData1 : entity work.overlay generic map (13, 2, 40, 15x"03E0", 15x"0000")
+      port map
+      (
+         clk                    => clk1x,
+         ce                     => '1',
+         ena                    => linkdebugEna,
+         i_pixel_out_x          => pixel_out_x,
+         i_pixel_out_y          => pixel_out_y,
+         o_pixel_out_data       => overlay_data1_data,
+         o_pixel_out_ena        => overlay_data1_ena,
+         textstring             => c1_datatext
+      );
 
-   ioverlayMulti1 : entity work.overlay generic map (13, 2, 60, 15x"03E0", 15x"0000")
-   port map
-   (
-      clk                    => clk1x,
-      ce                     => '1',
-      ena                    => linkdebugEna,
-      i_pixel_out_x          => pixel_out_x,
-      i_pixel_out_y          => pixel_out_y,
-      o_pixel_out_data       => overlay_multi1_data,
-      o_pixel_out_ena        => overlay_multi1_ena,
-      textstring             => c1_multitext
-   );
+      ioverlayMulti1 : entity work.overlay generic map (13, 2, 60, 15x"03E0", 15x"0000")
+      port map
+      (
+         clk                    => clk1x,
+         ce                     => '1',
+         ena                    => linkdebugEna,
+         i_pixel_out_x          => pixel_out_x,
+         i_pixel_out_y          => pixel_out_y,
+         o_pixel_out_data       => overlay_multi1_data,
+         o_pixel_out_ena        => overlay_multi1_ena,
+         textstring             => c1_multitext
+      );
 
-   ioverlayLink2 : entity work.overlay generic map (30, 2, 80, 15x"7FE0", 15x"0000")
-   port map
-   (
-      clk                    => clk1x,
-      ce                     => '1',
-      ena                    => linkdebugEna_c2,
-      i_pixel_out_x          => pixel_out_x,
-      i_pixel_out_y          => pixel_out_y,
-      o_pixel_out_data       => overlay_link2_data,
-      o_pixel_out_ena        => overlay_link2_ena,
-      textstring             => c2_linktext
-   );
+      ioverlayLink2 : entity work.overlay generic map (30, 2, 80, 15x"7FE0", 15x"0000")
+      port map
+      (
+         clk                    => clk1x,
+         ce                     => '1',
+         ena                    => linkdebugEna_c2,
+         i_pixel_out_x          => pixel_out_x,
+         i_pixel_out_y          => pixel_out_y,
+         o_pixel_out_data       => overlay_link2_data,
+         o_pixel_out_ena        => overlay_link2_ena,
+         textstring             => c2_linktext
+      );
 
-   ioverlayLinkData2 : entity work.overlay generic map (13, 2, 100, 15x"7FE0", 15x"0000")
-   port map
-   (
-      clk                    => clk1x,
-      ce                     => '1',
-      ena                    => linkdebugEna_c2,
-      i_pixel_out_x          => pixel_out_x,
-      i_pixel_out_y          => pixel_out_y,
-      o_pixel_out_data       => overlay_data2_data,
-      o_pixel_out_ena        => overlay_data2_ena,
-      textstring             => c2_datatext
-   );
+      ioverlayLinkData2 : entity work.overlay generic map (13, 2, 100, 15x"7FE0", 15x"0000")
+      port map
+      (
+         clk                    => clk1x,
+         ce                     => '1',
+         ena                    => linkdebugEna_c2,
+         i_pixel_out_x          => pixel_out_x,
+         i_pixel_out_y          => pixel_out_y,
+         o_pixel_out_data       => overlay_data2_data,
+         o_pixel_out_ena        => overlay_data2_ena,
+         textstring             => c2_datatext
+      );
 
-   ioverlayMulti2 : entity work.overlay generic map (13, 2, 120, 15x"7FE0", 15x"0000")
-   port map
-   (
-      clk                    => clk1x,
-      ce                     => '1',
-      ena                    => linkdebugEna_c2,
-      i_pixel_out_x          => pixel_out_x,
-      i_pixel_out_y          => pixel_out_y,
-      o_pixel_out_data       => overlay_multi2_data,
-      o_pixel_out_ena        => overlay_multi2_ena,
-      textstring             => c2_multitext
-   );
+      ioverlayMulti2 : entity work.overlay generic map (13, 2, 120, 15x"7FE0", 15x"0000")
+      port map
+      (
+         clk                    => clk1x,
+         ce                     => '1',
+         ena                    => linkdebugEna_c2,
+         i_pixel_out_x          => pixel_out_x,
+         i_pixel_out_y          => pixel_out_y,
+         o_pixel_out_data       => overlay_multi2_data,
+         o_pixel_out_ena        => overlay_multi2_ena,
+         textstring             => c2_multitext
+      );
+   end generate;
+
+   gNoLinkDebugOverlays : if second_core = '1' generate
+      overlay_link1_ena  <= '0';
+      overlay_link1_data <= (others => '0');
+      overlay_data1_ena  <= '0';
+      overlay_data1_data <= (others => '0');
+      overlay_multi1_ena <= '0';
+      overlay_multi1_data <= (others => '0');
+      overlay_link2_ena  <= '0';
+      overlay_link2_data <= (others => '0');
+      overlay_data2_ena  <= '0';
+      overlay_data2_data <= (others => '0');
+      overlay_multi2_ena <= '0';
+      overlay_multi2_data <= (others => '0');
+   end generate;
 
    pixel_out_x    <= pixel_shade_x;
    pixel_out_y    <= pixel_shade_y;
@@ -1967,6 +2224,129 @@ begin
    gpufifo_Din    <= gpufifo_Frame & gpufifo_row & gpufifo_col & '0' & pixel_out_data;
    gpufifo_Wr     <= pixel_out_we;
    
+   igba_gdb : entity work.gba_gdb
+   generic map
+   (
+      BP_COUNT         => gdb_slot_count(8, 2, second_core),
+      WP_COUNT         => gdb_slot_count(4, 1, second_core),
+      DUAL_CORE        => second_core,
+      HAS_DIRECT_REGRD => '1'
+   )
+   port map
+   (
+      clk1x            => clk1x,
+      reset            => not GBA_on,
+      gdb_enable       => gdb_enable,
+
+      ddr3_request     => rdram_request(DDR3MUX_GDB),
+      ddr3_rnw         => rdram_rnw(DDR3MUX_GDB),
+      ddr3_address     => rdram_address(DDR3MUX_GDB),
+      ddr3_burstcount  => rdram_burstcount(DDR3MUX_GDB),
+      ddr3_writeMask   => rdram_writeMask(DDR3MUX_GDB),
+      ddr3_dataWrite   => rdram_dataWrite(DDR3MUX_GDB),
+      ddr3_granted     => rdram_granted(DDR3MUX_GDB),
+      ddr3_done        => rdram_done(DDR3MUX_GDB),
+      ddr3_dataRead    => rdram_dataRead,
+
+      ss_bus_out       => gdb_ss_bus,
+      ss_bus_req       => gdb_ss_req,
+      ss_wired_out     => gdb_ss_out,
+      ss_wired_done    => gdb_ss_done,
+      GBA_BusAddr      => gdb_bus_addr,
+      GBA_BusRnW       => gdb_bus_rnw,
+      GBA_BusACC       => gdb_bus_acc,
+      GBA_BusWriteData => gdb_bus_write_data,
+      GBA_Bus_written  => gdb_bus_written,
+      GBA_BusReadData  => gdb_bus_read_data,
+      GBA_BusReadDone  => gdb_bus_read_done,
+      gdb_memaccess    => gdb_memaccess,
+      mem_dbg_ready    => gdb_mem_ready,
+      dbg_reg_wr       => dbg_reg_wr,
+      dbg_reg_idx      => dbg_reg_idx,
+      dbg_reg_data     => dbg_reg_data,
+      dbg_reg_rd_idx   => dbg_reg_rd_idx,
+      dbg_reg_rd_data  => dbg_reg_rd_data,
+      dbg_hold         => dbg_hold,
+      dbg_step         => dbg_step,
+      dbg_stop_now     => dbg_stop_now,
+      dbg_reset_req    => dbg_reset_req,
+      gdb_halted       => gdb_halted,
+      active_core_out  => active_core_out,
+      joy_ov_mask_c0   => joy_ov_mask_c0,
+      joy_ov_val_c0    => joy_ov_val_c0,
+      joy_ov_mask_c1   => joy_ov_mask_c1,
+      joy_ov_val_c1    => joy_ov_val_c1,
+
+      c0_ce             => c0_ce,
+      c0_arch_pc        => c0_arch_pc,
+      c0_fetch_instr_pc => c0_fetch_instr_pc,
+      c0_stall_instr_pc => c0_stall_instr_pc,
+      c0_decode_load    => c0_decode_load,
+      c0_execute_stall  => c0_execute_stall,
+      c0_decode_ready   => c0_decode_ready,
+      c0_fetch_ready    => c0_fetch_ready,
+      c0_decode_opcode  => c0_decode_opcode,
+      c0_bus_state      => c0_bus_state,
+      c0_thumbmode      => c0_thumbmode,
+      c0_cpu_mode       => c0_cpu_mode,
+      c0_cpu_done       => c0_cpu_done,
+      c0_cpu_halt       => c0_cpu_halt,
+      c0_cpu_bus_adr    => c0_cpu_bus_adr,
+      c0_cpu_bus_ena    => c0_cpu_bus_ena,
+      c0_cpu_bus_rnw    => c0_cpu_bus_rnw,
+      c0_cpu_bus_acc    => c0_cpu_bus_acc,
+      c0_cpu_bus_seq    => c0_cpu_bus_seq,
+      c0_cpu_bus_code   => c0_cpu_bus_code,
+      c0_dma_on         => c0_dma_on,
+      c0_vblank         => c0_vblank,
+      c0_hblank         => c0_hblank,
+      c0_line_trigger   => c0_line_trigger,
+      c0_dispstat       => c0_dispstat,
+      c0_irq_if         => c0_irq_if,
+      c0_irq_ie         => c0_irq_ie,
+      c0_irq_ime        => c0_irq_ime,
+      c0_cpu_irq        => c0_cpu_irq,
+      c0_haltcnt        => c0_haltcnt,
+      c0_mem_info       => c0_mem_info,
+      c0_link_state     => c1_debug_link_state,
+      c0_link_pins      => c0_link_pins,
+
+      c1_ce             => c1_ce,
+      c1_arch_pc        => c1_arch_pc,
+      c1_fetch_instr_pc => c1_fetch_instr_pc,
+      c1_stall_instr_pc => c1_stall_instr_pc,
+      c1_decode_load    => c1_decode_load,
+      c1_execute_stall  => c1_execute_stall,
+      c1_decode_ready   => c1_decode_ready,
+      c1_fetch_ready    => c1_fetch_ready,
+      c1_decode_opcode  => c1_decode_opcode,
+      c1_bus_state      => c1_bus_state,
+      c1_thumbmode      => c1_thumbmode,
+      c1_cpu_mode       => c1_cpu_mode,
+      c1_cpu_done       => c1_cpu_done,
+      c1_cpu_halt       => c1_cpu_halt,
+      c1_cpu_bus_adr    => c1_cpu_bus_adr,
+      c1_cpu_bus_ena    => c1_cpu_bus_ena,
+      c1_cpu_bus_rnw    => c1_cpu_bus_rnw,
+      c1_cpu_bus_acc    => c1_cpu_bus_acc,
+      c1_cpu_bus_seq    => c1_cpu_bus_seq,
+      c1_cpu_bus_code   => c1_cpu_bus_code,
+      c1_dma_on         => c1_dma_on,
+      c1_vblank         => c1_vblank,
+      c1_hblank         => c1_hblank,
+      c1_line_trigger   => c1_line_trigger,
+      c1_dispstat       => c1_dispstat,
+      c1_irq_if         => c1_irq_if,
+      c1_irq_ie         => c1_irq_ie,
+      c1_irq_ime        => c1_irq_ime,
+      c1_cpu_irq        => c1_cpu_irq,
+      c1_haltcnt        => c1_haltcnt,
+      c1_mem_info       => c1_mem_info,
+      c1_link_state     => c2_debug_link_state,
+      c1_link_pins      => c1_link_pins,
+      wireless_debug_state => wl_debug_state
+   );
+
    iDDR3Mux : entity work.DDR3Mux
    generic map
    (
@@ -2036,13 +2416,13 @@ begin
       if (rising_edge(clk1x)) then
 
          GBA_on1X_1 <= '0';
-         if (GBA_on = '1' and core1_power = '1' and core1_reset = '0' and
+         if (GBA_on = '1' and dbg_reset_req = '0' and core1_power = '1' and core1_reset = '0' and
              (ROMCOPYSTATE = ROMCOPY_IDLE or romcopy_target_core2 = '1')) then
             GBA_on1X_1 <= '1';
          end if;
 
          GBA_on1X_2 <= '0';
-         if (GBA_on = '1' and core2_power = '1' and core2_reset = '0' and
+         if (GBA_on = '1' and dbg_reset_req = '0' and core2_power = '1' and core2_reset = '0' and
              (ROMCOPYSTATE = ROMCOPY_IDLE or (rom_shared = '0' and romcopy_target_core2 = '0'))) then
             GBA_on1X_2 <= '1';
          end if;
@@ -2196,7 +2576,9 @@ begin
       hps_tx_valid => wl_uart_txv,
       hps_tx_ready => wl_uart_txr,
       hps_rx_data  => wl_uart_rxd,
-      hps_rx_valid => wl_uart_rxv
+      hps_rx_valid => wl_uart_rxv,
+      debug_state  => wl_debug_state,
+      dbg_freeze   => dbg_hold and not c0_ce
    );
 
    igba_wireless_uart : entity work.gba_wireless_uart

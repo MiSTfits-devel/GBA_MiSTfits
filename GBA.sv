@@ -337,6 +337,7 @@ parameter CONF_STR = {
    "D5P3O[5],Pause when OSD is open,Off,On;",
    "P3O[50],Error Overlay,Off,On;",
 	"H9P3O[14],Link Debug Overlay,Off,On;",
+	"P3O[69],GDB Stub,Off,On;",
    "P3-;",
 	"P3-,Only Romhacks or Crash!;",
 	"P3O[40],GPIO HACK(RTC+Rumble),Off,On;",
@@ -452,7 +453,8 @@ wire [15:0] joystick_analog_0;
 
 wire [32:0] RTC_time;
 
-wire [63:0] status_in = cart_download ? {status[63:39],ss_slot,status[36:19],3'b000,status[15:0]} : {status[63:39],ss_slot,status[36:19],2'b00,status[16:0]};
+wire [127:0] status_in = {status[127:64], status[63:39], ss_slot, status[36:19],
+                          2'b00, (status[16] & ~cart_download), status[15:0]};
 
 hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 (
@@ -833,6 +835,8 @@ gba
 	.clk3x(CLK_VIDEO),
 	.clk6x(clk_6x),
 	.GBA_on(gba_on),  // switching from off to on = reset
+	.gdb_enable(status[69]),
+	.gdb_halted(),
    .pause(pause),
    .inPause(inPause),
 	// Both speed controls are vestigial since the accuracy rewrite: the core is

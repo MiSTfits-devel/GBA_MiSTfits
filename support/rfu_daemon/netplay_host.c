@@ -40,6 +40,7 @@
 #define NETPLAY_HOST_CORE_VERSION "v1.1.0-8d268a6"
 
 #define RXBUF_MAX 4096
+#define TXBUF_MAX 8192
 
 enum client_state {
     CS_FREE = 0,
@@ -56,6 +57,8 @@ struct client {
     char     nick[NETPLAY_NICK_LEN + 1];
     uint8_t  rx[RXBUF_MAX];
     size_t   rxlen;
+    uint8_t  tx[TXBUF_MAX];
+    size_t   txoff, txlen; // [txoff, txlen) has not been written
 };
 
 static int listen_fd = -1;
@@ -69,38 +72,68 @@ static int     have_last_rx;
 
 // ---- small helpers ----
 
-static void set_nonblock(int fd)
+static int set_nonblock(int fd)
 {
     int fl = fcntl(fd, F_GETFL, 0);
-    if (fl >= 0) fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    return fl < 0 ? -1 : fcntl(fd, F_SETFL, fl | O_NONBLOCK);
 }
 
-// Blocking-ish send: the handshake messages are tiny, and a short write on a
-// fresh socket is vanishingly rare, but loop anyway so we never truncate a
-// command mid-header.
-static int send_all(int fd, const void *buf, size_t len)
+// Reserve a whole frame before enqueueing any byte. Compact only when the
+// remaining space at the end isn't enough for this frame.
+static uint8_t *queue_space(struct client *c, size_t len)
 {
-    const uint8_t *p = buf;
-    size_t sent = 0;
-    while (sent < len) {
-        ssize_t n = send(fd, p + sent, len - sent, 0);
-        if (n > 0) { sent += (size_t)n; continue; }
-        if (n < 0 && (errno == EINTR)) continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            usleep(1000);
-            continue;
-        }
-        return -1;
+    size_t pending = c->txlen - c->txoff;
+    if (len > sizeof(c->tx) - pending)
+        return NULL;
+    if (len > sizeof(c->tx) - c->txlen) {
+        memmove(c->tx, c->tx + c->txoff, pending);
+        c->txoff = 0;
+        c->txlen = pending;
     }
+    uint8_t *p = c->tx + c->txlen;
+    c->txlen += len;
+    return p;
+}
+
+static int queue_tx(struct client *c, const void *buf, size_t len)
+{
+    uint8_t *p = queue_space(c, len);
+    if (!p)
+        return -1;
+    memcpy(p, buf, len);
     return 0;
 }
 
-static void drop_client(struct client *c)
+static int flush_tx(struct client *c)
 {
-    if (c->fd >= 0) close(c->fd);
-    c->fd    = -1;
+    const int flags =
+#ifdef MSG_NOSIGNAL
+        MSG_NOSIGNAL;
+#else
+        0;
+#endif
+    ssize_t n = send(c->fd, c->tx + c->txoff, c->txlen - c->txoff, flags);
+    if (n > 0) {
+        c->txoff += (size_t)n;
+        if (c->txoff == c->txlen)
+            c->txoff = c->txlen = 0;
+        return 0;
+    }
+    return n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) ? 0 : -1;
+}
+
+static void drop_client(int peer)
+{
+    struct client *c = &clients[peer];
+    if (c->state == CS_FREE)
+        return;
+    int playing = c->state == CS_PLAYING;
+    close(c->fd);
+    c->fd = -1;
     c->state = CS_FREE;
-    c->rxlen = 0;
+    c->rxlen = c->txoff = c->txlen = 0;
+    if (playing)
+        rfu_core_peer_disconnected(RFU_NET_NETPLAY_BASE + peer);
 }
 
 // ---- handshake pieces ----
@@ -134,7 +167,7 @@ static int send_header(struct client *c, uint32_t protocol)
     hdr[4] = htonl(protocol);
     hdr[5] = htonl(nph_impl_magic(NETPLAY_TARGET_VERSION,
                                   HIGH_NETPLAY_PROTOCOL_VERSION));
-    return send_all(c->fd, hdr, sizeof(hdr));
+    return queue_tx(c, hdr, sizeof(hdr));
 }
 
 static int send_nick(struct client *c)
@@ -144,7 +177,7 @@ static int send_nick(struct client *c)
     m.cmd[0] = htonl(NETPLAY_CMD_NICK);
     m.cmd[1] = htonl(NETPLAY_NICK_LEN);
     snprintf(m.nick, sizeof(m.nick), "%s", NETPLAY_HOST_NICK);
-    return send_all(c->fd, &m, sizeof(m));
+    return queue_tx(c, &m, sizeof(m));
 }
 
 static int send_info(struct client *c)
@@ -161,7 +194,7 @@ static int send_info(struct client *c)
     m.content_crc = htonl(0);
     snprintf(m.core_name,    sizeof(m.core_name),    "%s", NETPLAY_HOST_CORE_NAME);
     snprintf(m.core_version, sizeof(m.core_version), "%s", NETPLAY_HOST_CORE_VERSION);
-    return send_all(c->fd, &m, sizeof(m));
+    return queue_tx(c, &m, sizeof(m));
 }
 
 static int send_sync(struct client *c, int peer)
@@ -184,7 +217,7 @@ static int send_sync(struct client *c, int peer)
     // client_num is 1-based on the netplay wire; peer is our 0-based index.
     m.paused_and_client_num = htonl((uint32_t)(peer + 1));
     snprintf(m.nick, sizeof(m.nick), "%s", NETPLAY_HOST_NICK);
-    return send_all(c->fd, &m, sizeof(m));
+    return queue_tx(c, &m, sizeof(m));
 }
 
 // ---- netpacket relay ----
@@ -289,6 +322,7 @@ static int consume(struct client *c, int peer)
 
         if (cmd == NETPLAY_CMD_NETPACKET) {
             // payload = {u32 client_id}{bytes}; size counts only the bytes.
+            if (size > RXBUF_MAX - 12) return -1;
             if (c->rxlen < 8 + 4 + size) return 0;
             // pkt_client_id designates the RECIPIENT (0 or broadcast = host).
             uint32_t pkt_client_id = nph_get32(c->rx + 8);
@@ -297,6 +331,7 @@ static int consume(struct client *c, int peer)
             if (pkt_client_id == NETPLAY_NETPACKET_BROADCAST ||
                 pkt_client_id == 0) {
                 deliver_to_rfu(peer, body, size);
+                if (c->state == CS_FREE) return -1; // RFU reply overflowed this peer's TX
             }
             if (pkt_client_id == NETPLAY_NETPACKET_BROADCAST) {
                 // relay to every other playing client
@@ -331,6 +366,7 @@ int netplay_host_open(int port)
         clients[i].fd = -1;
         clients[i].state = CS_FREE;
         clients[i].rxlen = 0;
+        clients[i].txoff = clients[i].txlen = 0;
     }
     have_last_rx = 0;
     last_rx_peer = -1;
@@ -350,7 +386,9 @@ int netplay_host_open(int port)
     if (listen(listen_fd, 4) < 0) {
         close(listen_fd); listen_fd = -1; return -3;
     }
-    set_nonblock(listen_fd);
+    if (set_nonblock(listen_fd) < 0) {
+        close(listen_fd); listen_fd = -1; return -3;
+    }
 
     socklen_t sl = sizeof(sa);
     if (getsockname(listen_fd, (struct sockaddr *)&sa, &sl) < 0) {
@@ -362,55 +400,78 @@ int netplay_host_open(int port)
 void netplay_host_close(void)
 {
     for (int i = 0; i < NETPLAY_HOST_MAX_CLIENTS; i++)
-        if (clients[i].fd >= 0) drop_client(&clients[i]);
+        drop_client(i);
     if (listen_fd >= 0) close(listen_fd);
     listen_fd = -1;
 }
 
-void netplay_host_poll(void)
+static void accept_client(void)
 {
-    if (listen_fd < 0) return;
-
-    // accept
-    for (;;) {
-        int fd = accept(listen_fd, NULL, NULL);
-        if (fd < 0) break;
-        int slot = -1;
-        for (int i = 0; i < NETPLAY_HOST_MAX_CLIENTS; i++)
-            if (clients[i].state == CS_FREE) { slot = i; break; }
-        if (slot < 0) { close(fd); continue; }
-        int one = 1;
-        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        set_nonblock(fd);
-        clients[slot].fd    = fd;
-        clients[slot].state = CS_HEADER;
-        clients[slot].rxlen = 0;
-        clients[slot].nick[0] = 0;
-    }
-
-    // service
+    int fd = accept(listen_fd, NULL, NULL);
+    if (fd < 0) return;
     for (int i = 0; i < NETPLAY_HOST_MAX_CLIENTS; i++) {
         struct client *c = &clients[i];
-        if (c->state == CS_FREE) continue;
-        for (;;) {
-            if (c->rxlen >= sizeof(c->rx)) { drop_client(c); break; }
-            ssize_t n = recv(c->fd, c->rx + c->rxlen,
-                             sizeof(c->rx) - c->rxlen, 0);
-            if (n > 0) {
-                c->rxlen += (size_t)n;
-                if (consume(c, i) < 0) { drop_client(c); break; }
-                continue;
+        if (c->state != CS_FREE) continue;
+        int one = 1;
+        setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#ifdef SO_NOSIGPIPE
+        if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one)) < 0)
+            break;
+#endif
+        if (set_nonblock(fd) < 0)
+            break;
+        c->fd = fd;
+        c->state = CS_HEADER;
+        c->nick[0] = 0;
+        return;
+    }
+    close(fd);
+}
+
+void netplay_host_poll(const struct pollfd *fds, int count)
+{
+    int incoming = 0;
+    for (int i = 0; i < count; i++) {
+        short events = fds[i].revents;
+        if (!events) continue;
+        if (fds[i].fd == listen_fd) {
+            incoming = events & POLLIN;
+            continue;
+        }
+        for (int peer = 0; peer < NETPLAY_HOST_MAX_CLIENTS; peer++) {
+            struct client *c = &clients[peer];
+            if (c->fd != fds[i].fd || c->state == CS_FREE) continue;
+            if (events & (POLLERR | POLLNVAL)) {
+                drop_client(peer);
+                break;
             }
-            if (n == 0) { drop_client(c); break; }
-            if (errno == EINTR) continue;
-            break;  // EAGAIN
+            if (events & (POLLIN | POLLHUP)) {
+                // One bounded receive per peer per pass, even when a
+                // continually readable client floods the socket.
+                ssize_t n = recv(c->fd, c->rx + c->rxlen, sizeof(c->rx) - c->rxlen, 0);
+                if (n > 0) {
+                    c->rxlen += (size_t)n;
+                    if (consume(c, peer) < 0 || c->rxlen == sizeof(c->rx))
+                        drop_client(peer);
+                } else if (n == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+                    drop_client(peer);
+                }
+            }
+            if (c->state != CS_FREE && (events & POLLOUT) && c->txlen && flush_tx(c) < 0)
+                drop_client(peer);
+            break;
         }
     }
+    // Accept last so an fd closed during this pass can't inherit its events.
+    if (incoming)
+        accept_client();
 }
 
 void netplay_host_send(int peer, const void *buf, size_t len)
 {
     uint32_t cmd[3];
+    if (len > RXBUF_MAX - sizeof(cmd))
+        return;
     cmd[0] = htonl(NETPLAY_CMD_NETPACKET);
     cmd[1] = htonl((uint32_t)len);
     // Host -> client: the field carries the SOURCE id, and 0 means the host.
@@ -419,9 +480,15 @@ void netplay_host_send(int peer, const void *buf, size_t len)
     for (int i = 0; i < NETPLAY_HOST_MAX_CLIENTS; i++) {
         if (peer >= 0 && i != peer) continue;
         if (clients[i].state != CS_PLAYING) continue;
-        if (send_all(clients[i].fd, cmd, sizeof(cmd)) < 0 ||
-            (len && send_all(clients[i].fd, buf, len) < 0))
-            drop_client(&clients[i]);
+        uint8_t *p = queue_space(&clients[i], sizeof(cmd) + len);
+        if (!p) {
+            rfu_log("netplay: peer %d TX queue full; disconnecting\n", i);
+            drop_client(i);
+            continue;
+        }
+        memcpy(p, cmd, sizeof(cmd));
+        if (len)
+            memcpy(p + sizeof(cmd), buf, len);
     }
 }
 
@@ -439,14 +506,15 @@ const char *netplay_host_client_name(int peer)
     return clients[peer].nick;
 }
 
-int netplay_host_pollfds(int *fds, int max)
+int netplay_host_pollfds(struct pollfd *fds, int max)
 {
     int n = 0;
-    if (!fds || max <= 0) return 0;
-    if (listen_fd >= 0 && n < max) fds[n++] = listen_fd;
+    if (!fds || max <= 0 || listen_fd < 0) return 0;
+    fds[n++] = (struct pollfd){ .fd = listen_fd, .events = POLLIN };
     for (int i = 0; i < NETPLAY_HOST_MAX_CLIENTS && n < max; i++)
-        if (clients[i].state != CS_FREE && clients[i].fd >= 0)
-            fds[n++] = clients[i].fd;
+        if (clients[i].state != CS_FREE)
+            fds[n++] = (struct pollfd){ .fd = clients[i].fd,
+                .events = POLLIN | (clients[i].txlen ? POLLOUT : 0) };
     return n;
 }
 

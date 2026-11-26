@@ -4,4 +4,7 @@
 
 source GBA.qsf
 
+# Keep the proven fitter seed for the 2P profile (GBA.qsf picks a different one).
+set_global_assignment -name SEED 0
+
 set_global_assignment -name VERILOG_MACRO "GBA2P_LITE=1"

@@ -123,7 +123,13 @@ entity gba_memorymux is
       PALETTE_OAM_datain   : out    std_logic_vector(31 downto 0);
       PALETTE_OAM_dataout  : in     std_logic_vector(31 downto 0);
       PALETTE_OAM_we       : out    std_logic_vector(3 downto 0);
-      PALETTE_OAM_re       : out    std_logic_vector(3 downto 0)
+      PALETTE_OAM_re       : out    std_logic_vector(3 downto 0);
+
+      dbg_frozen           : in     std_logic := '0';
+      gdb_memaccess        : in     std_logic := '0';
+      dbg_cancel_bus       : in     std_logic := '0';
+      dbg_mem_ready        : out    std_logic;
+      dbg_mem_info         : out    std_logic_vector(31 downto 0)
    );
 end entity;
 
@@ -196,6 +202,9 @@ architecture arch of gba_memorymux is
    signal cart_readback_muxed     : std_logic_vector(31 downto 0) := (others => '0');
                                
    signal cart_nowait             : std_logic := '0';
+   signal cart_done_held          : std_logic := '0';
+   signal ewram_done_held         : std_logic := '0';
+   signal ewram_readback          : std_logic_vector(31 downto 0) := (others => '0');
                                
    signal rotate_writedata        : std_logic_vector(31 downto 0);
    signal rotate_BE               : std_logic_vector(3 downto 0);   
@@ -230,6 +239,32 @@ architecture arch of gba_memorymux is
    signal prefetch_capacity       : integer range 4 to 8 := 4;
    signal prefetch_width          : integer range 2 to 4 := 2;
    signal prefetch_stopDelay      : integer range 0 to 1;
+
+   -- State of the paused CPU/DMA request while GDB owns the bus.
+   signal dbg_cycle_frozen        : boolean;
+   signal gdb_memaccess_d         : std_logic := '0';
+   signal sh_state                : tState := IDLE;
+   signal sh_readState            : treadState := READSTATE_BIOS;
+   signal sh_wait_timer           : integer range 0 to 31 := 0;
+   signal sh_adr_save             : std_logic_vector(gbbusadr_bits-1 downto 0) := (others => '0');
+   signal sh_acc_save             : std_logic_vector(1 downto 0) := (others => '0');
+   signal sh_rnw_save             : std_logic := '0';
+   signal sh_return_rotate        : std_logic_vector(1 downto 0) := (others => '0');
+   signal sh_cart_readback        : std_logic_vector(31 downto 0) := (others => '0');
+   signal sh_cart_done_held       : std_logic := '0';
+   signal sh_ewram_readback       : std_logic_vector(31 downto 0) := (others => '0');
+   signal sh_ewram_done_held      : std_logic := '0';
+   signal sh_cart_nowait          : std_logic := '0';
+   signal sh_mem_bus_done         : std_logic := '0';
+   signal sh_ce_done_hold         : std_logic := '0';
+   signal sh_cancelled            : std_logic := '0';
+
+   -- GDB can replace synchronous read outputs while the emulated wait is
+   -- still counting down. Preserve the result and use the existing CE latch
+   -- to return it on the original completion cycle.
+   signal sh_read_pending         : std_logic := '0';
+   signal sh_read_data            : std_logic_vector(31 downto 0) := (others => '0');
+   signal ce_replay_read          : std_logic := '0';
    
    -- savestate
    signal SAVESTATE_EEPROM  : std_logic_vector(31 downto 0);
@@ -562,7 +597,7 @@ begin
          case (mem_bus_Adr(27 downto 24)) is
              
             when x"0" =>
-               if (PC_in_BIOS = '1') then
+               if (PC_in_BIOS = '1' or gdb_memaccess = '1') then
                   bios_readEna <= mem_bus_rnw;
                end if;
              
@@ -634,6 +669,25 @@ begin
    
    -- response
    mem_bus_done_out <= mem_bus_done or (cart_done and cart_nowait);
+
+   dbg_cycle_frozen <= dbg_frozen = '1' and ce = '0' and gdb_memaccess = '0' and
+                       saving_savestate = '0' and loading_savestate = '0';
+   dbg_mem_ready <= '0' when ((state = WAIT_CART and cart_done_held = '0') or
+                             (state = WAIT_EWRAM and ewram_done_held = '0') or
+                             (cart_nowait = '1' and ce_latched_done = '0')) else '1';
+
+   dbg_mem_info(2 downto 0)   <= std_logic_vector(to_unsigned(tState'pos(state), 3));
+   dbg_mem_info(3)            <= prefetch_active;
+   dbg_mem_info(7 downto 4)   <= std_logic_vector(to_unsigned(prefetch_count, 4));
+   dbg_mem_info(13 downto 8)  <= std_logic_vector(to_unsigned(prefetch_countDown, 6));
+   dbg_mem_info(14)           <= ce_latched_done;
+   dbg_mem_info(15)           <= vram_blocked;
+   dbg_mem_info(19 downto 16) <= std_logic_vector(to_unsigned(treadState'pos(readState), 4));
+   dbg_mem_info(24 downto 20) <= std_logic_vector(to_unsigned(wait_timer, 5));
+   dbg_mem_info(25)           <= cart_done_held;
+   dbg_mem_info(26)           <= ewram_done_held;
+   dbg_mem_info(27)           <= dbg_mem_ready;
+   dbg_mem_info(31 downto 28) <= "0000";
    
    cart_readback_muxed <= cart_readback when (mem_bus_done = '1') else
                           cart_readdata;
@@ -648,7 +702,11 @@ begin
          when READSTATE_BIOS       => mem_bus_din_unrot <= bios_data;
          when READSTATE_EWRAM      =>
             if (ewram_in_sdram = '1') then
-               mem_bus_din_unrot <= ewram_readdata;
+               if (mem_bus_done = '1' or ewram_done_held = '1') then
+                  mem_bus_din_unrot <= ewram_readback;
+               else
+                  mem_bus_din_unrot <= ewram_readdata;
+               end if;
             else
                mem_bus_din_unrot <= largeram_DataOut;
             end if;
@@ -702,9 +760,9 @@ begin
       acc_save          => acc_save,
       return_rotate     => return_rotate,
       mem_bus_din_unrot => mem_bus_din_unrot,
-      ce_latched_done   => ce_latched_done,
+      ce_latched_done   => ce_latched_done or ce_replay_read,
       ce_latched_data   => ce_latched_data,
-      saving_savestate  => saving_savestate,
+      saving_savestate  => saving_savestate or gdb_memaccess,
 
       mem_bus_din       => mem_bus_din
    );
@@ -719,15 +777,21 @@ begin
    begin
       if rising_edge(clk) then
       
-         prefetch_countNext := prefetch_count;
-      
-         if (reset = '1') then  
+         gdb_memaccess_d <= gdb_memaccess;
+
+         if (gdb_memaccess = '0') then
+            prefetch_countNext := prefetch_count;
+            if (reset = '1') then
+               prefetch_active    <= '0';
+               prefetch_countNext := 0;
+               prefetch_countDown <= 0;
+            end if;
+         end if;
+
+         if (reset = '1') then
             state               <= IDLE;
-            prefetch_active     <= '0';
             ce_latched_done     <= '0';
             ce_block_prefetch   <= '0';
-            prefetch_countNext  := 0;
-            prefetch_countDown  <= 0;
          end if;
          
          -- synthesis translate_off
@@ -746,18 +810,33 @@ begin
          mem_bus_done    <= '0';
          gb_bus_out_ena  <= '0';
          
-         vram_cycle      <= '0';
+         if (gdb_memaccess = '0') then
+            vram_cycle <= '0';
+         end if;
          
          -- ce stopped handling
-         if ((ce = '1' and mem_bus_done_out = '1') or reset = '1' or loading_savestate = '1') then
+         if (reset = '1' or loading_savestate = '1' or
+             (ce = '1' and mem_bus_done_out = '1' and gdb_memaccess = '0' and gdb_memaccess_d = '0')) then
             ce_latched_done   <= '0';
             ce_wait           <= (others => '0');
             ce_done_hold      <= '0';
             ce_block_prefetch <= '0';
+            ce_replay_read     <= '0';
             if (loading_savestate = '1') then
                state          <= IDLE;
             end if;
-         elsif (ce = '0' and saving_savestate = '0') then
+         elsif (dbg_cycle_frozen and gdb_memaccess_d = '0') then
+            if (ce_done_hold = '1' or mem_bus_done_out = '1') then
+               mem_bus_done <= '1';
+            end if;
+            if (mem_bus_done_out = '1') then
+               ce_latched_done <= '1';
+               ce_latched_data <= mem_bus_din;
+               ce_done_hold    <= '1';
+               cart_nowait     <= '0';
+            end if;
+         elsif (ce = '0' and saving_savestate = '0' and dbg_frozen = '0' and
+                gdb_memaccess = '0' and gdb_memaccess_d = '0') then
             ce_wait <= ce_wait + 1;
             if (ce_done_hold = '1') then
                mem_bus_done <= '1';
@@ -778,12 +857,13 @@ begin
             end if;
          end if;
          
-         if (ce_block_prefetch = '1' and saving_savestate = '0') then
+         if (ce_block_prefetch = '1' and saving_savestate = '0' and not dbg_cycle_frozen and
+             gdb_memaccess = '0' and gdb_memaccess_d = '0') then
             state <= ALLWAIT_CE;
          end if;
          
          -- prefetch
-         if (ce = '1' and prefetch_active = '1') then
+         if (ce = '1' and prefetch_active = '1' and gdb_memaccess = '0' and gdb_memaccess_d = '0') then
             if (prefetch_countdown > 0) then
                prefetch_countdown <= prefetch_countdown - 1;
             end if;
@@ -795,6 +875,75 @@ begin
                end if;
             end if;
          end if;
+
+         -- The debugger waits for physical memory to finish before taking
+         -- ownership. Its first request is issued after this entry edge.
+         -- The live CE latch is held while GDB owns the bus; reset/load or a
+         -- bus cancel invalidates it, so it needs no shadow copy.
+         if (gdb_memaccess = '1' and gdb_memaccess_d = '0') then
+            sh_state           <= state;
+            sh_readState       <= readState;
+            sh_wait_timer      <= wait_timer;
+            sh_adr_save        <= adr_save;
+            sh_acc_save        <= acc_save;
+            sh_rnw_save        <= rnw_save;
+            sh_return_rotate   <= return_rotate;
+            sh_cart_readback   <= cart_readback;
+            sh_cart_done_held  <= cart_done_held;
+            sh_ewram_readback  <= ewram_readback;
+            sh_ewram_done_held <= ewram_done_held;
+            sh_cart_nowait     <= cart_nowait;
+            sh_mem_bus_done    <= mem_bus_done;
+            sh_ce_done_hold    <= ce_done_hold;
+            sh_cancelled       <= '0';
+
+            if (sh_read_pending = '0' and ce_latched_done = '0' and ce_replay_read = '0' and
+                rnw_save = '1' and (mem_bus_done = '1' or
+                (state = ALLWAIT and ((readState = READSTATE_EWRAM and ewram_in_sdram = '0') or
+                 readState = READSTATE_PALBG or readState = READSTATE_PALOAM or
+                 readState = READSTATE_VRAMHI or readState = READSTATE_VRAMLO)))) then
+               sh_read_data    <= mem_bus_din;
+               sh_read_pending <= '1';
+            end if;
+
+            state           <= IDLE;
+            mem_bus_done    <= '0';
+            cart_done_held  <= '0';
+            ewram_done_held <= '0';
+            cart_nowait     <= '0';
+            ce_done_hold    <= '0';
+         elsif (gdb_memaccess = '0' and gdb_memaccess_d = '1') then
+            if (sh_cancelled = '1') then
+               state           <= IDLE;
+               cart_done_held  <= '0';
+               ewram_done_held <= '0';
+               cart_nowait     <= '0';
+               ce_latched_done <= '0';
+               ce_done_hold    <= '0';
+               mem_bus_done    <= '0';
+            else
+               state           <= sh_state;
+               readState       <= sh_readState;
+               wait_timer      <= sh_wait_timer;
+               adr_save        <= sh_adr_save;
+               acc_save        <= sh_acc_save;
+               rnw_save        <= sh_rnw_save;
+               return_rotate   <= sh_return_rotate;
+               cart_readback   <= sh_cart_readback;
+               cart_done_held  <= sh_cart_done_held;
+               ewram_readback  <= sh_ewram_readback;
+               ewram_done_held <= sh_ewram_done_held;
+               cart_nowait     <= sh_cart_nowait;
+               mem_bus_done    <= sh_mem_bus_done;
+               ce_done_hold    <= sh_ce_done_hold;
+
+               if (sh_read_pending = '1' and sh_mem_bus_done = '1') then
+                  ce_latched_data <= sh_read_data;
+                  ce_replay_read  <= '1';
+                  sh_read_pending <= '0';
+               end if;
+            end if;
+         else
          
          case state is
          
@@ -827,7 +976,10 @@ begin
                         case (mem_bus_Adr(27 downto 24)) is
                         
                            when x"0" => 
-                              if (PC_in_BIOS = '0') then
+                              if (PC_in_BIOS = '1' or gdb_memaccess = '1') then
+                                 readState    <= READSTATE_BIOS;
+                                 mem_bus_done <= '1';
+                              else
                                  if (unsigned(mem_bus_Adr) < 16#4000#) then
                                     --rotate_data <= x"E3A02004"; -- only applies for one situation! -> after irq
                                     --rotate_data <= x"E55EC002"; -- only applies for one situation! -> after swi
@@ -839,21 +991,20 @@ begin
                                     mem_bus_done <= '1';
                                     readState    <= READSTATE_UNREADABLE;
                                  end if;
-                              else
-                                 readState    <= READSTATE_BIOS;
-                                 mem_bus_done <= '1';
                               end if;
                            
                            when x"2" =>
                               readState    <= READSTATE_EWRAM;
                               if (ewram_in_sdram = '1') then
                                  state        <= WAIT_EWRAM;
-                                 if (mem_bus_acc = ACCESS_32BIT) then
+                                 if (gdb_memaccess = '1') then
+                                    wait_timer <= 0;
+                                 elsif (mem_bus_acc = ACCESS_32BIT) then
                                     wait_timer <= 4;
                                  else
                                     wait_timer <= 1;
                                  end if;
-                              elsif (sleep_savestate = '1') then
+                              elsif (sleep_savestate = '1' or gdb_memaccess = '1') then
                                  mem_bus_done <= '1';
                               else
                                  state        <= ALLWAIT;
@@ -878,7 +1029,7 @@ begin
                               end if;
                               
                            when x"5" =>
-                              if (mem_bus_acc = ACCESS_32BIT) then
+                              if (mem_bus_acc = ACCESS_32BIT and gdb_memaccess = '0') then
                                  state      <= ALLWAIT;
                                  wait_timer <= 0;
                               else
@@ -891,7 +1042,7 @@ begin
                               end if;
                               
                            when x"6" =>
-                              if (mem_bus_acc = ACCESS_32BIT and sleep_savestate = '0') then
+                              if (mem_bus_acc = ACCESS_32BIT and sleep_savestate = '0' and gdb_memaccess = '0') then
                                  state      <= ALLWAIT;
                                  wait_timer <= 0;
                               else
@@ -908,70 +1059,71 @@ begin
                               mem_bus_done   <= '1';
                            
                            when x"8" | x"9" | x"A" | x"B" | x"C" | x"D" | x"E" | x"F" =>
-                              readState  <= READSTATE_ROM;
-                              wait_timer <= wait_cartnext - 1 + prefetch_stopDelay; 
-                              
-                              if (dma_on = '1') then
-                                 prefetch_active <= '0';
-                              end if;
-                              state         <= WAIT_CART; 
-                              
-                              prefetch_hit := '0';
-                              if (prefetch_active = '1' and mem_bus_code = '1') then
-                              	if (prefetch_count > 0 and mem_bus_Adr(27 downto 0) = prefetch_HeadAddr) then
-                                    prefetch_hit       := '1';
-                                    state              <= IDLE;
-                                    cart_nowait        <= '1';
-                                    prefetch_countNext := prefetch_countNext - 1;
-                                    if (mem_bus_acc = ACCESS_32BIT) then
-                                       prefetch_headAddr <= std_logic_vector(unsigned(prefetch_headAddr) + 4);
-                                    else
-                                       prefetch_headAddr <= std_logic_vector(unsigned(prefetch_headAddr) + 2);
-                                    end if;
-                                    if (prefetch_countdown < 2 and cart_waitcnt(14) = '1' and prefetch_count = prefetch_capacity) then -- special case of fetch when buffer is full
-                                       prefetch_countNext := prefetch_count;
-                                       prefetch_lastAddr  <= std_logic_vector(unsigned(prefetch_lastAddr) + prefetch_width);
-                                       prefetch_countdown <= prefetch_timingNext;
-                                    end if;
-                                 elsif (mem_bus_Adr(27 downto 0) = prefetch_lastAddr) then
-                                    prefetch_hit := '1';
-                                    if (prefetch_countdown <= 1) then
-                                       state        <= IDLE;
-                                       cart_nowait  <= '1';
-                                    else
-                                       wait_timer         <= prefetch_countdown - 2;
-                                       prefetch_countdown <= prefetch_countdown + prefetch_timingNext - 1;
-                                    end if;
-                                    if (mem_bus_acc = ACCESS_32BIT) then
-                                       prefetch_headAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 4);
-                                       prefetch_lastAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 4);
-                                    else
-                                       prefetch_headAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 2);
-                                       prefetch_lastAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 2);
-                                    end if;
-                                    prefetch_countNext := 0;
+                              readState <= READSTATE_ROM;
+                              state     <= WAIT_CART;
+
+                              if (gdb_memaccess = '0') then
+                                 wait_timer <= wait_cartnext - 1 + prefetch_stopDelay;
+                                 if (dma_on = '1') then
+                                    prefetch_active <= '0';
                                  end if;
-                              end if;
-                                    
-                              if (prefetch_hit = '0') then
-                              
-                                 prefetch_active <= '0';
-                              
-                                 if (mem_bus_code = '1' and cart_waitcnt(14) = '1' and dma_on = '0') then
-                                    prefetch_active     <= '1';
-                                    prefetch_countNext  := 0;
-                                    prefetch_countdown  <= wait_cartnext + prefetch_timing + 1 + prefetch_stopDelay;
-                                    prefetch_timingNext <= prefetch_timing + 1;
-                                    if (mem_bus_acc = ACCESS_32BIT) then
-                                       prefetch_width     <= 4;
-                                       prefetch_capacity  <= 4;
-                                       prefetch_headAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 4);
-                                       prefetch_lastAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 4);
-                                    else
-                                       prefetch_width     <= 2;
-                                       prefetch_capacity  <= 8;
-                                       prefetch_headAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 2);
-                                       prefetch_lastAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 2);
+
+                                 prefetch_hit := '0';
+                                 if (prefetch_active = '1' and mem_bus_code = '1') then
+                                    if (prefetch_count > 0 and mem_bus_Adr(27 downto 0) = prefetch_HeadAddr) then
+                                       prefetch_hit       := '1';
+                                       state              <= IDLE;
+                                       cart_nowait        <= '1';
+                                       prefetch_countNext := prefetch_countNext - 1;
+                                       if (mem_bus_acc = ACCESS_32BIT) then
+                                          prefetch_headAddr <= std_logic_vector(unsigned(prefetch_headAddr) + 4);
+                                       else
+                                          prefetch_headAddr <= std_logic_vector(unsigned(prefetch_headAddr) + 2);
+                                       end if;
+                                       if (prefetch_countdown < 2 and cart_waitcnt(14) = '1' and prefetch_count = prefetch_capacity) then -- special case of fetch when buffer is full
+                                          prefetch_countNext := prefetch_count;
+                                          prefetch_lastAddr  <= std_logic_vector(unsigned(prefetch_lastAddr) + prefetch_width);
+                                          prefetch_countdown <= prefetch_timingNext;
+                                       end if;
+                                    elsif (mem_bus_Adr(27 downto 0) = prefetch_lastAddr) then
+                                       prefetch_hit := '1';
+                                       if (prefetch_countdown <= 1) then
+                                          state        <= IDLE;
+                                          cart_nowait  <= '1';
+                                       else
+                                          wait_timer         <= prefetch_countdown - 2;
+                                          prefetch_countdown <= prefetch_countdown + prefetch_timingNext - 1;
+                                       end if;
+                                       if (mem_bus_acc = ACCESS_32BIT) then
+                                          prefetch_headAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 4);
+                                          prefetch_lastAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 4);
+                                       else
+                                          prefetch_headAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 2);
+                                          prefetch_lastAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 2);
+                                       end if;
+                                       prefetch_countNext := 0;
+                                    end if;
+                                 end if;
+
+                                 if (prefetch_hit = '0') then
+                                    prefetch_active <= '0';
+
+                                    if (mem_bus_code = '1' and cart_waitcnt(14) = '1' and dma_on = '0') then
+                                       prefetch_active     <= '1';
+                                       prefetch_countNext  := 0;
+                                       prefetch_countdown  <= wait_cartnext + prefetch_timing + 1 + prefetch_stopDelay;
+                                       prefetch_timingNext <= prefetch_timing + 1;
+                                       if (mem_bus_acc = ACCESS_32BIT) then
+                                          prefetch_width     <= 4;
+                                          prefetch_capacity  <= 4;
+                                          prefetch_headAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 4);
+                                          prefetch_lastAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 4);
+                                       else
+                                          prefetch_width     <= 2;
+                                          prefetch_capacity  <= 8;
+                                          prefetch_headAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 2);
+                                          prefetch_lastAddr  <= std_logic_vector(unsigned(mem_bus_Adr(27 downto 0)) + 2);
+                                       end if;
                                     end if;
                                  end if;
                               end if;
@@ -1000,12 +1152,14 @@ begin
                            when x"2" =>
                               if (ewram_in_sdram = '1') then
                                  state <= WAIT_EWRAM;
-                                 if (mem_bus_acc = ACCESS_32BIT) then
+                                 if (gdb_memaccess = '1') then
+                                    wait_timer <= 0;
+                                 elsif (mem_bus_acc = ACCESS_32BIT) then
                                     wait_timer <= 4;
                                  else
                                     wait_timer <= 1;
                                  end if;
-                              elsif (sleep_savestate = '1') then
+                              elsif (sleep_savestate = '1' or gdb_memaccess = '1') then
                                  mem_bus_done <= '1';
                               else
                                  state <= ALLWAIT;
@@ -1024,7 +1178,7 @@ begin
                               gb_bus_out_ena <= '1';
                            
                            when x"5" => 
-                              if (mem_bus_acc = ACCESS_32BIT) then
+                              if (mem_bus_acc = ACCESS_32BIT and gdb_memaccess = '0') then
                                  state      <= ALLWAIT;
                                  wait_timer <= 0;
                               else
@@ -1032,7 +1186,7 @@ begin
                               end if; 
                               
                            when x"6" => 
-                              if (mem_bus_acc = ACCESS_32BIT and sleep_savestate = '0') then
+                              if (mem_bus_acc = ACCESS_32BIT and sleep_savestate = '0' and gdb_memaccess = '0') then
                                  state      <= ALLWAIT;
                                  wait_timer <= 0;
                               else
@@ -1044,9 +1198,11 @@ begin
                               mem_bus_done <= '1';
                            
                            when x"8" | x"9" | x"A" | x"B" | x"C" | x"D" | x"E" | x"F" =>
-                              state           <= WAIT_CART; 
-                              prefetch_active <= '0';
-                              wait_timer      <= wait_cartnext - 1 + prefetch_stopDelay; 
+                              state <= WAIT_CART;
+                              if (gdb_memaccess = '0') then
+                                 prefetch_active <= '0';
+                                 wait_timer      <= wait_cartnext - 1 + prefetch_stopDelay;
+                              end if;
                               
                            when others => mem_bus_done <= '1'; --report "writing here not implemented!" severity failure;
                         end case;
@@ -1058,13 +1214,20 @@ begin
                end if;
 
             -- wait
-             when ALLWAIT =>
-               if (wait_timer > 0) then
-                  wait_timer <= wait_timer - 1;
-               else
-                  mem_bus_done <= '1'; 
-                  state <= IDLE;
-               end if;             
+            when ALLWAIT =>
+               if (not dbg_cycle_frozen) then
+                  if (wait_timer > 0) then
+                     wait_timer <= wait_timer - 1;
+                  else
+                     mem_bus_done <= '1';
+                     state        <= IDLE;
+                     if (sh_read_pending = '1' and gdb_memaccess = '0') then
+                        ce_latched_data <= sh_read_data;
+                        ce_replay_read  <= '1';
+                        sh_read_pending <= '0';
+                     end if;
+                  end if;
+               end if;
                
             when ALLWAIT_CE =>
                if (loading_savestate = '1') then
@@ -1087,31 +1250,34 @@ begin
                
             -- reading
             when WAIT_CART =>
-               if (wait_timer > 0) then
-                  wait_timer <= wait_timer - 1;
-               end if;
-               if (wait_timer = 0 and adr_save(27 downto 24) < x"E") then
-                  cart_nowait <= '1';
-                  state       <= IDLE;
-               end if;
-               
                if (cart_done = '1') then
                   if (adr_save(27 downto 24) = x"E" or adr_save(27 downto 24) = x"F") then
-                     cart_readback <= cart_readdata(7 downto 0) & cart_readdata(7 downto 0) & cart_readdata(7 downto 0) & cart_readdata(7 downto 0); 
-                     if (wait_timer > 0) then
-                        state      <= ALLWAIT;
-                     else
-                        mem_bus_done  <= '1'; 
-                        state         <= IDLE;
-                     end if;
+                     cart_readback <= cart_readdata(7 downto 0) & cart_readdata(7 downto 0) & cart_readdata(7 downto 0) & cart_readdata(7 downto 0);
                   else
                      cart_readback <= cart_readdata;
-                     
+                  end if;
+               end if;
+
+               if (dbg_cycle_frozen) then
+                  if (cart_done = '1') then
+                     cart_done_held <= '1';
+                  end if;
+               else
+                  if (wait_timer > 0) then
+                     wait_timer <= wait_timer - 1;
+                  elsif (adr_save(27 downto 24) < x"E" and cart_done = '0' and
+                         cart_done_held = '0' and gdb_memaccess = '0') then
+                     cart_nowait <= '1';
+                     state       <= IDLE;
+                  end if;
+
+                  if (cart_done = '1' or cart_done_held = '1') then
+                     cart_done_held <= '0';
                      if (wait_timer > 0) then
-                        state      <= ALLWAIT;
+                        state <= ALLWAIT;
                      else
-                        mem_bus_done    <= '1';
-                        state           <= IDLE;
+                        mem_bus_done <= '1';
+                        state        <= IDLE;
                      end if;
                   end if;
                end if;
@@ -1119,23 +1285,64 @@ begin
             -- same handshake as WAIT_CART: modeled waitstates still apply, the
             -- SDRAM roundtrip only adds time when it outlasts them
             when WAIT_EWRAM =>
-               if (wait_timer > 0) then
-                  wait_timer <= wait_timer - 1;
+               if (ewram_done = '1') then
+                  ewram_readback <= ewram_readdata;
                end if;
 
-               if (ewram_done = '1') then
+               if (dbg_cycle_frozen) then
+                  if (ewram_done = '1') then
+                     ewram_done_held <= '1';
+                  end if;
+               else
                   if (wait_timer > 0) then
-                     state <= ALLWAIT;
-                  else
-                     mem_bus_done <= '1';
-                     state        <= IDLE;
+                     wait_timer <= wait_timer - 1;
+                  end if;
+
+                  if (ewram_done = '1' or ewram_done_held = '1') then
+                     ewram_done_held <= '0';
+                     if (wait_timer > 0) then
+                        state <= ALLWAIT;
+                     else
+                        mem_bus_done <= '1';
+                        state        <= IDLE;
+                     end if;
                   end if;
                end if;
 
          end case;
-         
-         prefetch_count <= prefetch_countNext;
-      
+         end if;
+
+         if (gdb_memaccess = '0') then
+            prefetch_count <= prefetch_countNext;
+         end if;
+
+         if (reset = '1') then
+            cart_done_held  <= '0';
+            ewram_done_held <= '0';
+            cart_nowait     <= '0';
+         end if;
+         if (reset = '1' or loading_savestate = '1') then
+            sh_read_pending <= '0';
+            ce_replay_read  <= '0';
+         end if;
+
+         if (dbg_cancel_bus = '1' or
+             ((reset = '1' or loading_savestate = '1') and (gdb_memaccess = '1' or gdb_memaccess_d = '1'))) then
+            state             <= IDLE;
+            cart_done_held    <= '0';
+            ewram_done_held   <= '0';
+            cart_nowait       <= '0';
+            ce_latched_done   <= '0';
+            ce_done_hold      <= '0';
+            ce_block_prefetch <= '0';
+            ce_wait           <= (others => '0');
+            mem_bus_done      <= '0';
+            sh_read_pending   <= '0';
+            ce_replay_read    <= '0';
+            if (gdb_memaccess = '1') then
+               sh_cancelled <= '1';
+            end if;
+         end if;
       end if;
    end process;
    

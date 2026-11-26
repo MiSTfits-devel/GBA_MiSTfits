@@ -20,7 +20,8 @@ entity gba_top is
       strip_savestates         : std_logic := '0'; -- 1 = no savestates/rewind, only the reset controller remains (2P profile)
       strip_cheats             : std_logic := '0'; -- 1 = no cheat engine (2P profile)
       ewram_in_sdram           : std_logic := '0'; -- 1 = EWRAM lives in SDRAM instead of BRAM (2P profile)
-      turbosound               : std_logic  -- sound buffer to play sound in turbo mode without sound pitched up
+      turbosound               : std_logic; -- sound buffer to play sound in turbo mode without sound pitched up
+      legacy_sim_ss_debug      : std_logic := '1' -- legacy debugger bus in standalone simulation
    );
    port 
    (
@@ -148,13 +149,66 @@ entity gba_top is
       debug_cpu_mixed       : out    std_logic_vector(31 downto 0);
       debug_irq             : out    std_logic_vector(31 downto 0);
       debug_dma             : out    std_logic_vector(31 downto 0);
-      debug_mem             : out    std_logic_vector(31 downto 0)  
+      debug_mem             : out    std_logic_vector(31 downto 0);
+      -- GDB controls and active-core bus responses
+      dbg_hold              : in     std_logic := '0';
+      dbg_step              : in     std_logic := '0';
+      dbg_stop_now          : in     std_logic := '0';
+      gdb_memaccess         : in     std_logic := '0';
+      dbg_reg_wr            : in     std_logic := '0';
+      dbg_reg_idx           : in     std_logic_vector(4 downto 0) := (others => '0');
+      dbg_reg_data          : in     std_logic_vector(31 downto 0) := (others => '0');
+      ss_bus_gdb_req        : in     std_logic := '0';
+      ss_bus_gdb_in         : in     proc_bus_gb_type := ((others => '0'), (others => '0'), '1', '0', ACCESS_32BIT, x"F", '0');
+      GBA_BusReadDone       : out    std_logic := '0';
+      dbg_mem_ready         : out    std_logic := '1';
+      ss_wired_out_dbg      : out    std_logic_vector(proc_buswidth-1 downto 0) := (others => '0');
+      ss_wired_done_dbg     : out    std_logic := '0';
+      -- Live GDB telemetry
+      dbg_ce                : out    std_logic := '0';
+      dbg_arch_pc           : out    unsigned(31 downto 0) := (others => '0');
+      dbg_fetch_instr_pc    : out    unsigned(31 downto 0) := (others => '0');
+      dbg_stall_instr_pc    : out    unsigned(31 downto 0) := (others => '0');
+      dbg_decode_load       : out    std_logic := '0';
+      dbg_execute_stall     : out    std_logic := '0';
+      dbg_decode_ready      : out    std_logic := '0';
+      dbg_fetch_ready       : out    std_logic := '0';
+      dbg_decode_opcode     : out    std_logic_vector(31 downto 0) := (others => '0');
+      dbg_bus_state         : out    std_logic_vector(1 downto 0) := (others => '0');
+      dbg_thumbmode         : out    std_logic := '0';
+      dbg_cpu_mode          : out    std_logic_vector(3 downto 0) := (others => '0');
+      dbg_cpu_done          : out    std_logic := '0';
+      dbg_cpu_halt          : out    std_logic := '0';
+      dbg_cpu_bus_adr       : out    std_logic_vector(31 downto 0) := (others => '0');
+      dbg_cpu_bus_ena       : out    std_logic := '0';
+      dbg_cpu_bus_rnw       : out    std_logic := '0';
+      dbg_cpu_bus_acc       : out    std_logic_vector(1 downto 0) := (others => '0');
+      dbg_cpu_bus_seq       : out    std_logic := '0';
+      dbg_cpu_bus_code      : out    std_logic := '0';
+      dbg_dma_on            : out    std_logic := '0';
+      dbg_vblank            : out    std_logic := '0';
+      dbg_hblank            : out    std_logic := '0';
+      dbg_line_trigger      : out    std_logic := '0';
+      dbg_dispstat          : out    std_logic_vector(31 downto 0) := (others => '0');
+      dbg_irq_if            : out    std_logic_vector(15 downto 0) := (others => '0');
+      dbg_irq_ie            : out    std_logic_vector(15 downto 0) := (others => '0');
+      dbg_irq_ime           : out    std_logic := '0';
+      dbg_cpu_irq           : out    std_logic := '0';
+      dbg_haltcnt           : out    std_logic_vector(7 downto 0) := (others => '0');
+      dbg_mem_info          : out    std_logic_vector(31 downto 0) := (others => '0');
+      dbg_reg_rd_idx        : in     std_logic_vector(4 downto 0) := (others => '0');
+      dbg_reg_rd_data       : out    std_logic_vector(31 downto 0) := (others => '0')
    );
 end entity;
 
 architecture arch of gba_top is
 
    constant DEBUG_NOCPU : std_logic := '0';
+   constant use_ss_debug_bus : boolean := strip_savestates = '0'
+      -- synthesis translate_off
+      or (is_simu = '1' and legacy_sim_ss_debug = '1')
+      -- synthesis translate_on
+      ;
 
    signal ce              : std_logic := '0';
    signal pause_active    : std_logic;
@@ -167,6 +221,7 @@ architecture arch of gba_top is
    signal debug_bus_ena        : std_logic;
    signal debug_bus_acc        : std_logic_vector(1 downto 0);
    signal debug_bus_dout       : std_logic_vector(31 downto 0);
+   signal dbg_pc_written       : std_logic;
    
    -- save states
    signal SAVE_BusAddr         : std_logic_vector(27 downto 0);
@@ -176,6 +231,7 @@ architecture arch of gba_top is
    signal SAVE_Bus_ena         : std_logic;
    
    signal savestate_bus        : proc_bus_gb_type;
+   signal savestate_bus_ss     : proc_bus_gb_type;
    signal ss_wired_out         : std_logic_vector(proc_buswidth-1 downto 0) := (others => '0');
    signal ss_wired_done        : std_logic;
    type t_ss_wired_or is array(0 to 6) of std_logic_vector(31 downto 0);
@@ -243,6 +299,7 @@ architecture arch of gba_top is
    signal mem_bus_isDMA        : std_logic := '0';        
    
    signal bus_lowbits          : std_logic_vector(1 downto 0); -- only required for sram access
+   signal mem_bus_lowbits      : std_logic_vector(1 downto 0);
    
    signal bitmapdrawmode       : std_logic;
                                
@@ -319,6 +376,9 @@ architecture arch of gba_top is
    
    -- debug wires
    signal DISPSTAT_debug  : std_logic_vector(31 downto 0);     
+   signal dbg_vcount      : std_logic_vector(7 downto 0);
+   signal dbg_line_start  : std_logic;
+   signal dbg_hblank_start : std_logic;
    signal sound_fifocount : unsigned(15 downto 0);
    signal timerdebug0     : unsigned(15 downto 0);
    signal timerdebug1     : unsigned(15 downto 0);
@@ -380,6 +440,25 @@ begin
    ------------- cycling
    inPause <= pause_active;
 
+   dbg_ce           <= ce;
+   dbg_cpu_halt     <= cpu_halt;
+   dbg_cpu_bus_adr  <= cpu_bus_Adr;
+   dbg_cpu_bus_ena  <= cpu_bus_ena;
+   dbg_cpu_bus_rnw  <= cpu_bus_rnw;
+   dbg_cpu_bus_acc  <= cpu_bus_acc;
+   dbg_cpu_bus_seq  <= cpu_bus_seq;
+   dbg_cpu_bus_code <= CPU_bus_code;
+   dbg_dma_on       <= dma_on;
+   dbg_vblank       <= vblank_trigger;
+   dbg_hblank       <= dbg_hblank_start;
+   dbg_line_trigger <= dbg_line_start;
+   dbg_dispstat     <= x"00" & dbg_vcount & DISPSTAT_debug(15 downto 0);
+   dbg_irq_if       <= IRPFLags;
+   dbg_irq_ie       <= REG_IRP_IE;
+   dbg_irq_ime      <= REG_IME(0);
+   dbg_cpu_irq      <= cpu_irq;
+   dbg_haltcnt      <= REG_HALTCNT;
+
    ictrlpause : entity work.gba_ctrl_pause
    generic map
    (
@@ -399,7 +478,10 @@ begin
       KeyPause            => KeyPause,
 
       ce                  => ce,
-      pause_active        => pause_active
+      pause_active        => pause_active,
+      dbg_hold            => dbg_hold,
+      dbg_step            => dbg_step,
+      dbg_stop_now        => dbg_stop_now
    );
 
 
@@ -435,6 +517,7 @@ begin
    port map
    (
       clk100     => clk1x,
+      ce         => ce or not dbg_hold,
       gb_bus     => gb_bus,           
       wired_out  => reg_wired_or(9),
       wired_done => reg_wired_done(9),
@@ -456,7 +539,8 @@ begin
    
    mem_bus_Adr  <=  x"0" & debug_bus_Adr  when debug_bus_active = '1' else cpu_bus_Adr  when cpu_bus_ena = '1' else x"0" & dma_bus_Adr;
    mem_bus_rnw  <=  debug_bus_rnw         when debug_bus_active = '1' else cpu_bus_rnw  when cpu_bus_ena = '1' else dma_bus_rnw;
-   mem_bus_ena  <=  debug_bus_ena         when debug_bus_active = '1' else cpu_bus_ena  when cpu_bus_ena = '1' else dma_bus_ena; 
+   mem_bus_ena  <=  debug_bus_ena         when debug_bus_active = '1' or gdb_memaccess = '1' else
+                    cpu_bus_ena           when cpu_bus_ena = '1' else dma_bus_ena;
    mem_bus_seq  <=  '0'                   when debug_bus_active = '1' else cpu_bus_seq  when cpu_bus_ena = '1' else dma_bus_seq; 
    mem_bus_code <=  '0'                   when debug_bus_active = '1' else CPU_bus_code when cpu_bus_ena = '1' else '0'; 
    mem_bus_acc  <=  debug_bus_acc         when debug_bus_active = '1' else cpu_bus_acc  when cpu_bus_ena = '1' else dma_bus_acc;
@@ -481,11 +565,16 @@ begin
       if rising_edge(clk1x) then
    
          debug_bus_ena    <= '0';
+         GBA_BusReadDone  <= '0';
 
          if (debug_bus_active = '1' and mem_bus_done = '1') then
             GBA_BusReadData  <= mem_bus_din;
             debug_bus_active <= '0';
-            mem_bus_isCPU    <= '1';
+            if (gdb_memaccess = '1') then
+               GBA_BusReadDone <= '1';
+            else
+               mem_bus_isCPU <= '1';
+            end if;
          end if;
 
          -- re-arm AFTER the done-clear above so a new request landing on the
@@ -507,15 +596,19 @@ begin
             debug_bus_dout   <= SAVE_BusWriteData;
          end if;
          
-         if (debug_bus_ena = '1') then
-            mem_bus_isCPU <= '0';
-            mem_bus_isDMA <= '0';
-         elsif (cpu_bus_ena = '1') then
-            mem_bus_isCPU <= '1';
-            mem_bus_isDMA <= '0';
-         elsif (dma_bus_ena = '1') then
-            mem_bus_isCPU <= '0';
-            mem_bus_isDMA <= '1';
+         -- The memory mux parks and restores the CPU/DMA transaction around
+         -- GDB access. Keep the owner parked as well.
+         if (gdb_memaccess = '0') then
+            if (debug_bus_ena = '1') then
+               mem_bus_isCPU <= '0';
+               mem_bus_isDMA <= '0';
+            elsif (cpu_bus_ena = '1') then
+               mem_bus_isCPU <= '1';
+               mem_bus_isDMA <= '0';
+            elsif (dma_bus_ena = '1') then
+               mem_bus_isCPU <= '0';
+               mem_bus_isDMA <= '1';
+            end if;
          end if;
          
          error_memRequ_timeout <= '0';
@@ -544,11 +637,11 @@ begin
    end process;
    
    dma_bus_din    <= mem_bus_din;
-   dma_bus_done   <= mem_bus_done and mem_bus_isDMA;
+   dma_bus_done   <= mem_bus_done and mem_bus_isDMA and not gdb_memaccess;
    dma_bus_unread <= mem_bus_unread;
    
    cpu_bus_din  <= mem_bus_din;
-   cpu_bus_done <= mem_bus_done and mem_bus_isCPU;
+   cpu_bus_done <= mem_bus_done and mem_bus_isCPU and not gdb_memaccess;
    
    cart_reset <= reset;
    
@@ -576,7 +669,7 @@ begin
       savestate_address     => savestate_address,
       savestate_busy        => savestate_busy,      
 
-      internal_bus_out      => savestate_bus,
+      internal_bus_out      => savestate_bus_ss,
       wired_out             => ss_wired_out,
       wired_done            => ss_wired_done,
       
@@ -635,7 +728,7 @@ begin
       savestate_address     => savestate_address,
       savestate_busy        => savestate_busy,
 
-      internal_bus_out      => savestate_bus,
+      internal_bus_out      => savestate_bus_ss,
       wired_out             => ss_wired_out,
       wired_done            => ss_wired_done,
 
@@ -755,6 +848,20 @@ begin
       cheats_active       <= '0';
    end generate gCheatsStub;
 
+   gSavestateDebug : if use_ss_debug_bus generate
+   begin
+      savestate_bus     <= ss_bus_gdb_in when ss_bus_gdb_req = '1' else savestate_bus_ss;
+      ss_wired_out_dbg  <= ss_wired_out;
+      ss_wired_done_dbg <= ss_wired_done;
+   end generate gSavestateDebug;
+
+   gNoSavestateDebug : if not use_ss_debug_bus generate
+   begin
+      savestate_bus     <= savestate_bus_ss;
+      ss_wired_out_dbg  <= (others => '0');
+      ss_wired_done_dbg <= '1'; -- Zero-fill the stripped RDSTATE savestate words.
+   end generate gNoSavestateDebug;
+
    savestate_bus_ext  <= savestate_bus;
    save_wired_or(1)   <= ss_wired_out_ext;
    save_wired_done(1) <= ss_wired_done_ext;
@@ -766,6 +873,8 @@ begin
                 '1' when (dma_bus_ena = '1' and dma_bus_norom = '1') else
                 '0';
    
+   mem_bus_lowbits <= "00" when gdb_memaccess = '1' else bus_lowbits;
+
    igba_memorymux : entity work.gba_memorymux
    generic map
    (
@@ -838,7 +947,7 @@ begin
       Cheats_BusReadData   => Cheats_BusReadData, 
       Cheats_Bus_done      => Cheats_Bus_done,
       
-      bus_lowbits          => bus_lowbits,
+      bus_lowbits          => mem_bus_lowbits,
       
       dma_on               => dma_on,
       
@@ -878,7 +987,13 @@ begin
       PALETTE_OAM_datain   => PALETTE_OAM_datain, 
       PALETTE_OAM_dataout  => PALETTE_OAM_dataout,
       PALETTE_OAM_we       => PALETTE_OAM_we,
-      PALETTE_OAM_re       => PALETTE_OAM_re
+      PALETTE_OAM_re       => PALETTE_OAM_re,
+
+      dbg_frozen           => dbg_hold,
+      gdb_memaccess        => gdb_memaccess,
+      dbg_cancel_bus       => dbg_pc_written,
+      dbg_mem_ready        => dbg_mem_ready,
+      dbg_mem_info         => dbg_mem_info
    );
    
    CPU_bus_idleDone <= CPU_bus_idle or cpu_bus_done;
@@ -888,6 +1003,7 @@ begin
    (
       clk                 => clk1x,
       reset               => reset,
+      ce                  => ce or not dbg_hold,
                            
       savestate_bus       => savestate_bus,
       ss_wired_out        => save_wired_or(2),
@@ -1031,7 +1147,10 @@ begin
       PALETTE_OAM_we       => PALETTE_OAM_we,            
       PALETTE_OAM_re       => PALETTE_OAM_re,            
    
-      DISPSTAT_debug       => DISPSTAT_debug       
+      DISPSTAT_debug       => DISPSTAT_debug,
+      dbg_vcount           => dbg_vcount,
+      dbg_line_start       => dbg_line_start,
+      dbg_hblank_start     => dbg_hblank_start
    );
    
    igba_timer : entity work.gba_timer
@@ -1109,7 +1228,26 @@ begin
       
       IRQ_in           => cpu_irq,
       unhalt           => cpu_unhalt,
-      new_halt         => new_halt
+      new_halt         => new_halt,
+
+      dbg_arch_pc        => dbg_arch_pc,
+      dbg_fetch_instr_pc => dbg_fetch_instr_pc,
+      dbg_stall_instr_pc => dbg_stall_instr_pc,
+      dbg_decode_load    => dbg_decode_load,
+      dbg_execute_stall  => dbg_execute_stall,
+      dbg_decode_ready   => dbg_decode_ready,
+      dbg_fetch_ready    => dbg_fetch_ready,
+      dbg_decode_opcode  => dbg_decode_opcode,
+      dbg_bus_state      => dbg_bus_state,
+      dbg_thumbmode      => dbg_thumbmode,
+      dbg_cpu_mode       => dbg_cpu_mode,
+      dbg_pc_written     => dbg_pc_written,
+      dbg_cpu_done       => dbg_cpu_done,
+      dbg_reg_wr         => dbg_reg_wr,
+      dbg_reg_idx        => unsigned(dbg_reg_idx),
+      dbg_reg_data       => dbg_reg_data,
+      dbg_reg_rd_idx     => unsigned(dbg_reg_rd_idx),
+      dbg_reg_rd_data    => dbg_reg_rd_data
    );
    
    iREG_IRP_IE  : entity work.eProcReg_gba generic map (work.pReg_gba_system.IRP_IE ) port map  (clk1x, gb_bus, reg_wired_or(0), reg_wired_done(0), REG_IRP_IE , REG_IRP_IE );

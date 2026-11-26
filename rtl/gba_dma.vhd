@@ -46,7 +46,8 @@ entity gba_dma is
       dma_bus_done        : in     std_logic;
       dma_bus_unread      : in     std_logic;
       
-      debug_dma           : out    std_logic_vector(31 downto 0)
+      debug_dma           : out    std_logic_vector(31 downto 0);
+      ce                  : in     std_logic := '1'
    );
 end entity;
 
@@ -100,6 +101,17 @@ architecture arch of gba_dma is
    signal last_dma_valid3    : std_logic;
                              
    signal single_is_idle     : std_logic_vector(3 downto 0);
+
+   type tDmaTriggers is record
+      sound     : std_logic_vector(1 downto 0);
+      hblank    : std_logic;
+      vblank    : std_logic;
+      vid_start : std_logic;
+      vid_stop  : std_logic;
+   end record;
+   constant NO_TRIGGERS : tDmaTriggers := (sound => (others => '0'), others => '0');
+   signal pending_triggers : tDmaTriggers := NO_TRIGGERS;
+   signal dma_triggers     : tDmaTriggers;
        
    -- savestates
    type t_ss_wired_or is array(0 to 3) of std_logic_vector(31 downto 0);
@@ -107,6 +119,12 @@ architecture arch of gba_dma is
    signal save_wired_done      : unsigned(0 to 3);
        
 begin 
+
+   dma_triggers.sound     <= sound_dma_req or pending_triggers.sound;
+   dma_triggers.hblank    <= hblank_trigger or pending_triggers.hblank;
+   dma_triggers.vblank    <= vblank_trigger or pending_triggers.vblank;
+   dma_triggers.vid_start <= videodma_start or pending_triggers.vid_start;
+   dma_triggers.vid_stop  <= videodma_stop or pending_triggers.vid_stop;
 
    process (reg_wired_or)
       variable wired_or : std_logic_vector(31 downto 0);
@@ -151,6 +169,7 @@ begin
    (
       clk               => clk,     
       reset             => reset,
+      ce                => ce,
                         
       savestate_bus     => savestate_bus,
       ss_wired_out      => save_wired_or(0),
@@ -171,8 +190,8 @@ begin
       lowprio_pending   => lowprio_pending(0),
                         
       sound_dma_req     => '0', 
-      hblank_trigger    => hblank_trigger,
-      vblank_trigger    => vblank_trigger,
+      hblank_trigger    => dma_triggers.hblank,
+      vblank_trigger    => dma_triggers.vblank,
       videodma_start    => '0',
       videodma_stop     => '0',                
 
@@ -217,6 +236,7 @@ begin
    (
       clk               => clk,
       reset             => reset,
+      ce                => ce,
                          
       savestate_bus     => savestate_bus,
       ss_wired_out      => save_wired_or(1),
@@ -236,9 +256,9 @@ begin
       dma_soon          => single_soon(1),
       lowprio_pending   => lowprio_pending(1),
                         
-      sound_dma_req     => sound_dma_req(0), 
-      hblank_trigger    => hblank_trigger,
-      vblank_trigger    => vblank_trigger,
+      sound_dma_req     => dma_triggers.sound(0),
+      hblank_trigger    => dma_triggers.hblank,
+      vblank_trigger    => dma_triggers.vblank,
       videodma_start    => '0',
       videodma_stop     => '0',     
                         
@@ -283,6 +303,7 @@ begin
    (
       clk               => clk, 
       reset             => reset,
+      ce                => ce,
                         
       savestate_bus     => savestate_bus,
       ss_wired_out      => save_wired_or(2),
@@ -302,9 +323,9 @@ begin
       dma_soon          => single_soon(2),
       lowprio_pending   => lowprio_pending(2),
                         
-      sound_dma_req     => sound_dma_req(1), 
-      hblank_trigger    => hblank_trigger,
-      vblank_trigger    => vblank_trigger,
+      sound_dma_req     => dma_triggers.sound(1),
+      hblank_trigger    => dma_triggers.hblank,
+      vblank_trigger    => dma_triggers.vblank,
       videodma_start    => '0',
       videodma_stop     => '0',     
          
@@ -349,6 +370,7 @@ begin
    (
       clk               => clk,   
       reset             => reset,
+      ce                => ce,
                         
       savestate_bus     => savestate_bus,
       ss_wired_out      => save_wired_or(3),
@@ -369,10 +391,10 @@ begin
       lowprio_pending   => lowprio_pending(3),
                         
       sound_dma_req     => '0', 
-      hblank_trigger    => hblank_trigger,
-      vblank_trigger    => vblank_trigger,
-      videodma_start    => videodma_start,
-      videodma_stop     => videodma_stop ,     
+      hblank_trigger    => dma_triggers.hblank,
+      vblank_trigger    => dma_triggers.vblank,
+      videodma_start    => dma_triggers.vid_start,
+      videodma_stop     => dma_triggers.vid_stop,
          
       dma_eepromcount   => dma_eepromcount,
          
@@ -429,15 +451,25 @@ begin
    process (clk)
    begin
       if rising_edge(clk) then
+
+         -- Park one-shot requests from the last running cycle until the
+         -- channels can consume them. The channel FSMs stay frozen.
+         if (reset = '1' or ce = '1') then
+            pending_triggers <= NO_TRIGGERS;
+         else
+            pending_triggers <= dma_triggers;
+         end if;
       
-         if (last_dma_valid0 = '1') then
-            last_dma_value <= last_dma0;
-         elsif (last_dma_valid1 = '1') then
-            last_dma_value <= last_dma1;
-         elsif (last_dma_valid2 = '1') then
-            last_dma_value <= last_dma2;
-         elsif (last_dma_valid3 = '1') then
-            last_dma_value <= last_dma3;
+         if (ce = '1') then
+            if (last_dma_valid0 = '1') then
+               last_dma_value <= last_dma0;
+            elsif (last_dma_valid1 = '1') then
+               last_dma_value <= last_dma1;
+            elsif (last_dma_valid2 = '1') then
+               last_dma_value <= last_dma2;
+            elsif (last_dma_valid3 = '1') then
+               last_dma_value <= last_dma3;
+            end if;
          end if;
          
          if (reset = '1') then
@@ -445,7 +477,7 @@ begin
             dma_switch <= 0;
             state      <= IDLE;
         
-         else
+         elsif (ce = '1') then
          
             if    (Array_ena(0) = '1') then dma_switch <= 0;
             elsif (Array_ena(1) = '1') then dma_switch <= 1;
