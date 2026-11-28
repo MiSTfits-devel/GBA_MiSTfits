@@ -81,6 +81,8 @@ begin
 
    endpoints : for unit in unit_t generate
       signal g_sc, g_sc_oe, g_so, g_so_oe, g_sd, g_sd_oe : std_logic;
+      signal g_sd_gpio_oe, sd_gpio_oe : std_logic := '0';
+      signal adp_sd : std_logic := '1';
       signal lp_sc, lp_si, lp_sd, serial_irq : std_logic;
       signal a_sc, a_so, a_so_oe, sc_line, gba_si : std_logic;
       signal user_in, user_out : std_logic_vector(6 downto 0);
@@ -94,6 +96,14 @@ begin
       user_in <= (0 => sc_line, 1 => user_out(1), 2 => gba_si,
                   5 => wire_sd(unit), others => '1');
 
+      process (clk)
+      begin
+         if rising_edge(clk) then
+            adp_sd <= wire_sd(unit);
+            sd_gpio_oe <= g_sd_gpio_oe;
+         end if;
+      end process;
+
       link_port : entity work.gba_linkport
          port map (clk => clk, port_enable => '1', user_in => user_in, user_out => user_out,
                    link_clk_out => g_sc, link_clk_oe => g_sc_oe, link_clk_in => lp_sc,
@@ -106,6 +116,7 @@ begin
                    link_clk_out => g_sc, link_clk_oe => g_sc_oe, link_clk_in => lp_sc,
                    link_so_out => g_so, link_so_oe => g_so_oe, link_si_in => lp_si,
                    link_sd_out => g_sd, link_sd_oe => g_sd_oe, link_sd_in => lp_sd,
+                   link_sd_gpio_oe => g_sd_gpio_oe,
                    IRP_Serial => serial_irq);
 
       adapter : entity work.gba_wireless
@@ -113,7 +124,8 @@ begin
          port map (clk => clk, reset => '0', wireless_ena => '1',
                    link_sc_in => sc_line, link_sc_out => a_sc, link_sc_oe => adapter_master(unit),
                    link_si_in => user_out(1), link_so_out => a_so, link_so_oe => a_so_oe,
-                   link_sd_in => wire_sd(unit), hps_tx_data => hps_tx_data(unit),
+                   link_sd_in => adp_sd, link_sd_gpio_oe => sd_gpio_oe,
+                   hps_tx_data => hps_tx_data(unit),
                    hps_tx_valid => hps_tx_valid(unit), hps_tx_ready => '1',
                    hps_rx_data => hps_rx_data(unit), hps_rx_valid => hps_rx_valid(unit));
 
@@ -656,6 +668,11 @@ begin
 
       report "test 2: host broadcast, child scan/connect, slot-0 status";
       expect_command(HOST, x"10");
+      -- afska reinitializes Normal-32 rather than changing only the speed.
+      write_reg(HOST, SIOCNT, x"1000");
+      write_reg(HOST, SIOCNT, x"1008");
+      write_reg(HOST, SIOCNT, x"1009");
+      write_reg(HOST, SIOCNT, x"100B");
       expect_command(HOST, x"16", GAME_CONFIG);
       expect_command(HOST, x"19");
       expect_command(HOST, x"1A"); -- no children yet

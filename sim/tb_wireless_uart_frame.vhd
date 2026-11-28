@@ -10,10 +10,9 @@ end entity;
 
 architecture sim of tb_wireless_uart_frame is
    constant CLKSPEED  : integer := 16777216;
-   constant BAUD      : integer := 921600;
-   constant DIV       : integer := CLKSPEED / BAUD;
+   constant HPS_BAUD  : integer := 2083333;  -- 100 MHz / 16 / 3
    constant CLK_PERIOD: time := 1 sec / CLKSPEED;
-   constant BIT_TIME  : time := DIV * CLK_PERIOD;
+   constant BIT_TIME  : time := 1 sec / HPS_BAUD;
 
    signal clk          : std_logic := '0';
    signal reset        : std_logic := '1';
@@ -26,6 +25,8 @@ architecture sim of tb_wireless_uart_frame is
    signal htx_ready    : std_logic;
    signal hrx_data     : std_logic_vector(7 downto 0);
    signal hrx_valid    : std_logic;
+   signal rx_count     : natural := 0;
+   signal rx_bytes     : std_logic_vector(23 downto 0);
 
    signal link_sc_out  : std_logic;
    signal link_sc_oe   : std_logic;
@@ -66,6 +67,7 @@ begin
          link_so_out  => link_so_out,
          link_so_oe   => link_so_oe,
          link_sd_in   => sd_in,
+         link_sd_gpio_oe => '1',
          hps_tx_data  => htx_data,
          hps_tx_valid => htx_valid,
          hps_tx_ready => htx_ready,
@@ -75,7 +77,7 @@ begin
       );
 
    uart : entity work.gba_wireless_uart
-      generic map (CLKSPEED => CLKSPEED, BAUD => BAUD)
+      generic map (CLKSPEED => CLKSPEED)
       port map (
          clk      => clk,
          reset    => reset,
@@ -88,9 +90,29 @@ begin
          rx_valid => hrx_valid
       );
 
+   process (clk)
+   begin
+      if rising_edge(clk) and hrx_valid = '1' then
+         rx_count <= rx_count + 1;
+         rx_bytes <= rx_bytes(15 downto 0) & hrx_data;
+      end if;
+   end process;
+
    main : process
       variable b0, b1, b2            : std_logic_vector(7 downto 0);
       variable c0, c1, c2            : std_logic_vector(7 downto 0);
+
+      procedure send_uart_byte(value : std_logic_vector(7 downto 0)) is
+      begin
+         uart_rx <= '0';
+         wait for BIT_TIME;
+         for i in 0 to 7 loop
+            uart_rx <= value(i);
+            wait for BIT_TIME;
+         end loop;
+         uart_rx <= '1';
+         wait for BIT_TIME;
+      end procedure;
    begin
       wait for 20 * CLK_PERIOD;
       reset <= '0';
@@ -127,6 +149,15 @@ begin
       assert c0 = x"04" report "wrong second frame type: " & to_hstring(c0) severity failure;
       assert c1 = x"00" report "wrong second frame event id: " & to_hstring(c1) severity failure;
       assert c2 = x"00" report "wrong second frame event length: " & to_hstring(c2) severity failure;
+
+      -- Back-to-back bytes from the HPS at its actual rate, at an arbitrary
+      -- phase relative to the faster FPGA sampling clock.
+      wait for 17 ns;
+      send_uart_byte(x"A5");
+      send_uart_byte(x"00");
+      send_uart_byte(x"FF");
+      assert rx_count = 3 and rx_bytes = x"A500FF"
+         report "FPGA could not receive consecutive bytes from the HPS at 2 Mbaud" severity failure;
 
       -- The line must return to MARK and STAY idle long-term and stay clean
       -- (no lingering 0x00 flood between/after frames).

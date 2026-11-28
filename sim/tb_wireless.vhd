@@ -42,6 +42,8 @@ architecture sim of tb_wireless is
 
    -- GBA side pins
    signal g_clk_out, g_clk_oe, g_so_out, g_so_oe, g_sd_out, g_sd_oe : std_logic;
+   signal g_sd_gpio_oe, sd_gpio_oe : std_logic := '0';
+   signal adp_sd : std_logic := '1';
    -- adapter side pins
    signal a_sc_out, a_sc_oe, a_so_out, a_so_oe : std_logic;
 
@@ -56,13 +58,14 @@ architecture sim of tb_wireless is
    signal d_rx_data  : std_logic_vector(7 downto 0) := (others => '0');
    signal d_rx_valid : std_logic := '0';
 
-   signal login_done_seen : std_logic := '0';
+   signal ping_events, login_events : natural := 0;
    signal reversal_seen   : std_logic := '0';
    signal gbaack_seen     : std_logic := '0';
    signal req_hello_seen  : std_logic := '0';
    signal req_sstat_seen  : std_logic := '0';
    signal req_wait_seen   : std_logic := '0';
    signal watchdog_events : natural := 0;
+   signal adapter_state   : std_logic_vector(7 downto 0);
 
    constant ADR_SIODATA32 : integer := 16#120#;
    constant ADR_SIOCNT    : integer := 16#128#;
@@ -162,6 +165,14 @@ begin
    user_in(5) <= sd_line;
    user_in(6) <= '1';
 
+   process (clk)
+   begin
+      if rising_edge(clk) then
+         adp_sd <= sd_line;
+         sd_gpio_oe <= g_sd_gpio_oe;
+      end if;
+   end process;
+
    ilinkport : entity work.gba_linkport
    port map
    (
@@ -198,6 +209,7 @@ begin
       link_sd_out      => g_sd_out,
       link_sd_oe       => g_sd_oe,
       link_sd_in       => lp_sd_in,
+      link_sd_gpio_oe  => g_sd_gpio_oe,
       IRP_Serial       => irq_g
    );
 
@@ -214,12 +226,14 @@ begin
       link_si_in   => adp_si,
       link_so_out  => a_so_out,
       link_so_oe   => a_so_oe,
-      link_sd_in   => sd_line,
+      link_sd_in   => adp_sd,
+      link_sd_gpio_oe => sd_gpio_oe,
       hps_tx_data  => d_tx_data,
       hps_tx_valid => d_tx_valid,
       hps_tx_ready => d_tx_ready,
       hps_rx_data  => d_rx_data,
-      hps_rx_valid => d_rx_valid
+      hps_rx_valid => d_rx_valid,
+      debug_state  => adapter_state
    );
 
    -- behavioral daemon: parses FPGA->HPS packets and answers with canned
@@ -261,8 +275,10 @@ begin
 
          if (ptype = x"04") then
             -- event
-            if (b1 = x"01") then
-               login_done_seen <= '1';
+            if (b1 = x"00") then
+               ping_events <= ping_events + 1;
+            elsif (b1 = x"01") then
+               login_events <= login_events + 1;
             elsif (b1 = x"02") then
                reversal_seen <= '1';
                -- inject notify 0x28, no params
@@ -304,8 +320,6 @@ begin
    main : process
       variable r16 : std_logic_vector(15 downto 0);
       variable r32 : std_logic_vector(31 downto 0);
-      variable adapter_hi : std_logic_vector(15 downto 0);
-      variable gba_lo     : std_logic_vector(15 downto 0);
       type tKeystream is array(0 to 9) of std_logic_vector(15 downto 0);
       constant P : tKeystream := (x"494E", x"494E", x"494E", x"544E", x"544E",
                                   x"4E45", x"4E45", x"4F44", x"4F44", x"8001");
@@ -353,59 +367,113 @@ begin
 
       -- sendCommand: header + params, then response request; returns the
       -- ACK header word
-      procedure sendcmd(cmd : in std_logic_vector(7 downto 0); variable ackhdr : out std_logic_vector(31 downto 0)) is
+      procedure sendcmd(cmd : in std_logic_vector(7 downto 0);
+                        variable ackhdr : out std_logic_vector(31 downto 0);
+                        baud2m : in std_logic := '1') is
          variable r : std_logic_vector(31 downto 0);
       begin
-         xfer32(x"9966" & x"00" & cmd, '1', r);
+         xfer32(x"9966" & x"00" & cmd, baud2m, r);
          assert r = x"80000000" report "adapter did not return dummy for header" severity failure;
-         hshake('1');
-         xfer32(x"80000000", '1', r); -- response request
+         hshake(baud2m);
+         xfer32(x"80000000", baud2m, r); -- response request
          ackhdr := r;
-         hshake('1');
+         hshake(baud2m);
+      end procedure;
+
+      procedure activate_2mbps is
+         variable rcnt : std_logic_vector(15 downto 0);
+      begin
+         busread16(bus_g, wired_g, ADR_RCNT, rcnt);
+         buswrite16(bus_g, ADR_RCNT, rcnt and x"7FFF");
+         buswrite16(bus_g, ADR_SIOCNT, x"1000");
+         wait for 4 * CLK_PERIOD;
+         assert sd_line = '0' and sd_gpio_oe = '0'
+            report "Normal external-clock transition must drive SD low without GPIO" severity failure;
+         buswrite16(bus_g, ADR_SIOCNT, x"1008");
+         buswrite16(bus_g, ADR_SIOCNT, x"1009");
+         buswrite16(bus_g, ADR_SIOCNT, x"100B");
+         wait for 4 * CLK_PERIOD;
+         assert sd_line = '1' and sd_gpio_oe = '0'
+            report "Normal internal-clock master should release SD" severity failure;
+      end procedure;
+
+      procedure gpio_ping(afska : boolean) is
+         constant expected : natural := ping_events + 1;
+         variable rcnt : std_logic_vector(15 downto 0);
+      begin
+         buswrite16(bus_g, ADR_RCNT, x"8000");
+         if afska then
+            -- LinkGPIO uses a volatile read/modify/write. Pull-up readback
+            -- makes the GPIO SD output high as soon as its direction changes.
+            buswrite16(bus_g, ADR_SIOCNT, x"0000");
+            busread16(bus_g, wired_g, ADR_RCNT, rcnt);
+            buswrite16(bus_g, ADR_RCNT, rcnt or x"0080");
+            busread16(bus_g, wired_g, ADR_RCNT, rcnt);
+            assert rcnt(1) = '1' and sd_line = '1'
+               report "afska should enter GPIO with SD already high" severity failure;
+            buswrite16(bus_g, ADR_RCNT, rcnt or x"0020");
+            wait for 4 * CLK_PERIOD;
+            assert sd_line = '1' and sd_gpio_oe = '1'
+               report "afska GPIO SD direction change should preserve HIGH" severity failure;
+            busread16(bus_g, wired_g, ADR_RCNT, rcnt);
+            buswrite16(bus_g, ADR_RCNT, rcnt or x"0002");
+            wait for 3.67 ms;
+            busread16(bus_g, wired_g, ADR_RCNT, rcnt);
+            buswrite16(bus_g, ADR_RCNT, rcnt and x"FFFD");
+         else
+            buswrite16(bus_g, ADR_RCNT, x"80A0");
+            wait for 4 * CLK_PERIOD;
+            assert user_out(5) = '0' and user_out(1) = '0'
+               report "SNAC GPIO low mapping wrong (SD=5, SO=1)" severity failure;
+            buswrite16(bus_g, ADR_RCNT, x"80A2");
+            wait for 4 * CLK_PERIOD;
+            assert sd_line = '1' and sd_gpio_oe = '1' and user_out(1) = '0'
+               report "SNAC GPIO SD-high mapping wrong" severity failure;
+            wait for 1.10 ms;
+            buswrite16(bus_g, ADR_RCNT, x"80A0");
+         end if;
+         wait until ping_events = expected for 1 ms;
+         assert ping_events = expected and adapter_state(7 downto 4) = x"1"
+            report "GPIO SD pulse did not restart adapter login" severity failure;
+      end procedure;
+
+      procedure login is
+         constant expected : natural := login_events + 1;
+         variable adapter_hi : std_logic_vector(15 downto 0) := x"8000";
+         variable gba_lo     : std_logic_vector(15 downto 0) := x"FFFF";
+         variable r          : std_logic_vector(31 downto 0);
+      begin
+         buswrite16(bus_g, ADR_RCNT, x"0000");
+         for i in P'range loop
+            wait for 300 us;
+            xfer32((not adapter_hi) & P(i), '0', r);
+            if i >= 2 then
+               assert r = P(i) & (not gba_lo)
+                  report "bad login word " & integer'image(i) & ": " & to_hstring(r) severity failure;
+            end if;
+            adapter_hi := r(31 downto 16);
+            gba_lo := P(i);
+         end loop;
+         if login_events /= expected then
+            wait until login_events = expected for 1 ms;
+         end if;
+         assert login_events = expected report "adapter never reported login complete" severity failure;
       end procedure;
    begin
       wait for 20 * CLK_PERIOD;
 
-      ------------------------------------------------------------------
-      report "test 1: GPIO ping + login";
-      -- pingAdapter(): GPIO mode, SD+SO outputs, SD high ~1.1ms, then low
-      buswrite16(bus_g, ADR_RCNT, x"8000");
-      buswrite16(bus_g, ADR_RCNT, x"80A0"); -- SD/SO outputs, low
-      wait for 4 * CLK_PERIOD;
-      assert user_out(5) = '0' and user_out(1) = '0'
-         report "SNAC GPIO low mapping wrong (SD=5, SO=1)" severity failure;
-      buswrite16(bus_g, ADR_RCNT, x"80A2"); -- SD high
-      wait for 4 * CLK_PERIOD;
-      assert user_out(5) = '1' and user_out(1) = '0'
-         report "SNAC GPIO SD-high mapping wrong" severity failure;
-      wait for 1.2 ms;
-      buswrite16(bus_g, ADR_RCNT, x"80A0"); -- SD low
-      wait for 50 us;
-      buswrite16(bus_g, ADR_RCNT, x"0000"); -- leave GPIO mode
-
-      -- login: 10 exchanges at 256kbps, no handshake, ~1ms gaps
-      adapter_hi := x"8000";
-      gba_lo     := x"FFFF";
-      for i in 0 to 9 loop
-         wait for 300 us;
-         xfer32((not adapter_hi) & P(i), '0', r32);
-         if (i >= 2) then
-            assert r32 = P(i) & (not gba_lo)
-               report "login word " & integer'image(i) & " wrong: got " & to_hstring(r32) &
-                      " want " & to_hstring(P(i) & (not gba_lo)) severity failure;
-         end if;
-         adapter_hi := r32(31 downto 16);
-         gba_lo     := P(i);
-      end loop;
-      wait until login_done_seen = '1' for 1 ms;
-      assert login_done_seen = '1' report "adapter never reported login complete" severity failure;
+      report "test 1: librfu GPIO ping from PWRSAVE + login";
+      gpio_ping(false);
+      login;
       report "test 1 passed";
 
       ------------------------------------------------------------------
       report "test 2: Hello (0x10)";
-      sendcmd(x"10", r32);
+      sendcmd(x"10", r32, '0');
       assert r32 = x"99660090" report "hello ACK wrong: " & to_hstring(r32) severity failure;
       assert req_hello_seen = '1' report "daemon never saw hello" severity failure;
+      activate_2mbps;
+      assert ping_events = 1 report "post-HELLO SPI activation reset the adapter" severity failure;
       report "test 2 passed";
 
       ------------------------------------------------------------------
@@ -475,6 +543,10 @@ begin
       hshake('1');
       wait for 101 ms;
       assert watchdog_events = 0 report "watchdog fired while idle after DataRx" severity failure;
+      activate_2mbps;
+      sendcmd(x"11", r32);
+      assert r32 = x"99660091" and ping_events = 1
+         report "SPI reactivation after >100 ms idle did not preserve the session" severity failure;
 
       xfer32(x"99660116", '1', r32); -- start a request but withhold its parameter
       assert r32 = x"80000000" report "adapter did not accept the next request" severity failure;
@@ -486,10 +558,25 @@ begin
 
       sendcmd(x"3D", r32); -- also verifies that timeout returns to header framing
       assert r32 = x"996600BD" report "StopMode ACK wrong after timeout recovery" severity failure;
+      wait for 4 * CLK_PERIOD;
+      assert adapter_state(7 downto 4) = x"0" and sd_gpio_oe = '0' and gba_si = '1'
+         report "successful StopMode did not enter PWRSAVE and release SO" severity failure;
+      xfer32(x"99660011", '1', r32);
+      assert r32 = x"FFFFFFFF" report "stopped adapter clocked a command without a GPIO ping" severity failure;
       wait for 101 ms;
       assert watchdog_events = 1 report "watchdog fired while idle after StopMode" severity failure;
       report "test 5 passed";
 
+      report "test 6: afska GPIO wake/reset and librfu active reset";
+      gpio_ping(true);
+      login;
+      gpio_ping(true);
+      login;
+      gpio_ping(false);
+      login;
+      sendcmd(x"10", r32, '0');
+      assert r32 = x"99660090" and ping_events = 4 and login_events = 4
+         report "GPIO wake/relogin events or post-reset HELLO wrong" severity failure;
       report "ALL WIRELESS TESTS PASSED";
       done <= true;
       wait;

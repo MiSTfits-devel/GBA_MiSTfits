@@ -74,6 +74,8 @@ architecture sim of tb_wireless_librfu is
    signal irq_clr : std_logic := '0';
 
    signal g_clk_out, g_clk_oe, g_so_out, g_so_oe, g_sd_out, g_sd_oe : std_logic;
+   signal g_sd_gpio_oe, sd_gpio_oe : std_logic := '0';
+   signal adp_sd : std_logic := '1';
    signal a_sc_out, a_sc_oe, a_so_out, a_so_oe : std_logic;
 
    signal sc_line, sd_line, gba_si, adp_si : std_logic;
@@ -177,6 +179,14 @@ begin
    user_in(5) <= sd_line;
    user_in(6) <= '1';
 
+   process (clk)
+   begin
+      if rising_edge(clk) then
+         adp_sd <= sd_line;
+         sd_gpio_oe <= g_sd_gpio_oe;
+      end if;
+   end process;
+
    ilinkport : entity work.gba_linkport
    port map
    (
@@ -213,6 +223,7 @@ begin
       link_sd_out      => g_sd_out,
       link_sd_oe       => g_sd_oe,
       link_sd_in       => lp_sd_in,
+      link_sd_gpio_oe  => g_sd_gpio_oe,
       IRP_Serial       => irq_g
    );
 
@@ -229,7 +240,8 @@ begin
       link_si_in   => adp_si,
       link_so_out  => a_so_out,
       link_so_oe   => a_so_oe,
-      link_sd_in   => sd_line,
+      link_sd_in   => adp_sd,
+      link_sd_gpio_oe => sd_gpio_oe,
       hps_tx_data  => d_tx_data,
       hps_tx_valid => d_tx_valid,
       hps_tx_ready => d_tx_ready,
