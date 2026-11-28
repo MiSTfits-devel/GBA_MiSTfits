@@ -44,6 +44,7 @@ entity gba_serial is
       link_sd_out       : out   std_logic := '1';  -- SD
       link_sd_oe        : out   std_logic := '0';
       link_sd_in        : in    std_logic := '1';
+      link_sd_gpio_oe   : out   std_logic := '0';  -- SD driven by GPIO, not SIO
 
       IRP_Serial        : out std_logic := '0';
 
@@ -328,6 +329,7 @@ begin
          link_clk_oe <= '0';
          link_so_oe  <= '0';
          link_sd_oe  <= '0';
+         link_sd_gpio_oe <= '0';
 
          clockin_1 <= link_clk_in;
 
@@ -364,6 +366,7 @@ begin
                   end if;
                   if (REG_RCNT(5) = '1') then
                      link_sd_oe  <= '1';
+                     link_sd_gpio_oe <= '1';
                      link_sd_out <= REG_RCNT(1);
                   end if;
                   -- SI has no output driver on this port (receive only)

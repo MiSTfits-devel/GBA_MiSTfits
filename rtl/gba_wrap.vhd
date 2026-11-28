@@ -372,6 +372,7 @@ architecture arch of gba_wrap is
    signal wl_si_c1     : std_logic := '1'; -- adapter SO -> core 1 SI
    signal wl_si_adp    : std_logic := '1'; -- core 1 SO -> adapter SI
    signal wl_sd_adp    : std_logic := '1'; -- core 1 SD -> adapter (ping)
+   signal wl_sd_gpio_oe : std_logic := '0';
    signal wl_uart_txd  : std_logic_vector(7 downto 0);
    signal wl_uart_txv  : std_logic;
    signal wl_uart_txr  : std_logic;
@@ -389,6 +390,7 @@ architecture arch of gba_wrap is
    signal c1_link_sd_out    : std_logic;
    signal c1_link_sd_oe     : std_logic;
    signal c1_link_sd_in     : std_logic;
+   signal c1_link_sd_gpio_oe : std_logic;
 
    -- core 2 link lines
    signal c2_link_clk_out   : std_logic;
@@ -502,6 +504,8 @@ architecture arch of gba_wrap is
    signal c0_cpu_irq, c1_cpu_irq               : std_logic;
    signal c0_haltcnt, c1_haltcnt               : std_logic_vector(7 downto 0);
    signal c0_mem_info, c1_mem_info             : std_logic_vector(31 downto 0);
+   signal wl_diag                              : std_logic_vector(70 downto 0);
+   signal c0_link_state_dbg                    : std_logic_vector(70 downto 0);
    signal c0_link_pins, c1_link_pins           : std_logic_vector(7 downto 0);
    
    signal gpufifo_reset    : std_logic;
@@ -819,6 +823,7 @@ begin
       link_sd_out           => c1_link_sd_out       ,
       link_sd_oe            => c1_link_sd_oe        ,
       link_sd_in            => c1_link_sd_in        ,
+      link_sd_gpio_oe       => c1_link_sd_gpio_oe   ,
       debug_link_state      => c1_debug_link_state  ,
       -- debug interface
       GBA_BusAddr           => c0_bus_addr,
@@ -1337,6 +1342,7 @@ begin
          link_sd_out           => c2_link_sd_out,
          link_sd_oe            => c2_link_sd_oe,
          link_sd_in            => c2_link_sd_in,
+         link_sd_gpio_oe       => open,
          debug_link_state      => c2_debug_link_state,
          -- debug interface
          GBA_BusAddr           => gdb_bus_addr,
@@ -2308,7 +2314,7 @@ begin
       c0_cpu_irq        => c0_cpu_irq,
       c0_haltcnt        => c0_haltcnt,
       c0_mem_info       => c0_mem_info,
-      c0_link_state     => c1_debug_link_state,
+      c0_link_state     => c0_link_state_dbg,
       c0_link_pins      => c0_link_pins,
 
       c1_ce             => c1_ce,
@@ -2556,8 +2562,14 @@ begin
          wl_si_c1   <= (wl_so_out      or not wl_so_oe);
          wl_si_adp  <= (c1_link_so_out or not c1_link_so_oe);
          wl_sd_adp  <= (c1_link_sd_out or not c1_link_sd_oe);
+         wl_sd_gpio_oe <= c1_link_sd_gpio_oe;
       end if;
    end process;
+
+   -- Instrumented build: in wireless mode the debug mailbox's 64-bit
+   -- link_state word carries the wireless diagnostic word (the wired link
+   -- state is unused there).
+   c0_link_state_dbg <= wl_diag when link_wireless = '1' else c1_debug_link_state;
 
    igba_wireless : entity work.gba_wireless
    port map
@@ -2572,12 +2584,14 @@ begin
       link_so_out  => wl_so_out,
       link_so_oe   => wl_so_oe,
       link_sd_in   => wl_sd_adp,
+      link_sd_gpio_oe => wl_sd_gpio_oe,
       hps_tx_data  => wl_uart_txd,
       hps_tx_valid => wl_uart_txv,
       hps_tx_ready => wl_uart_txr,
       hps_rx_data  => wl_uart_rxd,
       hps_rx_valid => wl_uart_rxv,
       debug_state  => wl_debug_state,
+      diag         => wl_diag,
       dbg_freeze   => dbg_hold and not c0_ce
    );
 

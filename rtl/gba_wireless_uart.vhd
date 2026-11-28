@@ -6,14 +6,14 @@ use IEEE.numeric_std.all;
 
 -- Plain 8N1 UART for the gba_wireless <-> HPS daemon byte stream, on the
 -- framework's UART_RXD/UART_TXD pins (the MidiLink pattern: an ARM daemon
--- opens the FPGA serial device and bridges to the network). 921600 baud
--- moves a worst-case 95 byte RFU packet in ~1 ms against the protocol's
--- 64.8 ms budget.
+-- opens the FPGA serial device and bridges to the network). Select 2 Mbaud:
+-- the HPS (100 MHz / 16 / 3) and FPGA (16.78 MHz / 8) differ by <1%, and a
+-- 123-byte ACK fits the game's 15-scanline (~1.10 ms) handshake budget.
 entity gba_wireless_uart is
    generic
    (
       CLKSPEED : integer := 16777216;
-      BAUD     : integer := 921600
+      BAUD     : integer := 2000000
    );
    port
    (
@@ -34,11 +34,19 @@ end entity;
 
 architecture arch of gba_wireless_uart is
 
-   constant DIV : integer := CLKSPEED / BAUD; -- ~18 at 16.78MHz/921600
+   constant DIV : integer := CLKSPEED / BAUD;
+   -- Abort a TX byte that somehow never completes (4 byte times).
+   constant TX_STALL_MAX : integer := 4 * 10 * DIV;
 
    signal tx_shift  : std_logic_vector(9 downto 0) := (others => '1');
    signal tx_cnt    : integer range 0 to 10 := 0;
    signal tx_div    : integer range 0 to 65535 := 0;
+   -- '1' once tx_valid has been seen low since the last latched byte, so a
+   -- producer that holds tx_valid across a byte boundary is latched once
+   -- instead of re-latching the same byte for ever (tx_ready would never rise
+   -- again and the whole FPGA->HPS path would be dead until reset).
+   signal tx_armed  : std_logic := '1';
+   signal tx_watch  : integer range 0 to TX_STALL_MAX := 0;
 
    signal rx_sync   : std_logic_vector(1 downto 0) := "11";
    signal rx_div    : integer range 0 to 65535 := 0;
@@ -55,24 +63,38 @@ begin
          rx_valid <= '0';
          rx_sync  <= rx_sync(0) & uart_rx;
 
+         if (tx_valid = '0') then
+            tx_armed <= '1';
+         end if;
+
          -- transmit
          if (tx_cnt = 0) then
             tx_ready <= '1';
-            if (tx_valid = '1') then
+            tx_watch <= 0;
+            if (tx_valid = '1' and tx_armed = '1') then
                tx_shift <= '1' & tx_data & '0'; -- stop, data (lsb out first), start
                tx_cnt   <= 10;
                tx_div   <= DIV - 1;
                tx_ready <= '0';
+               tx_armed <= '0';
             end if;
          else
             tx_ready <= '0';
             uart_tx  <= tx_shift(0);
-            if (tx_div = 0) then
+            if (tx_watch = TX_STALL_MAX) then
+               -- bounded self-recovery: drop a byte that cannot complete
+               tx_cnt   <= 0;
+               tx_ready <= '1';
+               uart_tx  <= '1';
+               tx_watch <= 0;
+            elsif (tx_div = 0) then
                tx_shift <= '1' & tx_shift(9 downto 1);
                tx_cnt   <= tx_cnt - 1;
                tx_div   <= DIV - 1;
+               tx_watch <= tx_watch + 1;
             else
                tx_div <= tx_div - 1;
+               tx_watch <= tx_watch + 1;
             end if;
          end if;
 
@@ -105,6 +127,8 @@ begin
          if (reset = '1') then
             tx_cnt    <= 0;
             tx_ready  <= '1';
+            tx_armed  <= '1';
+            tx_watch  <= 0;
             uart_tx   <= '1';
             rx_active <= '0';
          end if;

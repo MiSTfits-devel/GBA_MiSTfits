@@ -125,6 +125,7 @@ entity gba_top is
       link_sd_out           : out    std_logic := '1';
       link_sd_oe            : out    std_logic := '0';
       link_sd_in            : in     std_logic := '1';
+      link_sd_gpio_oe       : out    std_logic := '0';
       -- temporary hardware diagnostic, see gba_serial.vhd/gba_wrap.vhd
       debug_link_state      : out    std_logic_vector(70 downto 0) := (others => '0');
       -- debug interface
@@ -507,6 +508,7 @@ begin
       link_sd_out       => link_sd_out,
       link_sd_oe        => link_sd_oe,
       link_sd_in        => link_sd_in,
+      link_sd_gpio_oe   => link_sd_gpio_oe,
 
       IRP_Serial        => IRP_Serial,
       debug_link_state  => debug_link_state
