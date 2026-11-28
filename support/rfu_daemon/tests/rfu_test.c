@@ -135,6 +135,115 @@ static void test_unit(void)
     printf("unit: done\n");
 }
 
+// --- session boundaries and the host receive path -------------------------
+
+static void inject_connect_req(int peer)
+{
+    uint8_t pkt[RFU1_LEN_CMD] = { 0 };
+    be_put32(&pkt[0], RFU1_MAGIC);
+    be_put32(&pkt[4], RFU1_CONNECT_REQ);
+    rfu_core_net_receive(peer, pkt, sizeof(pkt));
+}
+
+static void inject_client_send(int peer, int slot, uint16_t devid,
+                               const uint8_t *data, unsigned blen)
+{
+    uint8_t pkt[RFU1_LEN_DATA] = { 0 };
+    be_put32(&pkt[0], RFU1_MAGIC);
+    be_put32(&pkt[4], RFU1_CLIENT_SEND);
+    be_put32(&pkt[8], ((uint32_t)blen << 24) | ((uint32_t)slot << 16) | devid);
+    memcpy(&pkt[12], data, blen);
+    rfu_core_net_receive(peer, pkt, sizeof(pkt));
+}
+
+static void test_sessions(void)
+{
+    uint32_t r[RFU_MAX_WORDS], p[8];
+    uint8_t frame[16];
+    int n, slot0 = 0, i;
+    uint16_t devid0 = 0;
+
+    printf("unit: session boundaries and host receive\n");
+    rfu_core_init();
+
+    /* 1. A child joins a fresh room. */
+    p[0] = 0x003C0420;                    // maxPlayers encoding: four free slots
+    CHECK(cmd(0x17, 1, p, r) == 0, "SystemConfig");
+    CHECK(cmd(0x19, 0, NULL, r) == 0, "SC_Start");
+    inject_connect_req(24);
+    n = cmd(0x1A, 0, NULL, r);
+    CHECK(n == 1, "fresh host must accept a CONNECT_REQ (n=%d)", n);
+    if (n == 1) {
+        slot0  = (r[0] >> 16) & 3;
+        devid0 = r[0] & 0xffff;
+    }
+    CHECK(n == 1 && slot0 == 0 && devid0, "child must land in slot 0, got %08x", r[0]);
+
+    /* 2. Re-hosting opens a fresh room: the stale child must be gone and a
+     *    new peer must be accepted into slot 0 again. */
+    CHECK(cmd(0x19, 0, NULL, r) == 0, "second SC_Start");
+    n = cmd(0x1A, 0, NULL, r);
+    CHECK(n == 0, "SC_Start must clear the previous room (n=%d)", n);
+    inject_connect_req(25);
+    n = cmd(0x1A, 0, NULL, r);
+    CHECK(n == 1 && ((r[0] >> 16) & 3) == 0,
+          "re-hosted room must accept the new child in slot 0 (n=%d, %08x)", n, r[0]);
+
+    /* 3. Hello (0x10) resets the session the same way. */
+    CHECK(cmd(0x19, 0, NULL, r) == 0, "SC_Start before the reset check");
+    inject_connect_req(26);
+    CHECK(cmd(0x1A, 0, NULL, r) == 1, "child expected before the reset");
+    CHECK(cmd(0x10, 0, NULL, r) == 0, "Hello");
+    CHECK(cmd(0x19, 0, NULL, r) == 0, "SC_Start after Hello");
+    inject_connect_req(27);
+    n = cmd(0x1A, 0, NULL, r);
+    CHECK(n == 1 && ((r[0] >> 16) & 3) == 0,
+          "Hello + SC_Start must accept a child in slot 0 (n=%d)", n);
+    if (n == 1) {
+        slot0  = (r[0] >> 16) & 3;
+        devid0 = r[0] & 0xffff;
+    }
+
+    /* 4. Child payload reaches the host through DataRx. */
+    for (i = 0; i < 8; i++) frame[i] = (uint8_t)(0x40 + i);
+    inject_client_send(27, slot0, devid0, frame, 8);
+    n = cmd(0x26, 0, NULL, r);
+    CHECK(n >= 2, "host DataRx must carry the child payload (n=%d)", n);
+    if (n >= 2) {
+        CHECK(((r[0] >> (8 + slot0 * 5)) & 0x1f) == 8,
+              "DataRx length field for slot %d must be 8, got %08x", slot0, r[0]);
+        CHECK((r[1] & 0xff) == 0x40 && ((r[1] >> 8) & 0xff) == 0x41,
+              "DataRx payload byte order wrong: %08x", r[1]);
+    }
+    CHECK(cmd(0x26, 0, NULL, r) == 0, "DataRx must be empty once drained");
+
+    /* 5. Queue overflow keeps the freshest frame (drop oldest). */
+    for (i = 0; i < 6; i++) {             // MAX_PKTS is 4
+        memset(frame, (uint8_t)(0x10 + i), 8);
+        inject_client_send(27, slot0, devid0, frame, 8);
+    }
+    n = cmd(0x26, 0, NULL, r);
+    CHECK(n >= 2 && (r[1] & 0xff) == 0x12,
+          "drop-oldest must keep the four newest frames (oldest now 0x12), got %08x",
+          n >= 2 ? r[1] : 0);
+    for (i = 0; i < 3; i++)              // drain the rest: 0x13, 0x14, 0x15
+        n = cmd(0x26, 0, NULL, r);
+    CHECK(n >= 2 && (r[1] & 0xff) == 0x15,
+          "the newest frame must survive the overflow, got %08x", n >= 2 ? r[1] : 0);
+
+    /* 6. A closed entry rejects with a logged reason, an open one with a full
+     *    slot mask rejects too (advertised backpressure, not a wedge). */
+    n = cmd(0x1B, 0, NULL, r);           // stops accepting, keeps children
+    CHECK(n >= 0, "SC_End must succeed (n=%d)", n);
+    {
+        int before = cmd(0x1A, 0, NULL, r);
+        inject_connect_req(28);
+        CHECK(cmd(0x1A, 0, NULL, r) == before,
+              "a closed entry must not accept a new child (was %d)", before);
+    }
+    printf("unit: session checks done\n");
+}
+
 // --- two-process session --------------------------------------------------
 
 static void say(const char *who, const char *what) { printf("  %s: %s\n", who, what); }
@@ -279,6 +388,7 @@ int main(int argc, char **argv)
 {
     if (argc >= 2 && !strcmp(argv[1], "unit")) {
         test_unit();
+        test_sessions();
         printf(failures ? "UNIT FAILED (%d)\n" : "UNIT PASSED\n", failures);
         return failures ? 1 : 0;
     }

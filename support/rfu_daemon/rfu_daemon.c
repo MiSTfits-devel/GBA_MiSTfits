@@ -27,7 +27,10 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,8 +39,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#ifndef B921600           // absent on non-Linux dev hosts; target is Linux
-#define B921600 B115200
+#ifndef B2000000          // PTY tests on development hosts without this rate
+#define B2000000 B115200
 #endif
 
 #define RFU_UDP_PORT 55440
@@ -47,6 +50,19 @@
 
 static int uart    = -1;
 static int verbose = 0;
+
+#define LOG_SLOTS 128u
+#define LOG_LINE_MAX 256u
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "RFU log indices must be lock-free");
+
+static struct {
+    char line[LOG_SLOTS][LOG_LINE_MAX];
+    atomic_uint write_pos, read_pos, dropped;
+} logs;
+
+// Timestamp the batch with the event loop's existing clock sample. The
+// producer never needs to wake the writer or query the clock itself.
+static uint64_t log_time_ms;
 
 // The FPGA waits for each REQ's ACK. Keep one outbound frame intact across
 // short writes, and defer dispatching any buffered requests until it drains.
@@ -79,13 +95,78 @@ uint32_t rfu_now_ms(void)
 
 void rfu_log(const char *fmt, ...)
 {
-    va_list ap;
     if (!verbose)
         return;
+
+    unsigned pos = atomic_load_explicit(&logs.write_pos, memory_order_relaxed);
+    unsigned read = atomic_load_explicit(&logs.read_pos, memory_order_acquire);
+    if (pos - read == LOG_SLOTS) {
+        // Only the producer increments this counter.
+        unsigned dropped = atomic_load_explicit(&logs.dropped, memory_order_relaxed);
+        atomic_store_explicit(&logs.dropped, dropped + 1, memory_order_relaxed);
+        return;
+    }
+
+    char *line = logs.line[pos % LOG_SLOTS];
+    int prefix = snprintf(line, LOG_LINE_MAX, "rfu: t_ms=%" PRIu64 " ", log_time_ms);
+    va_list ap;
     va_start(ap, fmt);
-    fprintf(stderr, "rfu: t_ms=%" PRIu64 " ", monotonic_ms());
-    vfprintf(stderr, fmt, ap);
+    int n = vsnprintf(line + prefix, LOG_LINE_MAX - (size_t)prefix, fmt, ap);
     va_end(ap);
+    // Preserve record boundaries if a diagnostic is truncated.
+    if (n < 0 || (size_t)n >= LOG_LINE_MAX - (size_t)prefix) {
+        line[LOG_LINE_MAX - 2] = '\n';
+        line[LOG_LINE_MAX - 1] = '\0';
+    }
+    atomic_store_explicit(&logs.write_pos, pos + 1, memory_order_release);
+}
+
+static int log_write(const char *line)
+{
+    size_t left = strlen(line);
+    while (left) {
+        ssize_t n = write(STDERR_FILENO, line, left);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            return -1;
+        line += n;
+        left -= (size_t)n;
+    }
+    return 0;
+}
+
+static void *log_writer(void *unused)
+{
+    (void)unused;
+    // Losing a pipe reader must not terminate the UART process.
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGPIPE);
+    pthread_sigmask(SIG_BLOCK, &mask, NULL);
+
+    unsigned pos = 0, reported_drops = 0;
+    for (;;) {
+        // Drain a snapshot so drop reports are not starved by a busy producer.
+        unsigned end = atomic_load_explicit(&logs.write_pos, memory_order_acquire);
+        int idle = pos == end;
+        while (pos != end) {
+            if (log_write(logs.line[pos % LOG_SLOTS]) < 0)
+                return NULL;
+            atomic_store_explicit(&logs.read_pos, ++pos, memory_order_release);
+        }
+        unsigned dropped = atomic_load_explicit(&logs.dropped, memory_order_relaxed);
+        if (dropped != reported_drops) {
+            char notice[64];
+            snprintf(notice, sizeof(notice), "rfu: dropped %u log records\n",
+                     dropped - reported_drops);
+            if (log_write(notice) < 0)
+                return NULL;
+            reported_drops = dropped;
+        }
+        if (idle)
+            nanosleep(&(const struct timespec){ .tv_nsec = 4000000 }, NULL);
+    }
 }
 
 // --- UART ----------------------------------------------------------------
@@ -117,7 +198,7 @@ static int uart_flush(void)
         return 0;  // resume at the same offset on POLLOUT
     if (n == 0)
         errno = EIO;
-    perror("uart write");
+    rfu_log("uart write failed: errno=%d\n", errno);
     return -1;
 }
 
@@ -125,7 +206,7 @@ static int uart_flush(void)
 static int send_packet(uint8_t type, uint8_t cc, uint8_t nwords, const uint32_t *w)
 {
     if (nwords > RFU_MAX_WORDS) {
-        fprintf(stderr, "invalid UART transmit length: %u words\n", nwords);
+        rfu_log("invalid UART transmit length: %u words\n", nwords);
         return -1;
     }
     tx.frame[0] = type;
@@ -279,9 +360,9 @@ static int uart_read_input(void)
     if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
         return 0;
     if (n == 0)
-        fprintf(stderr, "uart eof\n");
+        rfu_log("uart eof\n");
     else
-        perror("uart read");
+        rfu_log("uart read failed: errno=%d\n", errno);
     return -1;
 }
 
@@ -327,12 +408,26 @@ int main(int argc, char **argv)
     if (uart < 0) { perror(dev); return 1; }
 
     struct termios tio;
-    if (tcgetattr(uart, &tio) == 0) {
-        cfmakeraw(&tio);
-        cfsetspeed(&tio, B921600);
-        tio.c_cc[VMIN] = 1;
-        tio.c_cc[VTIME] = 0;
-        tcsetattr(uart, TCSANOW, &tio);
+    if (tcgetattr(uart, &tio) < 0) {
+        perror("uart tcgetattr");
+        return 1;
+    }
+    cfmakeraw(&tio);
+    tio.c_cc[VMIN] = 1;
+    tio.c_cc[VTIME] = 0;
+    if (cfsetspeed(&tio, B2000000) < 0 || tcsetattr(uart, TCSANOW, &tio) < 0) {
+        perror("uart tcsetattr");
+        return 1;
+    }
+
+    if (verbose) {
+        pthread_t writer;
+        int error = pthread_create(&writer, NULL, log_writer, NULL);
+        if (error) {
+            fprintf(stderr, "rfu_daemon: cannot start log writer: %s\n", strerror(error));
+            return 1;
+        }
+        log_time_ms = monotonic_ms();
     }
 
     rfu_core_init();
@@ -343,18 +438,27 @@ int main(int argc, char **argv)
     for (int i = 0; i < npeers; i++)
         rfu_net_add_peer(peers[i], port);
 
-    fprintf(stderr, "rfu_daemon: %s <-> udp/%d%s\n",
-            dev, port, lan ? " (LAN discovery on)" : "");
+    if (verbose)
+        rfu_log("rfu_daemon: %s <-> udp/%d%s\n",
+                dev, port, lan ? " (LAN discovery on)" : "");
+    else
+        fprintf(stderr, "rfu_daemon: %s <-> udp/%d%s\n",
+                dev, port, lan ? " (LAN discovery on)" : "");
 
     if (np_port > 0) {
         int bound = netplay_host_open(np_port);
-        if (bound < 0)
-            fprintf(stderr, "rfu_daemon: cannot host netplay on tcp/%d (%d)\n",
-                    np_port, bound);
-        else
-            fprintf(stderr, "rfu_daemon: netplay host on tcp/%d "
-                            "(RetroArch %s + gpSP may join)\n",
+        if (bound < 0) {
+            if (verbose)
+                rfu_log("rfu_daemon: cannot host netplay on tcp/%d (%d)\n", np_port, bound);
+            else
+                fprintf(stderr, "rfu_daemon: cannot host netplay on tcp/%d (%d)\n", np_port, bound);
+        } else if (verbose) {
+            rfu_log("rfu_daemon: netplay host on tcp/%d (RetroArch %s + gpSP may join)\n",
                     bound, NETPLAY_TARGET_VERSION);
+        } else {
+            fprintf(stderr, "rfu_daemon: netplay host on tcp/%d (RetroArch %s + gpSP may join)\n",
+                    bound, NETPLAY_TARGET_VERSION);
+        }
     }
 
     // Single loop over both the UART and the socket. The ~60 Hz housekeeping
@@ -391,15 +495,16 @@ int main(int argc, char **argv)
 
         if (poll(fds, nfds, timeout) < 0) {
             if (errno == EINTR) continue;
-            perror("poll");
+            rfu_log("poll failed: errno=%d\n", errno);
             return 1;
         }
 
         if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-            fprintf(stderr, "uart poll error: revents=0x%X\n", fds[0].revents);
+            rfu_log("uart poll error: revents=0x%X\n", fds[0].revents);
             return 1;
         }
-        now = rfu_now_ms();
+        log_time_ms = monotonic_ms();
+        now = (uint32_t)log_time_ms;
         uart_rx_expire(now);
         if ((fds[0].revents & POLLOUT) && uart_flush() < 0)
             return 1;

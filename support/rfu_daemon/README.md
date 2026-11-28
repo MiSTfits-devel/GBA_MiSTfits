@@ -11,6 +11,8 @@ SPI transport from `rfu.c`:
 The FPGA forwards each complete command packet over the framework UART and
 takes the answer back the same way, so all RFU behaviour is plain C that can be
 tested on a laptop. See the [AGB-015 protocol notes](../../docs/agb015_protocol.md).
+The daemon and FPGA must agree on the **2 Mbaud** UART setting. An older
+921600-baud FPGA build must continue using the matching older daemon.
 
 ## The radio
 
@@ -65,7 +67,7 @@ adapter in reset and never sends it anything.
 | `-P host[:port]` | add a peer explicitly; repeatable, for play over the internet |
 | `-N port` | Listen for RetroArch 1.22.2 + gpSP netplay clients on this TCP port; disabled by default |
 | `-L` | disable LAN auto-discovery |
-| `-v` | Log to stderr with monotonic `t_ms`, command hex, payload counts/first words, and `0x28` parameters plus active/ACKed slot masks |
+| `-v` | Log to stderr with monotonic `t_ms`, command hex, payload counts/first words, and `0x28` parameters plus active/ACKed slot masks; drop and count records if the log sink falls behind |
 
 Two MiSTers on one LAN need no flags at all. Across the internet, one side
 forwards udp/55440 and the other passes `-P their.address`.
@@ -83,6 +85,9 @@ on TCP `55435`. The compatibility handshake targets RetroArch 1.22.2.
   25 ms. Pending UART output and per-client TCP output resume on `POLLOUT`;
   a peer that fills its bounded TCP output queue is disconnected instead of
   blocking STWI or other peers.
+* The UART/netplay loop never writes logs to disk. A separate thread drains a
+  bounded queue, so even `-v` redirected to synchronous FAT storage cannot
+  block an ACK. Timestamps reflect the event-loop sample, not UART wire time.
 * Retail Emerald's parent keepalive uses `0x24` or `0x25` with the single
   parameter `0x00000001` and no payload word. The daemon reconstructs the
   `0xFF` null frame and still rejects malformed ordinary payload lengths.
@@ -93,10 +98,10 @@ on TCP `55435`. The compatibility handshake targets RetroArch 1.22.2.
 
 ## Verification
 
-The simulation benches cover login, command framing, clock reversal and
-handback, and idle versus stalled-transfer watchdog behavior. `make check`
-covers RFU commands, the netplay handshake, teardown ordering, and UART
-framing. In a live MiSTer ↔ gpSP Pokémon Emerald wireless trade, both trainers
+The simulation benches cover login, GPIO resets, StopMode wake, command
+framing, clock reversal, and both directions of the 2 Mbaud UART. `make check`
+covers RFU commands, netplay, teardown, and UART service with a blocked log
+sink. In a live MiSTer ↔ gpSP Pokémon Emerald wireless trade, both trainers
 exchanged Pokémon, saved, and returned cleanly to the Union Room with zero
 word watchdog events and zero command rejections. The final `0x28` preserved
 the departing child's ACK (`ActiveSlot=0x0`, `ACKinfo=0x1`), and the parent

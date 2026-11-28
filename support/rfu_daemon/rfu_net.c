@@ -8,6 +8,7 @@
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -168,9 +169,17 @@ void rfu_net_send(int peer, const void *buf, size_t len)
     if (sock < 0)
         return;
     if (peer >= 0) {
-        if (peer < RFU_NET_MAX_PEERS && peers[peer].used)
-            sendto(sock, buf, len, 0, (struct sockaddr *)&peers[peer].addr,
-                   sizeof(peers[peer].addr));
+        if (peer < RFU_NET_MAX_PEERS && peers[peer].used) {
+            ssize_t n = sendto(sock, buf, len, 0,
+                               (struct sockaddr *)&peers[peer].addr,
+                               sizeof(peers[peer].addr));
+            if (n != (ssize_t)len)
+                rfu_log("udp: peer %d sendto -> %zd (want %zu) errno %d\n",
+                        peer, n, len, errno);
+        } else {
+            rfu_log("udp: peer %d unused, datagram dropped (len %zu)\n",
+                    peer, len);
+        }
         return;
     }
     for (i = 0; i < RFU_NET_MAX_PEERS; i++)

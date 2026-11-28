@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import termios
 
 
 def free_port(kind):
@@ -48,6 +49,64 @@ def connect(port):
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.005)
+
+
+def expect_logs(log, markers):
+    deadline = time.monotonic() + 1
+    while True:
+        # Never move the shared file offset of the daemon's stderr.
+        output = os.pread(log.fileno(), os.fstat(log.fileno()).st_size, 0).decode()
+        if all(marker in output for marker in markers):
+            return output
+        assert time.monotonic() < deadline, output
+        time.sleep(0.005)
+
+
+def blocked_stderr(daemon_path):
+    master, slave = pty.openpty()
+    read_fd, write_fd = os.pipe()
+    try:
+        # Fill the pipe before spawning the daemon and leave it undrained.
+        # Turn blocking back on for the daemon so its writer really stalls.
+        os.set_blocking(write_fd, False)
+        for size in (4096, 1):
+            while True:
+                try:
+                    os.write(write_fd, b" " * size)
+                except BlockingIOError:
+                    break
+        os.set_blocking(write_fd, True)
+
+        tcp_port = free_port(socket.SOCK_STREAM)
+        with subprocess.Popen(
+            [daemon_path, "-d", os.ttyname(slave), "-L", "-v",
+             "-p", str(free_port(socket.SOCK_DGRAM)), "-N", str(tcp_port)],
+            stderr=write_fd
+        ) as daemon:
+            try:
+                with connect(tcp_port) as tcp:
+                    # Wrong impl magic still negotiates; its warning must
+                    # likewise not write from the UART/netplay loop.
+                    tcp.sendall(struct.pack("!6I", 0x52414E50, 0, 0, 7, 5, 0))
+                    assert read_exact(tcp, 24)[:4] == b"RANP"
+                    # Two log records per HELLO, enough to overflow the ring
+                    # regardless of whether the writer has been scheduled.
+                    for _ in range(256):
+                        os.write(master, b"\x01\x10\x00")
+                        expect_frame(master, 2, 0x90)
+
+                output = bytearray()
+                deadline = time.monotonic() + 1
+                while not re.search(rb"rfu: dropped [1-9][0-9]* log records\n", output):
+                    assert select.select([read_fd], [], [], max(0, deadline - time.monotonic()))[0], (
+                        "writer never reported the log records dropped while stderr was blocked"
+                    )
+                    output.extend(os.read(read_fd, 4096))
+            finally:
+                daemon.kill()
+    finally:
+        for fd in (master, slave, read_fd, write_fd):
+            os.close(fd)
 
 
 def exercise(master, udp, tcp, udp_port):
@@ -106,22 +165,25 @@ def main():
             )
             try:
                 with connect(tcp_port) as tcp:
+                    rate = getattr(termios, "B2000000", termios.B115200)
+                    assert termios.tcgetattr(slave)[4:6] == [rate, rate]
                     exercise(master, udp, tcp, udp_port)
-                log.seek(0)
-                output = log.read().decode()
+                output = expect_logs(log, [
+                    "uart=req cmd=0x17 words=1 first=00000420",
+                    "drop=timeout have=4 need=27",
+                    "drop=timeout have=2 need=3",
+                    "cmd=0x28 words=1 param=0x00000000 active=0x0 acked=0x0",
+                ])
                 timestamps = [int(ms) for ms in re.findall(r"^rfu: t_ms=(\d+) ", output, re.M)]
                 assert timestamps and timestamps == sorted(timestamps), output
-                assert "uart=req cmd=0x17 words=1 first=00000420" in output, output
-                assert "drop=timeout have=4 need=27" in output, output
-                assert "drop=timeout have=2 need=3" in output, output
-                assert "cmd=0x28 words=1 param=0x00000000 active=0x0 acked=0x0" in output, output
             finally:
                 daemon.kill()
                 daemon.wait()
     finally:
         os.close(master)
         os.close(slave)
-    print("UART PTY, UDP/TCP service and logging passed")
+    blocked_stderr(sys.argv[1])
+    print("UART PTY, UDP/TCP service, and blocked stderr logging passed")
 
 
 if __name__ == "__main__":

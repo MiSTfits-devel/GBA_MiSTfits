@@ -252,9 +252,8 @@ static int consume(struct client *c, int peer)
             uint32_t proto  = select_protocol(cli_lo, cli_hi);
             if (proto < LOW_NETPLAY_PROTOCOL_VERSION ||
                 proto > HIGH_NETPLAY_PROTOCOL_VERSION) {
-                fprintf(stderr, "netplay: client protocol %u..%u "
-                        "outside our %d..%d\n", cli_lo, cli_hi,
-                        LOW_NETPLAY_PROTOCOL_VERSION,
+                rfu_log("netplay: client protocol %u..%u outside our %d..%d\n",
+                        cli_lo, cli_hi, LOW_NETPLAY_PROTOCOL_VERSION,
                         HIGH_NETPLAY_PROTOCOL_VERSION);
                 return -1;
             }
@@ -266,7 +265,7 @@ static int consume(struct client *c, int peer)
             uint32_t our_impl   = nph_impl_magic(NETPLAY_TARGET_VERSION,
                                                  HIGH_NETPLAY_PROTOCOL_VERSION);
             if (their_impl != our_impl)
-                fprintf(stderr, "netplay: client impl magic 0x%08X != ours "
+                rfu_log("netplay: client impl magic 0x%08X != ours "
                         "0x%08X (different RetroArch build; continuing)\n",
                         their_impl, our_impl);
 
@@ -477,19 +476,28 @@ void netplay_host_send(int peer, const void *buf, size_t len)
     // Host -> client: the field carries the SOURCE id, and 0 means the host.
     cmd[2] = htonl(0);
 
+    int handed = 0;
     for (int i = 0; i < NETPLAY_HOST_MAX_CLIENTS; i++) {
         if (peer >= 0 && i != peer) continue;
-        if (clients[i].state != CS_PLAYING) continue;
+        if (clients[i].state != CS_PLAYING) {
+            if (peer >= 0)
+                rfu_log("netplay: peer %d not playing (state %d), skipped\n",
+                        i, (int)clients[i].state);
+            continue;
+        }
         uint8_t *p = queue_space(&clients[i], sizeof(cmd) + len);
         if (!p) {
             rfu_log("netplay: peer %d TX queue full; disconnecting\n", i);
             drop_client(i);
             continue;
         }
+        handed++;
         memcpy(p, cmd, sizeof(cmd));
         if (len)
             memcpy(p + sizeof(cmd), buf, len);
     }
+    if (peer >= 0 && !handed)
+        rfu_log("netplay: peer %d got nothing (len %zu)\n", peer, len);
 }
 
 int netplay_host_client_count(void)

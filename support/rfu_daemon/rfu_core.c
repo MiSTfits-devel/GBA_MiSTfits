@@ -216,6 +216,8 @@ static int stage_tx(uint8_t len, const uint32_t *p)
     txbuf.acked = 0;
     txbuf.departed_acked = 0;
     txbuf.report_pending = 0;
+    rfu_log("stage_tx: blen=%u null_llsf=%d targets=%02x host=%d len=%u\n",
+            blen, null_llsf, txbuf.targets, is_host(), len);
     if (null_llsf)
         txbuf.words[0] = 0xFF;
     else
@@ -228,15 +230,23 @@ static int stage_tx(uint8_t len, const uint32_t *p)
 // DataTx, so both end up here.
 static int transmit_staged(void)
 {
-    if (!txbuf.valid)
+    if (!txbuf.valid) {
+        rfu_log("tx_staged: nothing staged\n");
         return -1;
+    }
 
     if (is_host()) {
         txbuf.report_pending = 1;
         for (int i = 0; i < MAX_CLIENTS; i++)
-            if ((txbuf.targets & ~txbuf.acked) & (1u << i))
+            if ((txbuf.targets & ~txbuf.acked) & (1u << i)) {
+                rfu_log("tx_staged: slot %d peer %d devid %04x blen %u -> HOST_SEND\n",
+                        i, host.clients[i].peer, host.clients[i].devid, txbuf.blen);
                 net_data(host.clients[i].peer, RFU1_HOST_SEND,
                          txbuf.blen, txbuf.words, txbuf.blen);
+            } else if (txbuf.targets & (1u << i)) {
+                rfu_log("tx_staged: slot %d peer %d already acked, skipped\n",
+                        i, host.clients[i].peer);
+            }
     } else if (state == RFU_ST_CLIENT) {
         net_data(client.host_peer, RFU1_CLIENT_SEND,
                  ((uint32_t)txbuf.blen << 24) |
@@ -318,12 +328,15 @@ int rfu_core_command(uint8_t cmd, uint8_t len, const uint32_t *p, uint32_t *resp
     case 0x19: // SC_Start: host and accept children
         if (state == RFU_ST_CLIENT || state == RFU_ST_CONNECTING)
             return -1;
-        if (!is_host()) {
-            host.devid = new_devid();
-            memset(host.clients, 0, sizeof(host.clients));
-            memset(&txbuf, 0, sizeof(txbuf));
-            rfu_log("hosting, device id %04x\n", host.devid);
-        }
+        /* SC_Start always opens a fresh room. Re-hosting while already hosting
+         * used to keep host.clients[] from the previous session, so the next
+         * CONNECT_REQ found no free slot inside cfg_avail_slots and was NACKed
+         * for the rest of that daemon's life (only a GPIO ping cleared them).
+         * A host that announces a room must have all four slots free. */
+        host.devid = new_devid();
+        memset(host.clients, 0, sizeof(host.clients));
+        memset(&txbuf, 0, sizeof(txbuf));
+        rfu_log("hosting, device id %04x\n", host.devid);
         state           = RFU_ST_HOST_OPEN;
         host.entry_open = 1;
         host.tx_ttl     = BCAST_PERIOD_FR; // announce on the next tick
@@ -335,6 +348,8 @@ int rfu_core_command(uint8_t cmd, uint8_t len, const uint32_t *p, uint32_t *resp
         for (i = 0; i < MAX_CLIENTS; i++)
             if (host.clients[i].devid)
                 resp[n++] = host.clients[i].devid | ((uint32_t)i << 16);
+        rfu_log("poll1A: state=%s slots=%02x words=%d first=%08x\n",
+                state_names[state], host_slots(), n, n ? resp[0] : 0);
         return n;
 
     case 0x1B: // SC_End: stop accepting, keep the ones we have
@@ -398,8 +413,13 @@ int rfu_core_command(uint8_t cmd, uint8_t len, const uint32_t *p, uint32_t *resp
 
     case 0x24: // DataTx
     case 0x25: // DataTx & Change (reversal follows the ACK)
-        if (!len || stage_tx(len, p) < 0)
+        if (!len || stage_tx(len, p) < 0) {
+            rfu_log("tx_cmd 0x%02X: refused (len=%u first=%08x)\n",
+                    cmd, len, len ? p[0] : 0);
             return -1;
+        }
+        rfu_log("tx_cmd 0x%02X: len=%u blen=%u targets=%02x valid=%d\n",
+                cmd, len, txbuf.blen, txbuf.targets, txbuf.valid);
         return transmit_staged();
 
     case 0x37: // ResumeRetransmit & Change: resend the staged frame
@@ -411,6 +431,7 @@ int rfu_core_command(uint8_t cmd, uint8_t len, const uint32_t *p, uint32_t *resp
         if (is_host()) {
             n = 1;
             resp[0] = 0;
+            rfu_log("rx_poll: host slots=%02x\n", host_slots());
             for (i = 0; i < MAX_CLIENTS; i++) {
                 unsigned dlen = host.clients[i].pkts[0].len;
                 if (dlen > 16) dlen = 16;
@@ -665,6 +686,8 @@ void rfu_core_net_receive(int peer, const void *buf, size_t len)
 
     case RFU1_CONNECT_REQ:
         if (state != RFU_ST_HOST_OPEN || !host.entry_open) {
+            rfu_log("connect nack peer %d: state=%d entry_open=%d\n",
+                    peer, (int)state, (int)host.entry_open);
             net_cmd(peer, RFU1_CONNECT_NACK, 0);
             return;
         }
@@ -683,6 +706,10 @@ void rfu_core_net_receive(int peer, const void *buf, size_t len)
                         host.clients[i].devid | ((uint32_t)i << 16));
                 return;
             }
+        /* No slot inside cfg_avail_slots: say which slots are taken and how
+         * many the room advertises, so a NACK is never silent again. */
+        rfu_log("connect nack peer %d: slots_used=%u avail=%u devid=%04x\n",
+                peer, host_slots(), (unsigned)cfg_avail_slots, host.devid);
         net_cmd(peer, RFU1_CONNECT_NACK, 0);
         break;
 
