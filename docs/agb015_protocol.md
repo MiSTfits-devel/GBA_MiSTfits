@@ -25,22 +25,25 @@ Terminology: all "words" are 32-bit SIO Normal-32 transfers, **MSB first** on th
 
 Before login the GBA pulses **SD** while in general-purpose (GPIO) mode:
 
-- afska [LRW `pingAdapter`]: RCNT → GPIO mode, SO and SD configured as outputs
-  (SO value left low), **SD driven HIGH for 50 scanlines ≈ 3.1 ms, then LOW**.
+- afska [LRW `pingAdapter`]: RCNT → GPIO, SO and SD configured as outputs,
+  **SD driven HIGH for 50 scanlines ≈ 3.67 ms, then LOW**. The RCNT
+  read/modify/write can copy the pulled-up input into the SD output latch,
+  so there need not be a physical rising edge when SD becomes an output.
 - librfu [RFU `AgbRFU_SoftReset`]: `RCNT=0x8000` (GPIO, all inputs), then
   `RCNT=0x80A0` (SD & SO outputs, both low), then `RCNT=0x80A2` (**SD HIGH**) held
   in a loop for 18 ticks of a 1024-cycle timer ≈ **1.10 ms**, then `RCNT=0x80A0`
   (SD LOW). Then it immediately switches to Normal-32.
 
-**Adapter requirement:** treat a rising-then-falling edge on SD (high ≥ ~1 ms) while
-in GPIO mode as a hard reset out of power-save: clear all session state, reset the
-login state machine, RFU_State → N (Neutral). No response is required on SO during
-the ping; the adapter's idle SO level is don't-care here (GBA reconfigures to SPI
-right after). Duration varies (1 ms librfu / 3 ms afska) — trigger on the falling
-edge, don't require an exact width.
+**Integrated adapter:** time SD high only while RCNT selects GPIO output on
+SD. A GPIO-output low sample after at least 0.5 ms high starts fresh ID
+login and resets the daemon session; leaving GPIO output cancels the pulse.
+Normal-mode master releases SD and Normal-mode slave drives it low, so
+switching clock roles must not reset the adapter even after a long idle.
 
-The manual confirms the adapter powers on in "power conservation mode" and needs
-this soft reset before accepting commands. [MAN C-5 §3.4]
+The real adapter's SD interrupt can reset it from any state except Serial
+Boot [MAN Fig. 8, A-12; B-49]. Starting it from Stop is one example [MAN
+§3.4, C-5]. The documentation does not specify the pin's pulse threshold;
+0.5 ms is the emulator's qualifier, not an MCU specification.
 
 ---
 
@@ -167,6 +170,11 @@ session). Implement the same: a per-word timeout (~100 ms) that re-arms the
 "expect 0x9966 header" state.
 The word timeout is disarmed after the final ACK word's handshake: idle
 between commands is not a stalled transfer, even during long Flash writes.
+
+The MiSTer FPGA/HPS bridge runs at nominal 2 Mbaud so the UART can deliver
+full STWI packets inside afska's much shorter per-word deadline. The HPS
+100 MHz UART with divisor 3 runs at about 2.083 Mbaud; the FPGA's 8-cycle
+divider runs at about 2.097 Mbaud. Verbose logs drain outside the UART loop.
 
 ---
 
