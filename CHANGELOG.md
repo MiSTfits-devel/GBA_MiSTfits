@@ -1,5 +1,21 @@
 # Changelog
 
+## 2026-11-27 — v0.8.1
+
+### Emulated wireless adapter reliability
+
+- Fixed the FPGA-to-HPS UART valid/ready wedge, transfer alignment after a
+  core hold, and refusal of a daemon answer arriving before the handshake
+  state machine was ready.
+- The FPGA/HPS UART now runs at nominal 2 Mbaud; use the matching daemon.
+  Verbose logging drains on a separate thread rather than blocking ACKs.
+- Selected SO pulse and refusal/stall diagnostics are exposed through the
+  wireless 71-bit debug `link_state`. Earlier diagnostic builds exposed other
+  register sets.
+- In the final measured MiSTer ↔ gpSP run six of ten wireless ROMs passed.
+  The four failures have ROM/harness-level symptoms that vary by run; the
+  lab ROM times out despite the correct adapter response and handshake.
+
 ## 2026-09-15
 
 ### `/CS` is released when the bus goes quiet
