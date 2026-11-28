@@ -176,6 +176,11 @@ full STWI packets inside afska's much shorter per-word deadline. The HPS
 100 MHz UART with divisor 3 runs at about 2.083 Mbaud; the FPGA's 8-cycle
 divider runs at about 2.097 Mbaud. Verbose logs drain outside the UART loop.
 
+In wireless mode the debug link-state output exposes the SO pulse meter and
+refused-answer/stall snapshot. The separate dead-state, drift/reject and
+ACK-transaction registers are build-time instruments, not additional fields
+exposed by this output.
+
 ---
 
 ## 4. Command set
